@@ -17,6 +17,12 @@ fs_permissions = [
     { access = "read", path = "./policies" },
     # test oracle: canonical Safe / MultiSendCallOnly runtime hashes
     { access = "read", path = "./node_modules/@safe-global/safe-deployments/dist/assets" },
+    # review g10b: differential vectors and the canonical MultiSendCallOnly runtime code
+    { access = "read", path = "./test/guards/vectors" },
+    # review g11d: the traceability suite reads the contracts, the runbook and the test files
+    { access = "read", path = "./contracts/guards" },
+    { access = "read", path = "./docs/curator-guard.md" },
+    { access = "read", path = "./test/guards" },
 ]
 
 auto_detect_remappings = false

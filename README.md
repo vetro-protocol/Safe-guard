@@ -26,7 +26,7 @@ This repository was split out of `vesper-strategies`. The Lagoon strategies the 
 | ------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
 | `contracts/guards/`                                          | `CuratorGuard`, `CuratorGuardPolicy`, `CuratorGuardTimelock`                             |
 | `contracts/interfaces/safe/`, `contracts/interfaces/lagoon/` | Safe and Lagoon interfaces (Lagoon is used by the tests)                                 |
-| `test/guards/`                                               | Foundry unit, fuzz, invariant and mutation suites; `*.e2e.ethereum.t.sol` are fork tests |
+| `test/guards/`                                               | Foundry unit, fuzz, invariant and mutation suites; `*.e2e.ethereum.t.sol`, `G10d_Fork`, `G11b_Policy`, `G11c_ExecutorFloor.e2e` and `G9a_CanonicalProxyHashes` are fork tests |
 | `test/guards-precancun/`                                     | Checks that the guard refuses to deploy on a pre-Cancun EVM                              |
 | `policies/curator-guard/`                                    | Policy files and the lint corpus                                                         |
 | `deploy/ethereum/guards/`                                    | hardhat-deploy script for the timelock and guard (`--tags CuratorGuard`)                 |
@@ -48,7 +48,7 @@ You need [Foundry](https://book.getfoundry.sh) (CI pins `v1.5.1`) and Node from 
 ## Test
 
 ```bash
-forge test --no-match-path '*e2e*'                       # unit suites, no RPC needed
+forge test --no-match-path '*e2e*'                       # unit suites, no RPC needed (the three non-e2e fork suites report skipped)
 ETHEREUM_FORK_BLOCK_NUMBER=25570000 forge test           # everything, needs ETHEREUM_FORK_NODE_URL (archive RPC)
 FOUNDRY_PROFILE=guards_deep forge test --mt invariant    # deep invariant search
 forge build && FOUNDRY_PROFILE=precancun forge test      # pre-Cancun deployment refusal
@@ -58,7 +58,11 @@ FORK_NODE_URL=<rpc> FORK_BLOCK_NUMBER=25570000 \
   npx hardhat run scripts/curator-guard-fork-dryrun.ts --network hardhat   # fork rehearsal of the tooling
 ```
 
-The e2e fork block must come before the guard was installed on the Vetro curator Safe (the tests assert the Safe has no guard and no modules).
+To drive the tasks against an anvil fork you run yourself (`--network localhost`), start it with `--chain-id 31337`
+(hardhat refuses any other chain id for that network) and point `LOCALHOST_NODE_URL` at it; `FORK_NODE_URL` is only
+the upstream of the in-process `hardhat` network.
+
+The fork block must come before the guard was installed on the Vetro curator Safe (the fork tests assert the Safe has no guard and no modules); without `ETHEREUM_FORK_NODE_URL` the `*.e2e.ethereum` suites fail to resolve the `ethereum` RPC alias and the other fork suites skip.
 
 The guard and its timelock compile at 10 optimizer runs on the legacy pipeline, with `evm_version = cancun`, in both Foundry and Hardhat. CI checks that the two toolchains produce identical runtime bytecode.
 
@@ -68,7 +72,7 @@ The guard and its timelock compile at 10 optimizer runs on the legacy pipeline, 
 npx hardhat deploy --network ethereum --tags CuratorGuard
 ```
 
-Before a mainnet run, fill in the `Vetro.curatorGuard*` roles in `helpers/address.ts`. The script refuses an empty canceller list or council, and a proposer, canceller or council that shares keys with the curator Safe. See docs section 8 for the install sequence. Use `curator-guard-sync` to schedule policy changes through the timelock.
+Before a mainnet run, fill in the `Vetro.curatorGuard*` roles in `helpers/address.ts`. The script refuses an empty canceller list or council, and a proposer, canceller or council that shares keys with the curator Safe. See docs sections 7.1 to 7.4 for the deploy, the policy sync, the pre-install checks and the install batch (section 8 lists the Lagoon-side preconditions). Use `curator-guard-sync` to schedule policy changes through the timelock.
 
 ## CI
 

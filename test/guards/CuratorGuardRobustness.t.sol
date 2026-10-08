@@ -187,7 +187,7 @@ contract StatefulHandler {
     }
 }
 
-/// @title IMPROVEMENTS_V2.md items 8, 9 and 12 on the v1.4.1 fixture: `SafeConfigUnreadable` and the
+/// @title The v2 robustness items (docs section 13.2) on the v1.4.1 fixture: `SafeConfigUnreadable` and the
 ///        Cancun probe, `lockdownAndRevoke`, `TransactionChecked`; plus the round-4 review findings.
 contract CuratorGuardRobustnessTest is CuratorGuardTestBase {
     bytes4 internal constant SETTLE = MockProtocol.settleDeposit.selector;

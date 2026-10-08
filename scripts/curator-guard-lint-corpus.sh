@@ -9,6 +9,9 @@ for f in policies/curator-guard/lint-corpus/refuse-*.json; do
     echo "FAIL: $f was accepted"; status=1
   # A refuse-* case is refused for ITS reason, not for a typo elsewhere in the file: when a
   # `<name>.reason` file sits next to it, that text must occur in the lint's output (review G9e-3).
+  # An empty pattern would match anything, so an empty .reason file is a failure (review G11e-2).
+  elif [ -f "${f%.json}.reason" ] && [ -z "$(cat "${f%.json}.reason")" ]; then
+    echo "FAIL: ${f%.json}.reason is empty (it would match any refusal)"; status=1
   elif [ -f "${f%.json}.reason" ] && ! grep -qF -- "$(cat "${f%.json}.reason")" <<< "$out"; then
     echo "FAIL: $f was refused for another reason: $(echo "$out" | grep -m1 -E '^Error' || echo "$out" | tail -1)"; status=1
   else
@@ -17,7 +20,15 @@ for f in policies/curator-guard/lint-corpus/refuse-*.json; do
 done
 for f in policies/curator-guard/lint-corpus/accept-*.json policies/curator-guard/*.json; do
   if out=$(npx hardhat curator-guard-lint --policy "$f" 2>&1); then
-    echo "ok: accepted $f"
+    # An accept-* case may pin a WARNING: when a `<name>.warn` file sits next to it, that text must
+    # occur in the lint's output (the lint's warnings are rules too; review G11e).
+    if [ -f "${f%.json}.warn" ] && [ -z "$(cat "${f%.json}.warn")" ]; then
+      echo "FAIL: ${f%.json}.warn is empty (it would match any output)"; status=1
+    elif [ -f "${f%.json}.warn" ] && ! grep -qF -- "$(cat "${f%.json}.warn")" <<< "$out"; then
+      echo "FAIL: $f was accepted without the expected warning: $(cat "${f%.json}.warn")"; status=1
+    else
+      echo "ok: accepted $f"
+    fi
   else
     echo "FAIL: $f was refused: $(echo "$out" | tail -1)"; status=1
   fi
