@@ -1,0 +1,32 @@
+{
+  "chainId": 1,
+  "safe": "0x1b534a8543212F5957168D83311A41E0Ea1cfe48",
+  "mode": "Enforced",
+  "requiredFallbackHandler": {
+    "handler": "0x0000000000000000000000000000000000000000",
+    "enforce": true
+  },
+  "guardians": [],
+  "functions": [
+    {
+      "target": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+      "signature": "approve(address,uint256)",
+      "rules": [
+        {
+          "kind": "OneOf",
+          "wordIndex": 0,
+          "values": [
+            "0x131CcfDFfeD712885aAc31445d351E6b62656679"
+          ]
+        },
+        {
+          "kind": "OneOf",
+          "wordIndex": 0,
+          "values": [
+            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+          ]
+        }
+      ]
+    }
+  ]
+}

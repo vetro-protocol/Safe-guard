@@ -1,0 +1,41 @@
+{
+  "name": "safe-guard",
+  "version": "1.0.0",
+  "description": "CuratorGuard: a Safe transaction and module guard that allowlists what a Lagoon curator Safe may call",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "build": "forge build",
+    "test": "forge test",
+    "test:precancun": "forge build && FOUNDRY_PROFILE=precancun forge test",
+    "lint:policies": "./scripts/curator-guard-lint-corpus.sh",
+    "eslint": "eslint --cache .",
+    "compile": "hardhat compile",
+    "sizes": "./scripts/check-contract-sizes.sh",
+    "deploy": "hardhat deploy"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.23.0",
+    "@nomicfoundation/hardhat-network-helpers": "1.1.2",
+    "@nomicfoundation/hardhat-toolbox": "5.0.0",
+    "@openzeppelin/contracts": "5.2.0",
+    "@safe-global/api-kit": "4.1.0",
+    "@safe-global/protocol-kit": "6.1.2",
+    "@safe-global/safe-deployments": "1.37.56",
+    "@safe-global/types-kit": "3.1.0",
+    "@typescript-eslint/eslint-plugin": "^8.29.0",
+    "chalk": "4.1.2",
+    "dotenv": "^16.5.0",
+    "eslint": "^9.23.0",
+    "eslint-config-prettier": "^10.1.1",
+    "eslint-plugin-prettier": "^5.2.6",
+    "ethers": "6.16.0",
+    "globals": "^16.0.0",
+    "hardhat": "2.28.6",
+    "hardhat-deploy": "1.0.4",
+    "prettier": "^3.5.3",
+    "ts-node": "10.9.2",
+    "typescript": "5.9.3",
+    "typescript-eslint": "^8.29.0"
+  }
+}

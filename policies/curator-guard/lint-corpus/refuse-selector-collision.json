@@ -1,0 +1,16 @@
+{
+  "chainId": 1,
+  "safe": "0x1b534a8543212F5957168D83311A41E0Ea1cfe48",
+  "mode": "Enforced",
+  "requiredFallbackHandler": {
+    "handler": "0x0000000000000000000000000000000000000000",
+    "enforce": true
+  },
+  "guardians": [],
+  "functions": [
+    {
+      "target": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+      "signature": "many_msg_babbage(bytes1)"
+    }
+  ]
+}

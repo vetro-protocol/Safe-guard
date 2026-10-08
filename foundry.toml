@@ -1,0 +1,63 @@
+[profile.default]
+src = 'contracts'
+test = 'test/guards'
+script = 'test/guards'
+out = 'out-guards'
+cache_path = 'cache_forge_guards'
+libs = ['node_modules', 'lib']
+solc_version = "0.8.25"
+# Keep in sync with hardhat.config.ts: cancun (EIP-1153 transient storage is required by the guard).
+evm_version = "cancun"
+optimizer = true
+# 10 runs = the guard's deployment setting (hardhat.config.ts): the tested bytecode is the deployed one.
+optimizer_runs = 10
+
+fs_permissions = [
+    { access = "read", path = "./deployments" },
+    { access = "read", path = "./policies" },
+    # test oracle: canonical Safe / MultiSendCallOnly runtime hashes
+    { access = "read", path = "./node_modules/@safe-global/safe-deployments/dist/assets" },
+]
+
+auto_detect_remappings = false
+remappings = [
+    "@openzeppelin/=node_modules/@openzeppelin/",
+    "forge-std/=lib/forge-std/src/",
+    # Safe sources, tests only (the npm packages pin ethers@5 as a peer dependency).
+    "safe-contracts-v1.4.1/=lib/safe-smart-account/",
+    "safe-contracts-v1.5.0/=lib/safe-smart-account-v1.5.0/",
+]
+
+[invariant]
+runs = 256
+depth = 30
+fail_on_revert = true
+shrink_run_limit = 5000
+
+# Kept as an alias of the default profile (docs and older commands use `FOUNDRY_PROFILE=guards`).
+[profile.guards]
+
+# Deep invariant search: `FOUNDRY_PROFILE=guards_deep forge test --mt invariant`. Same out/cache as default.
+[profile.guards_deep]
+
+[profile.guards_deep.invariant]
+runs = 1024
+depth = 50
+fail_on_revert = true
+shrink_run_limit = 5000
+
+# Pre-Cancun check: `FOUNDRY_PROFILE=precancun forge test` (after a default build). Compiles only
+# `test/guards-precancun` for a Shanghai EVM and deploys the Cancun creation code from `out-guards/`
+# through a raw `create`, which must fail: the constructor's EIP-1153 probe refuses chains without
+# transient storage, where the hooks would otherwise brick the first guarded Safe.
+[profile.precancun]
+src = 'test/guards-precancun'
+test = 'test/guards-precancun'
+script = 'test/guards-precancun'
+out = 'out-precancun'
+cache_path = 'cache_forge_precancun'
+evm_version = "shanghai"
+fs_permissions = [{ access = "read", path = "./out-guards" }]
+
+[rpc_endpoints]
+ethereum = "${ETHEREUM_FORK_NODE_URL}"

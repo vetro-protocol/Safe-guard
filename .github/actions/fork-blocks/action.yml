@@ -1,0 +1,12 @@
+name: Pin fork blocks
+description: >
+  Exports pinned fork block numbers for deterministic fork tests.
+  ETHEREUM_FORK_BLOCK_NUMBER must predate the CuratorGuard install on the Vetro curator Safe:
+  test/guards/CuratorGuard.e2e.ethereum.t.sol asserts a pristine Safe (no guard, no modules).
+
+runs:
+  using: composite
+  steps:
+    - name: Export pinned fork block numbers
+      shell: bash
+      run: echo "ETHEREUM_FORK_BLOCK_NUMBER=25570000" >> "$GITHUB_ENV"

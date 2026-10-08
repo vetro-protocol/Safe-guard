@@ -1,0 +1,140 @@
+name: Curator Guard
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # Pinned, not `stable`: the compiled bytecode (and the size gate) must not move under a toolchain bump.
+  FOUNDRY_VERSION: v1.5.1
+
+jobs:
+  check:
+    name: Foundry project
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Use nvmrc
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: npm
+
+      - name: Install dependencies (lockfile, no lifecycle scripts)
+        run: npm ci --ignore-scripts
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      - name: Pin fork block numbers
+        uses: ./.github/actions/fork-blocks
+
+      - name: Lint the tooling
+        run: npx eslint tasks deploy scripts helpers hardhat.config.ts
+
+      - name: Type-check the tooling
+        run: npx tsc --noEmit -p tsconfig.json
+
+      # Offline validation: every shipped policy file is accepted, every crafted refuse-* file refused.
+      - name: Lint the policy files (corpus)
+        run: ./scripts/curator-guard-lint-corpus.sh
+
+      # Same solc settings as the deployed bytecode (10 runs, cancun). The *.e2e.ethereum suites need the
+      # ETHEREUM_FORK_NODE_URL secret (archive RPC).
+      - name: Run tests
+        run: forge test -vvv
+        env:
+          ETHEREUM_FORK_NODE_URL: ${{ secrets.ETHEREUM_FORK_NODE_URL }}
+
+      # The guard must refuse to deploy on a pre-Cancun EVM (constructor EIP-1153 probe): this profile
+      # compiles for Shanghai and deploys the Cancun creation code the default build above produced.
+      - name: Pre-Cancun deployment refusal
+        run: forge t -vvv
+        env:
+          FOUNDRY_PROFILE: precancun
+
+  # The tooling against a real fork: deploy script preflights and audit, timelock scheduling, execution,
+  # install, dry runs and the incident drill (scripts/curator-guard-fork-dryrun.ts). Hardhat compiles the
+  # guard contracts for this, so the artifacts are cached on the sources' hash. Both
+  # jobs need the repository secret ETHEREUM_FORK_NODE_URL (an archive-capable RPC): pull requests from
+  # forks do not receive it and fail here by design. A green rehearsal proves the scripted flow on the
+  # fork with the rehearsal-only downgrades (key overlap, stand-in veto Safe); it does not prove that the
+  # committed address book passes the mainnet preflights.
+  rehearsal:
+    name: Fork rehearsal of the tooling
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Use nvmrc
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: npm
+
+      - name: Install dependencies (lockfile, no lifecycle scripts)
+        run: npm ci --ignore-scripts
+
+      - name: Cache hardhat artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            artifacts
+            cache
+          key: hardhat-${{ runner.os }}-${{ hashFiles('contracts/**/*.sol', 'hardhat.config.ts', 'package-lock.json') }}
+
+      - name: Pin fork block numbers
+        uses: ./.github/actions/fork-blocks
+
+      - name: Fork dry run
+        # hardhat's EDR can panic on an upstream failure and exit 0 (review R7C-01): the script sets a
+        # failing exit code until its last line, and the marker line is asserted here as well.
+        run: |
+          set -o pipefail
+          npx hardhat run scripts/curator-guard-fork-dryrun.ts --network hardhat | tee dryrun.log
+          grep -q "incident drill complete" dryrun.log
+        env:
+          FORK_NODE_URL: ${{ secrets.ETHEREUM_FORK_NODE_URL }}
+          FORK_BLOCK_NUMBER: ${{ env.ETHEREUM_FORK_BLOCK_NUMBER }}
+          # The rehearsal must not touch any real service: no Safe API key, no verification key.
+          SAFE_API_KEY: ""
+          ETHERSCAN_API_KEY: ""
+
+      # The deployed bytecode is the Hardhat artifact: the 96 % size gate runs on it here, where the
+      # artifacts exist.
+      - name: Size gate
+        run: THRESHOLD_PCT=96 ./scripts/check-contract-sizes.sh
+
+      # The Hardhat artifact must be byte-identical (metadata tail excluded) to the Foundry build
+      # the test job exercises: same solc, same 10 runs, same evm version.
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+      - name: Toolchain parity of the guard bytecode
+        run: |
+          forge build
+          node -e '
+            const fs = require("fs");
+            const strip = (h) => { h = h.replace(/^0x/, ""); const n = (parseInt(h.slice(-4), 16) + 2) * 2; return h.slice(0, h.length - n); };
+            for (const [name, hh, ff] of [
+              ["CuratorGuard", "artifacts/contracts/guards/CuratorGuard.sol/CuratorGuard.json", "out-guards/CuratorGuard.sol/CuratorGuard.json"],
+              ["CuratorGuardTimelock", "artifacts/contracts/guards/CuratorGuardTimelock.sol/CuratorGuardTimelock.json", "out-guards/CuratorGuardTimelock.sol/CuratorGuardTimelock.json"],
+            ]) {
+              const a = strip(JSON.parse(fs.readFileSync(hh)).deployedBytecode);
+              const b = strip(JSON.parse(fs.readFileSync(ff)).deployedBytecode.object);
+              if (a !== b) { console.error(name + ": hardhat and foundry runtime bytecode differ"); process.exit(1); }
+              console.log(name + ": hardhat == foundry (" + a.length / 2 + " bytes)");
+            }'

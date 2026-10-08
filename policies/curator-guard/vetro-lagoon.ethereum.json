@@ -1,0 +1,81 @@
+{
+  "$comment": "CuratorGuard policy for the Vetro Lagoon curator Safe (Ethereum). Derived from the Safe's executed history (nonces 0-30: NAV updates, settles, approve(vault) per asset, MultiSendCallOnly v1.4.1 batches). Apply with: npx hardhat curator-guard-sync --network ethereum --guard <CuratorGuard> --policy policies/curator-guard/vetro-lagoon.ethereum.json --proposer <governance Safe> [--allow-unlock], then --execute after the timelock delay. Owner management (addOwnerWithThreshold, changeThreshold, setGuard) is NOT allowlisted: the council (owner management, disableModule, setFallbackHandler(0), the empty rejection) or the admin (setGuard, setModuleGuard, enableModule, any other handler, batches) approves each such one-off with safeTxGas = 0 with approveTransaction. mode may only be Lockdown or Enforced: Bypass is an incident action on the guard, never a desired state.",
+  "chainId": 1,
+  "safe": "0x1b534a8543212F5957168D83311A41E0Ea1cfe48",
+  "mode": "Enforced",
+  "$comment_nav": "updateNewTotalAssets is marked unconstrained ONLY because the vaults are unfunded: before any debtRatio above zero, either the Lagoon-level controls of docs section 8 are live (whitelist mode, guardrails, valuation / security-council roles at Vetro) or each funded vault gets a NAV band here (GreaterThanOrEqual + LessThanOrEqual on word 0 around the settled NAV, re-synced with every funding step). The guard cannot judge a NAV: with these five entries alone a colluding signer quorum can mark a vault down, buy in, mark it up and redeem the whole custody in one transaction.",
+  "$comment_handler": "The Safe currently runs the canonical CompatibilityFallbackHandler v1.4.1 (0xfd07...Ec99), which implements EIP-1271: a signer quorum could authorise USDC permit / transferWithAuthorization off-chain and bypass the guard. Policy traffic is refused until the signers execute the Vetro-approved setFallbackHandler(0x0). See docs/curator-guard.md section 7.",
+  "requiredFallbackHandler": { "handler": "0x0000000000000000000000000000000000000000", "enforce": true },
+  "$comment_guardians": "Narrow-only responders for THIS Safe (lockdown, revoke, revokeAllApprovals): fill in Vetro's monitoring bot / on-call keys before go-live. Deployment-wide responders hold GUARDIAN_ROLE on the guard instead (granted through the timelock) and are not listed here. A replacement guard starts with none, so re-sync it with this file before the signers switch to it.",
+  "guardians": [],
+  "$comment_unwrappers": "The three canonical MultiSendCallOnly deployments (v1.3.0, v1.4.1, v1.5.0): same hash-pinned, storage-free code, so registering all three costs no trust and keeps batching alive when a wallet switches library.",
+  "multiSendUnwrappers": [
+    "0x40A2aCCbd92BCA938b02010E17A5b8929b49130D",
+    "0x9641d764fc13c8B624c04430C7356C1C7C8102e2",
+    "0xA83c336B20401Af773B6219BA5027174338D1836"
+  ],
+  "modules": [],
+  "nativeTransfers": [],
+  "functions": [
+    { "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679", "signature": "updateNewTotalAssets(uint256)", "unconstrained": true, "note": "Vetro_USDC: Safe is valuationManager" },
+    { "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679", "signature": "settleDeposit(uint256)", "note": "Vetro_USDC" },
+    { "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679", "signature": "settleRedeem(uint256)", "note": "Vetro_USDC" },
+    { "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679", "signature": "claimSharesOnBehalf(address[])", "note": "Vetro_USDC" },
+    { "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679", "signature": "claimAssetsOnBehalf(address[])", "note": "Vetro_USDC" },
+
+    { "target": "0xE7FaE53e32B09028db4Ca8Ff7E4fF0574367eDba", "signature": "updateNewTotalAssets(uint256)", "unconstrained": true, "note": "Vetro_USDT" },
+    { "target": "0xE7FaE53e32B09028db4Ca8Ff7E4fF0574367eDba", "signature": "settleDeposit(uint256)", "note": "Vetro_USDT" },
+    { "target": "0xE7FaE53e32B09028db4Ca8Ff7E4fF0574367eDba", "signature": "settleRedeem(uint256)", "note": "Vetro_USDT" },
+    { "target": "0xE7FaE53e32B09028db4Ca8Ff7E4fF0574367eDba", "signature": "claimSharesOnBehalf(address[])", "note": "Vetro_USDT" },
+    { "target": "0xE7FaE53e32B09028db4Ca8Ff7E4fF0574367eDba", "signature": "claimAssetsOnBehalf(address[])", "note": "Vetro_USDT" },
+
+    { "target": "0x1a9b5c9845c2685923215779c6Ec288bD5090e90", "signature": "updateNewTotalAssets(uint256)", "unconstrained": true, "note": "Vetro_WBTC" },
+    { "target": "0x1a9b5c9845c2685923215779c6Ec288bD5090e90", "signature": "settleDeposit(uint256)", "note": "Vetro_WBTC" },
+    { "target": "0x1a9b5c9845c2685923215779c6Ec288bD5090e90", "signature": "settleRedeem(uint256)", "note": "Vetro_WBTC" },
+    { "target": "0x1a9b5c9845c2685923215779c6Ec288bD5090e90", "signature": "claimSharesOnBehalf(address[])", "note": "Vetro_WBTC" },
+    { "target": "0x1a9b5c9845c2685923215779c6Ec288bD5090e90", "signature": "claimAssetsOnBehalf(address[])", "note": "Vetro_WBTC" },
+
+    { "target": "0x110B1F3cD409Ef5A7b354AA1667c19998E1b6340", "signature": "updateNewTotalAssets(uint256)", "unconstrained": true, "note": "Vetro_cbBTC" },
+    { "target": "0x110B1F3cD409Ef5A7b354AA1667c19998E1b6340", "signature": "settleDeposit(uint256)", "note": "Vetro_cbBTC" },
+    { "target": "0x110B1F3cD409Ef5A7b354AA1667c19998E1b6340", "signature": "settleRedeem(uint256)", "note": "Vetro_cbBTC" },
+    { "target": "0x110B1F3cD409Ef5A7b354AA1667c19998E1b6340", "signature": "claimSharesOnBehalf(address[])", "note": "Vetro_cbBTC" },
+    { "target": "0x110B1F3cD409Ef5A7b354AA1667c19998E1b6340", "signature": "claimAssetsOnBehalf(address[])", "note": "Vetro_cbBTC" },
+
+    { "target": "0x26A6179247420B6e8036DBdeF48fD74d1E57fdc3", "signature": "updateNewTotalAssets(uint256)", "unconstrained": true, "note": "Vetro_hemiBTC" },
+    { "target": "0x26A6179247420B6e8036DBdeF48fD74d1E57fdc3", "signature": "settleDeposit(uint256)", "note": "Vetro_hemiBTC" },
+    { "target": "0x26A6179247420B6e8036DBdeF48fD74d1E57fdc3", "signature": "settleRedeem(uint256)", "note": "Vetro_hemiBTC" },
+    { "target": "0x26A6179247420B6e8036DBdeF48fD74d1E57fdc3", "signature": "claimSharesOnBehalf(address[])", "note": "Vetro_hemiBTC" },
+    { "target": "0x26A6179247420B6e8036DBdeF48fD74d1E57fdc3", "signature": "claimAssetsOnBehalf(address[])", "note": "Vetro_hemiBTC" },
+
+    {
+      "target": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+      "signature": "approve(address,uint256)",
+      "note": "USDC: settlement pull by Vetro_USDC only",
+      "rules": [{ "kind": "OneOf", "wordIndex": 0, "values": ["0x131CcfDFfeD712885aAc31445d351E6b62656679"] }]
+    },
+    {
+      "target": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+      "signature": "approve(address,uint256)",
+      "note": "USDT: settlement pull by Vetro_USDT only",
+      "rules": [{ "kind": "OneOf", "wordIndex": 0, "values": ["0xE7FaE53e32B09028db4Ca8Ff7E4fF0574367eDba"] }]
+    },
+    {
+      "target": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
+      "signature": "approve(address,uint256)",
+      "note": "WBTC: settlement pull by Vetro_WBTC only",
+      "rules": [{ "kind": "OneOf", "wordIndex": 0, "values": ["0x1a9b5c9845c2685923215779c6Ec288bD5090e90"] }]
+    },
+    {
+      "target": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
+      "signature": "approve(address,uint256)",
+      "note": "cbBTC: settlement pull by Vetro_cbBTC only",
+      "rules": [{ "kind": "OneOf", "wordIndex": 0, "values": ["0x110B1F3cD409Ef5A7b354AA1667c19998E1b6340"] }]
+    },
+    {
+      "target": "0x06ea695B91700071B161A434fED42D1DcbAD9f00",
+      "signature": "approve(address,uint256)",
+      "note": "hemiBTC: settlement pull by Vetro_hemiBTC only",
+      "rules": [{ "kind": "OneOf", "wordIndex": 0, "values": ["0x26A6179247420B6e8036DBdeF48fD74d1E57fdc3"] }]
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "chainId": 1,
+  "safe": "0x1b534a8543212F5957168D83311A41E0Ea1cfe48",
+  "mode": "Enforced",
+  "requiredFallbackHandler": {
+    "handler": "0x0000000000000000000000000000000000000000",
+    "enforce": true
+  },
+  "guardians": [],
+  "functions": [
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "route(bytes,bytes)",
+      "rules": [
+        {
+          "kind": "EqualTo",
+          "wordIndex": 1,
+          "tail": true,
+          "value": "0xa87442ba90c6ae27caefcd5c53358cbf291611e0ecf91d95dd246deaf5e491fe"
+        }
+      ]
+    }
+  ]
+}

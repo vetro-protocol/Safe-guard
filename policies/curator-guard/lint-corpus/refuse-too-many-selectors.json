@@ -1,0 +1,144 @@
+{
+  "chainId": 1,
+  "safe": "0x1b534a8543212F5957168D83311A41E0Ea1cfe48",
+  "mode": "Enforced",
+  "requiredFallbackHandler": {
+    "handler": "0x0000000000000000000000000000000000000000",
+    "enforce": true
+  },
+  "guardians": [],
+  "functions": [
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f0()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f1()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f2()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f3()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f4()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f5()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f6()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f7()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f8()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f9()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f10()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f11()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f12()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f13()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f14()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f15()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f16()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f17()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f18()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f19()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f20()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f21()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f22()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f23()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f24()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f25()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f26()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f27()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f28()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f29()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f30()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f31()"
+    },
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "f32()"
+    }
+  ]
+}

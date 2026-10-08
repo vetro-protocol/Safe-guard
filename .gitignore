@@ -1,0 +1,23 @@
+.DS_Store
+node_modules
+.env
+.eslintcache
+# Hardhat
+artifacts
+cache
+typechain-types
+# Deployment
+safe.batch.tmp.json
+safe.batch.tmp.json.timelock*
+**/deployments/localhost/*
+**/deployments/hardhat/*
+**/deployments/*/failed*
+**/deployments/**/*fork*
+# Foundry
+out-guards/
+out-precancun/
+cache_forge_guards/
+cache_forge_precancun/
+# tooling logs
+tsc.log
+dryrun.log
