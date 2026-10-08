@@ -4,7 +4,7 @@ import chalk from "chalk";
 import SafeApiKit from "@safe-global/api-kit";
 import Safe from "@safe-global/protocol-kit";
 import { MetaTransactionData, OperationType } from "@safe-global/types-kit";
-import { Wallet } from "ethers";
+import { Contract, Wallet } from "ethers";
 
 export const SAFE_BATCH_TXS_FILE = "safe.batch.tmp.json";
 
@@ -175,11 +175,29 @@ const proposeOneSafeBatch = async (
 
   const apiKit = new SafeApiKit({ chainId, apiKey: process.env.SAFE_API_KEY });
 
-  const protocolKit = await Safe.init({
-    provider: provider,
-    signer: signerKey,
-    safeAddress,
-  });
+  // protocol-kit knows a fixed list of Safe releases (6.1.2: v1.0.0 to v1.4.1) and throws a bare "Invalid Safe
+  // version" for any other, Safe v1.5.0 included (Safe{Wallet}'s default for new Safes since September 2026):
+  // name the Safe, its version and the fix instead (review G11f).
+  let protocolKit: Safe;
+  try {
+    protocolKit = await Safe.init({
+      provider: provider,
+      signer: signerKey,
+      safeAddress,
+    });
+  } catch (e) {
+    if (!String((e as Error).message).includes("Invalid Safe version")) throw e;
+    const version = await new Contract(
+      safeAddress,
+      ["function VERSION() view returns (string)"],
+      hre.ethers.provider,
+    ).VERSION();
+    throw Error(
+      `Safe ${safeAddress} runs Safe v${version}, which this @safe-global/protocol-kit does not know: upgrade ` +
+        `protocol-kit to a release that lists v${version} (grep '"${version}"' node_modules/@safe-global/protocol-kit/dist/cjs/src/index.cjs), ` +
+        `or propose this batch from Safe{Wallet}'s Transaction Builder`,
+    );
+  }
 
   // Strip the saved `from` — Safe SDK only consumes (to, value, data, operation).
   const safeTransactionData: MetaTransactionData[] = group.map(({ to, value, data }) => ({

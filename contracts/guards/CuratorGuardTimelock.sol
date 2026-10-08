@@ -5,12 +5,12 @@ import {TimelockController} from "@openzeppelin/contracts/governance/TimelockCon
 
 /// @title CuratorGuardTimelock
 /// @notice The `DEFAULT_ADMIN_ROLE` holder of `CuratorGuard` in production: an OpenZeppelin
-///         `TimelockController` with its role topology fixed at construction and four guard rails.
+///         `TimelockController` with its role topology fixed at construction and guard rails on it.
 ///         Every widening of a curator policy (and every long approval or long `Bypass`) is a scheduled
 ///         operation that sits in public for `minDelay` before anyone may execute it; the canceller
 ///         Safe can stop it in that window. Narrowing never goes through here: it is immediate on the
 ///         guard (council, guardians).
-/// @dev    Topology (docs/curator-guard.md sections 4 and 6, reviews V2-63 and V2-74):
+/// @dev    Topology (docs/curator-guard.md sections 4 and 6):
 ///         - `proposers_` hold `PROPOSER_ROLE` (in production two Safes, so one lost quorum cannot
 ///           strand the guard; the contract requires one); `cancellers_` hold `CANCELLER_ROLE` (in
 ///           production one dedicated veto Safe). Proposing and
@@ -23,7 +23,8 @@ import {TimelockController} from "@openzeppelin/contracts/governance/TimelockCon
 ///         - the executor role is open (`address(0)`): no key is needed to land a ready operation;
 ///         - the timelock administers itself; NO deployer admin (the role set is final at creation,
 ///           nothing to renounce, nothing a deployer key could have granted in between).
-///         Guard rails, all enforced on the timelock's own scheduled self-calls:
+///         Guard rails, enforced on the timelock's own scheduled self-calls and, for the last-holder
+///         rail, on a holder's own `renounceRole` too:
 ///         - `getMinDelay()` is clamped to [`MIN_DELAY_FLOOR`, `MIN_DELAY_CAP`]: an `updateDelay` typed
 ///           in the wrong unit can neither make widenings instant nor take years to undo;
 ///         - the open executor cannot be revoked (nothing could execute again, the repair included);
@@ -35,18 +36,20 @@ import {TimelockController} from "@openzeppelin/contracts/governance/TimelockCon
 ///           from inside an operation someone else scheduled: a phantom proposer for the last-holder
 ///           rail, and as a canceller a veto in every proposer's hands) ever holds a gated role;
 ///         - a proposer is never granted `CANCELLER_ROLE`, a canceller never `PROPOSER_ROLE`.
-///         Proposal-time rails (`schedule` / `scheduleBatch`): an operation delay other than the live
-///         `getMinDelay()` is refused (an operation id carries neither its proposer nor its delay, so
-///         with a longer delay one proposer could take another proposer's exact operation up to 30
-///         days out, leaving the honest schedule to revert and the honest `executeBefore` wrapper dead
-///         on arrival; a unit mistake would park the operation, and the queue, for years), as is
-///         calldata for a target without code (it would "execute" and be Done with nothing run;
-///         `execute` refuses it again) and a scheduled `updateDelay` outside the clamp (refused when
-///         proposed instead of being silently read as the floor or the cap).
-///         Not enforced on-chain: the NUMBER of cancellers (a rotation needs two for one batch);
-///         monitoring pages on any `grantRole(CANCELLER_ROLE, …)`. Only a canceller can clear a
-///         pending operation, a dead one included, and cancelling a predecessor does not cancel its
-///         successor (cancel chained operations as a pair).
+///         Proposal-time rails (`schedule` / `scheduleBatch`): three things are refused when the
+///         operation is proposed instead of failing or misbehaving after the delay. An operation delay
+///         other than the live `getMinDelay()`: an operation id carries neither its proposer nor its
+///         delay, so with a longer delay one proposer could take another proposer's exact operation
+///         up to 30 days out, leaving the honest schedule to revert and the honest `executeBefore`
+///         wrapper dead on arrival, and a unit mistake would park the operation, and the queue, for
+///         years. Calldata for a target without code: it would "execute" and be Done with nothing run
+///         (`execute` refuses it again). A scheduled `updateDelay` outside the clamp: otherwise it is
+///         stored and silently read as the floor or the cap.
+///         Not enforced on-chain: the NUMBER of cancellers (a one-batch rotation of the veto Safe
+///         holds two for a moment: it grants the new one, then revokes the old); monitoring pages on
+///         any `grantRole(CANCELLER_ROLE, …)`. Only a canceller can clear a pending operation, a dead
+///         one included, and cancelling a predecessor does not cancel its successor (cancel chained
+///         operations as a pair).
 contract CuratorGuardTimelock is TimelockController {
     uint256 public constant MIN_DELAY_FLOOR = 1 hours;
     uint256 public constant MIN_DELAY_CAP = 30 days;
@@ -124,7 +127,7 @@ contract CuratorGuardTimelock is TimelockController {
 
     /// @dev Proposal-time rails. (1) An operation delay is exactly the live `getMinDelay()` (the base refuses
     ///      a shorter one): a longer one would let a proposer take another proposer's exact operation (same
-    ///      id, up to 30 days out; round 10, G10c-1), a unit mistake would park the operation for years, and
+    ///      id, up to 30 days out), a unit mistake would park the operation for years, and
     ///      near 2^256 `block.timestamp + delay` is a bare `Panic`. (2) A scheduled
     ///      `updateDelay` outside the clamp is refused instead of being stored and silently read as the
     ///      floor or the cap (`updateDelay` can only ever run as a scheduled self-call, so this covers it).

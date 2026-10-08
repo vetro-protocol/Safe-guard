@@ -4,7 +4,12 @@ import "hardhat-deploy";
 import "dotenv/config";
 import "./tasks/curator-guard";
 
-const localhost = process.env.FORK_NODE_URL || "http://localhost:8545";
+// `--network localhost` is a dev node you run yourself (anvil / hardhat node), which must report chain id
+// 31337 (`anvil --chain-id 31337 --fork-url <rpc>`: hardhat refuses any other id for this network, HH101), so
+// it is a rehearsal by the task's and the deploy script's rule. FORK_NODE_URL is only ever the UPSTREAM of
+// the in-process `hardhat` network below (the archive RPC of the fork rehearsal), never the node the tasks
+// talk to: with .env filled as .env.example says it would otherwise point `localhost` at mainnet (review P1b-3).
+const localhost = process.env.LOCALHOST_NODE_URL || "http://127.0.0.1:8545";
 const ethereumNodeUrl = process.env.ETHEREUM_NODE_URL || "";
 
 // CuratorGuard sits close to the EIP-170 limit: it and its timelock deploy at 10 runs on the legacy pipeline

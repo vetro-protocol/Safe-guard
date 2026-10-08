@@ -1,4 +1,5 @@
 import fs from "fs";
+import os from "os";
 import path from "path";
 import hre from "hardhat";
 import Addresses from "../helpers/address";
@@ -66,16 +67,29 @@ async function main() {
     await guard.owner(),
   );
   if ((await guard.defaultAdmin()).toLowerCase() !== t.address.toLowerCase()) throw Error("admin is not the timelock");
+  // The committed file is pinned to the PRODUCTION guard from section 7.2 step 0 on, and the task
+  // refuses a pin that differs from `--guard` on every network. This rehearsal deploys a fresh guard,
+  // so it syncs a copy of the file pinned to that guard; everything else in the file is unchanged
+  // (review G11a-1).
+  const committed = JSON.parse(fs.readFileSync(POLICY, "utf8")) as Record<string, unknown>;
+  const POLICY_RUN = path.join(os.tmpdir(), `curator-guard-fork-dryrun.${d.address.toLowerCase()}.json`);
+  fs.writeFileSync(POLICY_RUN, JSON.stringify({ ...committed, guard: d.address }, null, 2));
+  console.log("policy copy for this rehearsal (pinned to the fresh guard):", POLICY_RUN);
 
   // Every sync here passes `allowUnconstrainedNav`: the live vaults hold dust (about 1 USDC), which the
   // unconstrained-NAV gate refuses on mainnet until a band is set or the flag is given knowingly.
   console.log("--- dry run ---");
-  await hre.run("curator-guard-sync", { allowUnconstrainedNav: true, guard: d.address, policy: POLICY, dryRun: true });
+  await hre.run("curator-guard-sync", {
+    allowUnconstrainedNav: true,
+    guard: d.address,
+    policy: POLICY_RUN,
+    dryRun: true,
+  });
   console.log("--- schedule through the timelock (proposer impersonated) ---");
   await hre.run("curator-guard-sync", {
     allowUnconstrainedNav: true,
     guard: d.address,
-    policy: POLICY,
+    policy: POLICY_RUN,
     viaTimelock: true,
     proposer: PROPOSER,
   });
@@ -86,7 +100,7 @@ async function main() {
     await hre.run("curator-guard-sync", {
       allowUnconstrainedNav: true,
       guard: d.address,
-      policy: POLICY,
+      policy: POLICY_RUN,
       execute: true,
     });
   } catch (e: unknown) {
@@ -98,9 +112,19 @@ async function main() {
   await hre.network.provider.send("evm_increaseTime", [minDelay + 1]);
   await hre.network.provider.send("evm_mine", []);
   console.log(`--- warped ${minDelay + 1}s; execute ---`);
-  await hre.run("curator-guard-sync", { allowUnconstrainedNav: true, guard: d.address, policy: POLICY, execute: true });
+  await hre.run("curator-guard-sync", {
+    allowUnconstrainedNav: true,
+    guard: d.address,
+    policy: POLICY_RUN,
+    execute: true,
+  });
   console.log("--- re-run (expect: already in sync) ---");
-  await hre.run("curator-guard-sync", { allowUnconstrainedNav: true, guard: d.address, policy: POLICY, dryRun: true });
+  await hre.run("curator-guard-sync", {
+    allowUnconstrainedNav: true,
+    guard: d.address,
+    policy: POLICY_RUN,
+    dryRun: true,
+  });
   if ((await guard.targets(SAFE)).length === 0) throw Error("policy not applied");
   console.log(
     "mode:",
@@ -187,7 +211,7 @@ async function main() {
     await hre.run("curator-guard-sync", {
       allowUnconstrainedNav: true,
       guard: d.address,
-      policy: POLICY,
+      policy: POLICY_RUN,
       viaTimelock: true,
       proposer: PROPOSER,
     });
@@ -199,7 +223,7 @@ async function main() {
   await hre.run("curator-guard-sync", {
     allowUnconstrainedNav: true,
     guard: d.address,
-    policy: POLICY,
+    policy: POLICY_RUN,
     viaTimelock: true,
     proposer: PROPOSER,
     allowUnlock: true,
@@ -213,7 +237,7 @@ async function main() {
   if (stored.operations.length !== 1)
     throw Error(`expected the lift alone (nothing else to change), got ${stored.operations.length} operations`);
   console.log("--- verify the queued lift from the logs ---");
-  await hre.run("curator-guard-verify", { guard: d.address, policy: POLICY, op: lift.opId });
+  await hre.run("curator-guard-verify", { guard: d.address, policy: POLICY_RUN, op: lift.opId });
   // A re-lock by the council one hour before the delay ends: the lift is held back by the cooldown.
   await hre.network.provider.send("evm_increaseTime", [minDelay - 3600]);
   await hre.network.provider.send("evm_mine", []);
@@ -226,7 +250,7 @@ async function main() {
     await hre.run("curator-guard-sync", {
       allowUnconstrainedNav: true,
       guard: d.address,
-      policy: POLICY,
+      policy: POLICY_RUN,
       execute: true,
     });
   } catch (e: unknown) {
@@ -238,7 +262,7 @@ async function main() {
   await hre.run("curator-guard-sync", {
     allowUnconstrainedNav: true,
     guard: d.address,
-    policy: POLICY,
+    policy: POLICY_RUN,
     execute: true,
     allowUnlock: true,
   });
@@ -248,7 +272,7 @@ async function main() {
   await hre.run("curator-guard-sync", {
     allowUnconstrainedNav: true,
     guard: d.address,
-    policy: POLICY,
+    policy: POLICY_RUN,
     execute: true,
     allowUnlock: true,
   });

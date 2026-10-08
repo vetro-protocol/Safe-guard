@@ -58,7 +58,7 @@ contract FlipThenNestVenue {
 }
 
 /// @title CuratorGuard v2: roles, council limits, time-boxed Bypass, approval TTLs, timelock admin,
-///        v1.5.0 MultiSend decoding. See IMPROVEMENTS_V2.md items 1-5.
+///        v1.5.0 MultiSend decoding. See docs/curator-guard.md section 13 (the v2 items).
 contract CuratorGuardV2Test is CuratorGuardTestBase {
     bytes4 internal constant SETTLE = MockProtocol.settleDeposit.selector;
     bytes4 internal constant DEPOSIT = MockProtocol.deposit.selector;

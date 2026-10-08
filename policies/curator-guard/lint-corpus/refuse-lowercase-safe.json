@@ -1,0 +1,11 @@
+{
+  "chainId": 1,
+  "safe": "0x1b534a8543212f5957168d83311a41e0ea1cfe48",
+  "mode": "Enforced",
+  "requiredFallbackHandler": {
+    "handler": "0x0000000000000000000000000000000000000000",
+    "enforce": true
+  },
+  "guardians": [],
+  "functions": []
+}

@@ -20,12 +20,16 @@ import {CuratorGuardPolicy} from "./CuratorGuardPolicy.sol";
 ///             (`NestedExecution`) whenever the outer transaction recorded a snapshot or an approval.
 ///             The check runs before the Bypass return, so a window opened inside an outer policy
 ///             transaction cannot be used to nest; an owner-signed transaction that itself runs inside
-///             a window records nothing, so nesting inside it goes undetected (unchecked anyway). The
-///             owner-signed and module paths are independent.
+///             a window records nothing, so nesting inside it goes undetected (the inner transaction
+///             is held to the window's own limits like any other). The owner-signed and module paths
+///             are independent.
 ///          2. The Safe's guard slot of this path (transaction guard, module guard) must name this
 ///             guard (`GuardNotInstalled`): a replacement that is not installed yet and a guard the
-///             Safe has moved away from are refused, so neither can spend approvals, use windows or
-///             emit reports when the installed guard lets the Safe call it.
+///             Safe has moved away from are refused, so neither can spend approvals or use windows
+///             when the installed guard lets the Safe call it. The post-hook does not repeat the check
+///             (an approved or admin-window `setGuard` moves the slot inside the transaction, and the
+///             Safe sends the post-hook to the cached guard), so a post-hook that a Safe calls
+///             directly, while it holds a live window on this guard, still emits a `Bypass` report.
 ///          3. Module path only: the module must be allowlisted, in every mode, approval or not (a
 ///             guardian's `setModuleAllowed(false)` is a complete switch for that key, inside windows
 ///             too).
@@ -33,13 +37,15 @@ import {CuratorGuardPolicy} from "./CuratorGuardPolicy.sol";
 ///             on either path, except that the guard itself is never a call target
 ///             (`GuardCallNotAllowed`, true in every mode), and does not check gas refunds (a window
 ///             allows any transfer anyway). A COUNCIL window relaxes the owner-signed path only: it
-///             refuses what would weaken the Safe (self-calls outside the council's allowlist: owner
-///             management, `disableModule`, `setFallbackHandler(0)`, the empty rejection call;
-///             delegatecalls to anything but a registered `MultiSendCallOnly`, whose entries get the
-///             same limits) and a gas refund (a transfer to `refundReceiver` those limits never see);
-///             the MODULE path falls through to the rules below unchanged (a module needs no owner
-///             signature, and the window is opened for the signers). Approvals cannot exist inside a
-///             window (`CuratorGuardPolicy`).
+///             refuses what would weaken the Safe, that is any self-call outside the council's
+///             allowlist (which holds only owner management with a threshold of at least 2 and new
+///             owners without code, `disableModule`, `setFallbackHandler(0)` and the empty rejection
+///             call), any call to the policy's required fallback handler
+///             (part of the Safe), any delegatecall to anything but a registered `MultiSendCallOnly`
+///             (whose entries get the same limits) and a gas refund (a transfer to `refundReceiver`
+///             those limits never see); the MODULE path falls through to the rules below unchanged
+///             (a module needs no owner signature, and the window is opened for the signers).
+///             Approvals cannot exist inside a window (`CuratorGuardPolicy`).
 ///          5. Gas refunds are rejected (`gasPrice != 0`): `handlePayment` can otherwise pay out
 ///             the Safe's ERC-20 / native balance to an arbitrary `refundReceiver`.
 ///          6. An unconsumed, unexpired approval for the exact payload AND execution path
@@ -59,40 +65,43 @@ import {CuratorGuardPolicy} from "./CuratorGuardPolicy.sol";
 ///             handler, guard, module guard) is snapshotted into transient storage; the fallback
 ///             handler must be none or the policy's required one when a requirement is set; and no
 ///             module may be linked unless this guard is also the module guard (`ModuleNotHooked`).
-///          9. `operation == DelegateCall` is accepted only to a registered unwrapper whose runtime
-///             code hash is still allowed (`MultiSendCallOnly`); the batch is strictly decoded and
-///             every entry is checked as a plain call. Entries whose operation is not a plain call, or
-///             addressed to the zero address (which v1.5.0 `MultiSendCallOnly` rewrites to the Safe
-///             itself), are rejected.
+///          9. `operation == DelegateCall` is accepted, with no value, only to a registered unwrapper
+///             whose runtime code hash is still allowed (`MultiSendCallOnly`); the batch is strictly
+///             decoded and every entry is checked as a plain call. Entries whose operation is not a
+///             plain call, or addressed to the zero address (which v1.5.0 `MultiSendCallOnly` rewrites
+///             to the Safe itself), are rejected.
 ///         10. A plain call must target neither the Safe itself (no `setGuard`, `enableModule`,
 ///             `swapOwner`, …; the only exception is the empty zero-value self-call Safe{Wallet} uses
 ///             to reject a queued transaction) nor this guard. Empty calldata needs the native-transfer
-///             permission; otherwise the selector must be allowed on the target, the target must carry
-///             code, a non-zero value needs `allowValue`, and every configured parameter rule must hold.
+///             permission and calldata shorter than a selector is malformed; otherwise the selector
+///             must be allowed on the target, the target must carry code, a non-zero value needs
+///             `allowValue`, and every configured parameter rule must hold.
 ///         Post-execution: the call must be exactly an after-hook's 68 bytes (`ForwardedHookCall`:
 ///         a call forwarded by a Safe's fallback carries the caller's address where `success` sits),
-///         then the single transient slot of `(safe, path)` is read and cleared. An
-///         approved execution (sentinel) is done; an empty slot is only legitimate for the admin or an
-///         effective `Bypass` (`MissingSnapshot` otherwise); a snapshot must equal the current digest,
-///         so any change to the Safe's guard, module guard, modules head, owner list, owner count,
-///         threshold, fallback handler or singleton reverts the whole Safe transaction (fail closed).
+///         then the single transient slot of `(safe, path)` is read and cleared. An approved
+///         execution (the slot holds `APPROVED_SENTINEL`) is done; an empty slot is only legitimate
+///         for the admin or an effective `Bypass` (`MissingSnapshot` otherwise); a snapshot must equal
+///         the current digest, so any change to the Safe's guard, module guard, modules head, owner
+///         list, owner count, threshold, fallback handler or singleton reverts the whole Safe
+///         transaction (fail closed).
 ///         Every transaction that passes both hooks is reported once (`TransactionChecked`: owner or
 ///         module path, and whether the policy, an approval or a Bypass window let it through); the
 ///         admin's own transactions are neither checked nor reported.
 ///         The digest cannot enumerate mappings (a dangling `modules[x]` / `owners[x]` /
 ///         `approvedHashes` / `signedMessages` entry is invisible to it), which is why unwrapper code
 ///         is pinned by hash, and only the canonical `MultiSendCallOnly` hashes seeded at deployment
-///         can ever be allowed (code that calls the guard from the Safe's context could otherwise
-///         re-arm the hooks and launder the digest).
+///         can ever be allowed (code that calls the hooks from the Safe's context could otherwise
+///         clear the snapshot and take a fresh one of the modified configuration, so the comparison
+///         would pass).
 /// @dev    Requires EIP-1153 transient storage (Cancun) for the in-flight / snapshot slot; the
 ///         constructor probes for it so a deployment on a pre-Cancun chain fails instead of bricking
-///         the first guarded Safe. The configuration reads go through the Safe's own views; a Safe
-///         whose owner list no longer matches its owner count (only a storage-writing delegatecall
-///         can do that) makes `getOwners()` fail (an index-out-of-bounds write: `Panic(0x32)` on a
-///         0.8 build, the gas-consuming `INVALID` opcode on the deployed 0.7.6 singletons), which
-///         surfaces as `SafeConfigUnreadable` either way, and is recovered through an approval or a
-///         Bypass window, neither of which reads the owner list: a window reads one slot of the Safe
-///         (the guard slot of rule 2), an approval that slot and the fallback-handler slot.
+///         the first guarded Safe. The configuration reads go through the Safe's own views. A Safe
+///         whose owner list is longer than its owner count (only a storage-writing delegatecall
+///         can do that) makes `getOwners()` fail: an index-out-of-bounds write, `Panic(0x32)` on a
+///         0.8 build and the gas-consuming `INVALID` opcode on the deployed 0.7.6 singletons. Either
+///         way the hook reports `SafeConfigUnreadable`. Such a Safe recovers through an approval or
+///         a Bypass window, neither of which reads the owner list: a window reads one slot of the
+///         Safe (the guard slot of rule 2), an approval that slot and the fallback-handler slot.
 /// @dev    Not covered and documented in `docs/curator-guard.md`: pre-existing allowances and
 ///         storage planted before install, EIP-1271 signatures while a 1271-capable fallback handler
 ///         is installed (hence `setRequiredFallbackHandler`), upgradeable targets changing their code
@@ -400,7 +409,7 @@ contract CuratorGuard is CuratorGuardPolicy, ISafeTransactionGuard, ISafeModuleG
     ///      module; v1.5.0+: `setModuleGuard(guard)` never ran, or the slot points elsewhere) executes
     ///      with no check at all, `setGuard(0)` included: the policy refuses to run next to one
     ///      (`ModuleNotHooked(firstLinkedModule)`), like it refuses to run with a handler it does not
-    ///      allow. Approvals and Bypass windows do not read the configuration, so the fix
+    ///      allow. Approvals and Bypass windows skip this check, so the fix
     ///      (`disableModule`, council lane; `setModuleGuard`, admin lane) stays executable.
     function _checkConfig(SafePolicy storage $, address safe_) internal view returns (bytes32 _digest) {
         address _handler;
@@ -567,18 +576,18 @@ contract CuratorGuard is CuratorGuardPolicy, ISafeTransactionGuard, ISafeModuleG
         }
     }
 
-    /// @dev `staticcall` into the Safe. A revert (a `Panic`, or on the deployed 0.7.6 singletons an
-    ///      `INVALID` opcode that burns the forwarded gas, from `getOwners()` on a Safe whose owner list
-    ///      is longer than its owner count; out of gas), an account without code or a response of the
-    ///      wrong shape surfaces as `SafeConfigUnreadable`. `expectedLength_ == 0` accepts a
-    ///      well-formed `address[]` (offset word, count word, `count` words) of any count.
+    /// @dev `staticcall` into the Safe; every failure surfaces as `SafeConfigUnreadable`: a revert (a
+    ///      `Panic`, or on the deployed 0.7.6 singletons an `INVALID` opcode that burns the forwarded
+    ///      gas, from `getOwners()` on a Safe whose owner list is longer than its owner count; out of
+    ///      gas), an account without code, or a response of the wrong shape. `expectedLength_ == 0`
+    ///      accepts a well-formed `address[]` (offset word, count word, `count` words) of any count.
     function _read(address safe_, bytes memory call_, uint256 expectedLength_) private view returns (bytes memory _ret) {
         bool _ok;
         (_ok, _ret) = safe_.staticcall(call_);
         uint256 _length = _ret.length;
         if (expectedLength_ == 0) {
             // The count word is only meaningful once `_length >= 64`, which the conjunction checks first;
-            // for a shorter response the load reads past the array (never written) and is discarded.
+            // for a shorter response the load reads past the array and its value is discarded.
             uint256 _count;
             assembly ("memory-safe") {
                 _count := mload(add(_ret, 0x40))
@@ -732,8 +741,11 @@ contract CuratorGuard is CuratorGuardPolicy, ISafeTransactionGuard, ISafeModuleG
         if (!_f.allowed) revert FunctionNotAllowed(to_, _selector);
         // A function call to an account without code never does what the policy author reviewed (a
         // mistyped target one bit off a venue "succeeds" and keeps the value): fail closed. Post-Cancun
-        // code cannot disappear, a counterfactual target becomes callable once deployed, and the
-        // native lane above is untouched, so this costs no liveness.
+        // a contract's code cannot disappear (an EIP-7702 delegated account passes this check with its
+        // 23-byte designator and loses it when its key clears the delegation: an upgradeable venue whose
+        // single admin is that key, failing closed here once revoked; never allowlist one), a
+        // counterfactual target becomes callable once deployed, and the native lane above is untouched,
+        // so this costs no liveness.
         if (to_.code.length == 0) revert NotAContract(to_);
         if (value_ != 0 && !_f.allowValue) revert ValueNotAllowed(to_, _selector);
         uint256 _count = _f.rules.length;

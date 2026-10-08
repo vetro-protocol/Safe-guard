@@ -1,6 +1,17 @@
 import fs from "fs";
 import chalk from "chalk";
-import { FunctionFragment, ParamType, getAddress, isAddress, keccak256, toBeHex, zeroPadValue } from "ethers";
+import {
+  AbiCoder,
+  FunctionFragment,
+  ParamType,
+  getAddress,
+  getBytes,
+  hexlify,
+  isAddress,
+  keccak256,
+  toBeHex,
+  zeroPadValue,
+} from "ethers";
 import type { Contract, EventLog, Interface, Log } from "ethers";
 import { task } from "hardhat/config";
 import type { HardhatRuntimeEnvironment } from "hardhat/types";
@@ -60,7 +71,7 @@ const MAX_SELECTORS = 32;
 const MAX_GUARDIANS = 32;
 const TAIL_FLAG = 0x8000;
 const LOCKDOWN_COOLDOWN = 86_400n;
-// Joint caps on `OneOf` members (IMPROVEMENTS_V2.md item 10, enforced here rather than on-chain). Since
+// Joint caps on `OneOf` members (a v2 robustness item, enforced here rather than on-chain). Since
 // round 8 revocation abandons the sets in O(1) (generation-keyed), but `clearAllowedValues` and a
 // re-allow that drops a `OneOf` rule still iterate every member (≈ 4.3k gas each on committed
 // storage), so a policy must stay far below a block: 256 per function ≈ 1.1 M gas.
@@ -90,6 +101,9 @@ const SAFE_SINGLETON_CODEHASHES = new Map<string, string>([
 // a batch above it is signed, waits the delay and then reverts for every executor (review R6C-09).
 const BATCH_GAS_WARN = 8_000_000n;
 const BATCH_GAS_REFUSE = 12_000_000n;
+// Least `executeBefore` window worth having (seconds): the proposer Safe's signing round eats the window
+// from the preparation side and a block interval or a cancel latency from the execution side.
+const WINDOW_MARGIN = 3_600n;
 const MAX_NOTE_LENGTH = 200;
 const UINT256_MAX = (1n << 256n) - 1n;
 const ZERO_HASH = "0x0000000000000000000000000000000000000000000000000000000000000000";
@@ -213,6 +227,8 @@ const KNOWN_SIGNATURES = new Map<string, string>(
 // cannot stop a malicious quorum (marks chain), but it refuses unit mistakes, caps a single mark, and is
 // the one NAV control that needs no curator signature (docs/curator-guard.md sections 5 and 8).
 const BAND_SHAPED = new Map<string, number>([[selectorOfSignature("updateNewTotalAssets(uint256)"), 0]]);
+// The settles of a NAV-shaped target: they repeat the pending mark, so a band on the mark must be repeated on them.
+const SETTLE_SIGNATURES = ["settleDeposit(uint256)", "settleRedeem(uint256)"];
 // Storage slots that reveal an upgradeable target (ERC-1967, the ZeppelinOS legacy slot used by USDC
 // and cbBTC, EIP-1822).
 const PROXY_SLOTS: [string, string][] = [
@@ -233,6 +249,36 @@ const CANONICAL_SAFE_HANDLERS = new Set([
 ]);
 const SAFE_GUARD_SLOT = "0x4a204f620c8c5ccdca3fd54d003badd85ba500436a431f0cbda4f558c93c34c8";
 const SENTINEL = "0x0000000000000000000000000000000000000001";
+// Canonical Safe libraries an approved delegatecall may legitimately address (safe-deployments 1.37.56,
+// Ethereum, lower-cased). The approval pins the code of `to`, never what an entry inside a batch addresses,
+// so `verify --op` prints an approval's payload one level down and names these (review G11f): a batch into a
+// canonical `MultiSend` is unpacked entry by entry, a migration entry is checked against the canonical
+// `SafeMigration`, and a delegatecall into anything else is marked as unknown code in the Safe's context.
+const CANONICAL_MULTISEND = new Map<string, string>([
+  ["0xa238cbeb142c10ef7ad8442c6d1f9e89e07e7761", "MultiSend v1.3.0"],
+  ["0x998739bfdaadde7c933b942a68053933098f9eda", "MultiSend v1.3.0 (eip155)"],
+  ["0x40a2accbd92bca938b02010e17a5b8929b49130d", "MultiSendCallOnly v1.3.0"],
+  ["0xa1dabef33b3b82c7814b6d82a79e50f4ac44102b", "MultiSendCallOnly v1.3.0 (eip155)"],
+  ["0x38869bf66a61cf6bdb996a6ae40d5853fd43b526", "MultiSend v1.4.1"],
+  ["0x9641d764fc13c8b624c04430c7356c1c7c8102e2", "MultiSendCallOnly v1.4.1"],
+  ["0x218543288004cd07832472d464648173c77d7eb7", "MultiSend v1.5.0"],
+  ["0xa83c336b20401af773b6219ba5027174338d1836", "MultiSendCallOnly v1.5.0"],
+]);
+const CANONICAL_MIGRATIONS = new Map<string, string>([
+  ["0x526643f69b81b008f46d95cd5ced5ec0edffdac6", "SafeMigration v1.4.1"],
+  ["0x6439e7abd8bb915a5263094784c5cf561c4172ac", "SafeMigration v1.5.0"],
+]);
+const MIGRATION_SIGNATURES = [
+  "migrateSingleton()",
+  "migrateWithFallbackHandler()",
+  "migrateL2Singleton()",
+  "migrateL2WithFallbackHandler()",
+];
+const MIGRATION_NAMES = new Map<string, string>(MIGRATION_SIGNATURES.map((sig) => [selectorOfSignature(sig), sig]));
+// The migration library's entry points that put a signature-capable fallback handler back (docs §7.5).
+const HANDLER_REINSTALLING = new Set(
+  ["migrateWithFallbackHandler()", "migrateL2WithFallbackHandler()"].map(selectorOfSignature),
+);
 
 /// `tail`: the rule binds `keccak256(calldata[4 + 32 * wordIndex:])`, the whole tail from that word
 /// (`wordIndex` must be the FIRST dynamic parameter's head word, so every offset word is inside the hash)
@@ -372,11 +418,19 @@ task("curator-guard-sync", "Reconcile a CuratorGuard policy for a Safe against a
     // window, approval or abandoned batch is executable by anyone and must never hide behind a quiet
     // routine check (review R7C-03).
     if (ctx.timelock) {
-      const queue = await pendingOperations(ctx, await timelockScan(hre, ctx, true));
+      const scan = await timelockScan(hre, ctx, true);
+      const queue = await pendingOperations(ctx, scan);
       if (queue.length) {
         console.log(chalk.yellow(`${queue.length} operation(s) pending on the timelock ${ctx.admin}:`));
         for (const q of queue)
           console.log(chalk.yellow(`  ${q.opId} (scheduled in block ${q.block}): ${q.description}`));
+      } else if (scan.degraded) {
+        // A tolerated scan that could not list the queue must never read as an empty queue (review P1b-2).
+        console.log(
+          chalk.yellow(
+            `the timelock's queue could NOT be listed (${scan.degraded}): treat it as unknown, never as empty`,
+          ),
+        );
       } else console.log(chalk.blue(`no operation pending on the timelock ${ctx.admin}`));
     }
     const plan = await planDiff(hre, ctx, policy, false, args.allowUnconstrainedNav === true);
@@ -434,9 +488,15 @@ task(
       const plan = await planDiff(hre, ctx, policy, true, true);
       const wanted = new Set(plan.calls.map((c) => c.data));
       let allMatch = true;
+      let syncShaped = 0;
+      let pendingNamed = 0;
       for (const id of args.op.split(",")) {
         const op = await rebuildOperation(ctx, scan, id.trim());
         const ts: bigint = await ctx.timelock.getTimestamp(op.opId);
+        // An executed operation's calls left the diff when they landed: it is not judged against the current
+        // diff (the drift verdict would be red by construction; review P1b-7).
+        const done = ts === 1n;
+        if (!done) ++pendingNamed;
         console.log(
           chalk.blue(
             `operation ${op.opId}: ${ts === 0n ? "NOT scheduled" : ts === 1n ? "executed" : `ready at ${iso(ts)}`}, ` +
@@ -447,16 +507,44 @@ task(
           const inner = unwrapExecuteBefore(ctx.guardIface, c.data);
           const guardTarget = lower(c.target) === lower(ctx.guard);
           const stillWanted = guardTarget && inner !== undefined && wanted.has(inner.data);
-          allMatch &&= stillWanted;
+          if (!done) {
+            allMatch &&= stillWanted;
+            if (guardTarget && inner !== undefined && SYNC_SELECTORS.has(inner.data.slice(0, 10))) ++syncShaped;
+          }
+          const [first, ...rest] = describeTimelockCall(ctx, c.target, c.data).split("\n");
           console.log(
-            `  [${i}] ${describeTimelockCall(ctx, c.target, c.data)}` +
-              (guardTarget
-                ? stillWanted
-                  ? chalk.green("  (in the current diff)")
-                  : chalk.red("  (NOT in the current diff)")
-                : chalk.red("  (NOT a guard call)")),
+            `  [${i}] ${first}` +
+              (done
+                ? chalk.blue("  (executed)")
+                : guardTarget
+                  ? stillWanted
+                    ? chalk.green("  (in the current diff)")
+                    : chalk.red("  (NOT in the current diff)")
+                  : chalk.red("  (NOT a guard call)")) +
+              rest.map((line) => `\n${line}`).join(""),
           );
         }
+      }
+      // A sync operation is judged against the diff the committed file produces right now; a one-off
+      // (an approval, a window, a role change, a lift: the runbook's own recipes of sections 7.5 and
+      // 7.6) never is, so the verdict names it as such instead of calling it drift (review G11a-4).
+      if (!pendingNamed) {
+        console.log(
+          chalk.blue(
+            "every operation named is already executed: its calls left the diff when they landed; compare them with the " +
+              "signer manifest or the file's history, not with the current diff",
+          ),
+        );
+        return;
+      }
+      if (!allMatch && syncShaped === 0) {
+        console.log(
+          chalk.yellow(
+            "no decoded call is a policy sync: this is a one-off operation (role / incident-sensitive); compare the decoded " +
+              "call with the runbook recipe it came from and with the manifest of whoever scheduled it, never with the policy file",
+          ),
+        );
+        return;
       }
       console.log(
         allMatch
@@ -467,6 +555,23 @@ task(
       );
     },
   );
+
+/// The guard functions a policy sync emits (every call of `planDiff`); any other guard call is a one-off.
+const SYNC_SELECTORS = new Set(
+  [
+    "allowFunction(address,address,bytes4,bool,(uint8,uint16,bytes32)[])",
+    "revokeFunction(address,address,bytes4)",
+    "addAllowedValues(address,address,bytes4,uint16,bytes32[])",
+    "removeAllowedValues(address,address,bytes4,uint16,bytes32[])",
+    "setNativeTransferAllowed(address,address,bool)",
+    "setMultiSendUnwrapper(address,address,bool)",
+    "setModuleAllowed(address,address,bool)",
+    "setGuardian(address,address,bool)",
+    "setRequiredFallbackHandler(address,address,bool)",
+    "enforce(address)",
+    "lockdown(address)",
+  ].map(selectorOfSignature),
+);
 
 /*//////////////////////////////////////////////////////////////
                          CONTEXT AND SUMMARY
@@ -568,8 +673,41 @@ async function governanceSummary(hre: HardhatRuntimeEnvironment, ctx: Ctx): Prom
     for (const h of out) if (await g.hasRole(role, h)) live.push(h);
     return live;
   };
+  // Canaries (review G10e-1): the creation transaction granted the admin role at or after `from`, so a
+  // scan that cannot see that grant while the role is held is an incomplete log stream (a provider that
+  // silently truncates or drops answers), and every list below would be optimistic: refuse instead.
+  if (from !== undefined) {
+    const adminRole: string = await g.DEFAULT_ADMIN_ROLE();
+    const seenAdmin = (await scanLogs(hre, g, g.filters.RoleGranted(adminRole), from)).some(
+      (l) => lower(String((l as EventLog).args.account)) === lower(ctx.admin),
+    );
+    if (!seenAdmin && (await g.hasRole(adminRole, ctx.admin)))
+      throw Error(
+        `log stream incomplete: the guard's RoleGranted(DEFAULT_ADMIN_ROLE, ${ctx.admin}) since block ${from} is missing ` +
+          `from eth_getLogs although the role is held: the scan starts after the grant (pass the timelock's creation block, ` +
+          `not a later one) or the provider truncates or drops logs; either way no list rebuilt from it ` +
+          `(council, guardians, approvals, the timelock's queue) can be trusted; use an RPC that answers completely`,
+      );
+  }
   const council = await holders(councilRole);
   const guardians = await holders(guardianRole);
+  // The address book names the council: a configured council the scan does not show while hasRole says
+  // it holds the role is the same incomplete stream (review G10e-1), like the deploy script's audit.
+  // (loaded at call time: helpers/address imports the hardhat runtime, which a task file cannot at config load)
+  const bookCouncil: string =
+    ctx.chainId === "1"
+      ? ((await import("../helpers/address")).default as typeof import("../helpers/address").default).ethereum.Vetro
+          .curatorGuardCouncil
+      : "";
+  if (
+    bookCouncil &&
+    !council.some((c) => lower(c) === lower(bookCouncil)) &&
+    (await g.hasRole(councilRole, bookCouncil))
+  )
+    throw Error(
+      `log stream incomplete: ${bookCouncil} holds COUNCIL_ROLE but no RoleGranted log was found since block ${from}: ` +
+        `the scan starts after the grant (pass the timelock's creation block) or the provider drops logs`,
+    );
   const unknown = from === undefined ? "(unknown: no log range, pass --timelock-block)" : "none";
   lines.push(`council: ${council.length ? council.join(", ") : unknown}`);
   lines.push(`deployment-wide guardians: ${guardians.length ? guardians.join(", ") : unknown}`);
@@ -617,16 +755,21 @@ async function governanceSummary(hre: HardhatRuntimeEnvironment, ctx: Ctx): Prom
     }
   }
   if (from !== undefined) {
-    const live: string[] = [];
+    // One line per approval id: a re-approval of the same transaction logs the same id again with a
+    // new expiry (review G11e-3).
+    const live = new Map<string, string>();
     for (const l of await scanLogs(hre, g, g.filters.TransactionApproved(ctx.safe), from)) {
       const a = (l as EventLog).args;
       const expiry: bigint = await g.approvalExpiry(a.approvalId);
-      if (expiry > now)
-        live.push(
+      // The hook honours an approval through its expiry second (`block.timestamp <= expiry`).
+      if (expiry >= now)
+        live.set(
+          String(a.approvalId),
           `${a.approvalId} to ${a.to} ${String(a.data).slice(0, 10)} executor ${a.executor} until ${iso(expiry)}`,
         );
     }
-    if (live.length) lines.push(chalk.yellow(`STANDING APPROVALS (${live.length}):\n    ${live.join("\n    ")}`));
+    if (live.size)
+      lines.push(chalk.yellow(`STANDING APPROVALS (${live.size}):\n    ${[...live.values()].join("\n    ")}`));
     const forbidden: string[] = [];
     for (const l of await scanLogs(hre, g, g.filters.UnwrapperCodehashUpdated(), from)) {
       const a = (l as EventLog).args;
@@ -680,6 +823,11 @@ async function planDiff(
 
   const calls: Call[] = [];
   const valueCalls: Call[] = []; // applied after allowFunction: values need their OneOf rule first
+  // Removals go FIRST: the contract checks `MAX_SELECTORS` per target and `MAX_GUARDIANS` per Safe
+  // after the add, so at the cap a rotation (one out, one in) that adds first reverts `TooManyValues`
+  // for the whole batch, although the final set fits (review G11e-1). Every intermediate state of
+  // the direct path is still fail-closed (fewer permissions, never more).
+  const revokeCalls: Call[] = [];
   const NARROWING = new Set(["revokeFunction", "removeAllowedValues", "revokeTarget", "clearAllowedValues"]);
   let revocations = 0;
   const loosenings: string[] = [];
@@ -881,16 +1029,18 @@ async function planDiff(
     }
     onChainFunctions.delete(k);
   }
-  calls.push(...valueCalls);
   for (const f of onChainFunctions.values()) {
     const known = KNOWN_SIGNATURES.get(f.selector);
-    push(`revokeFunction ${f.selector}${known ? ` (${known})` : ""} on ${f.target}`, "revokeFunction", [
-      safe,
-      f.target,
-      f.selector,
-    ]);
+    push(
+      `revokeFunction ${f.selector}${known ? ` (${known})` : ""} on ${f.target}`,
+      "revokeFunction",
+      [safe, f.target, f.selector],
+      revokeCalls,
+    );
     say(chalk.red(`- revoke  ${f.selector}${known ? ` (${known})` : ""} on ${f.target}`));
   }
+  calls.unshift(...revokeCalls);
+  calls.push(...valueCalls);
 
   // --- sets: unwrappers / modules / native transfers (absent key = empty set) -------------------
   const syncSet = async (label: string, want: string[], have: string[], fn: string) => {
@@ -944,6 +1094,11 @@ async function planDiff(
     const have = new Set(((await guard.guardians(safe)) as string[]).map(lower));
     onChainGuardians = have.size;
     const safeOwners = await safeOwnersOf(hre, safe);
+    for (const g of have) {
+      if (want.has(g)) continue;
+      push(`setGuardian ${ethers.getAddress(g)} = false`, "setGuardian", [safe, ethers.getAddress(g), false]);
+      say(chalk.red(`- guardian ${g}`));
+    }
     for (const g of want) {
       if (g === lower(safe) || safeOwners.has(g)) {
         say(
@@ -956,11 +1111,6 @@ async function planDiff(
       if (have.has(g)) continue;
       push(`setGuardian ${ethers.getAddress(g)} = true`, "setGuardian", [safe, ethers.getAddress(g), true]);
       say(chalk.green(`+ guardian ${g}`));
-    }
-    for (const g of have) {
-      if (want.has(g)) continue;
-      push(`setGuardian ${ethers.getAddress(g)} = false`, "setGuardian", [safe, ethers.getAddress(g), false]);
-      say(chalk.red(`- guardian ${g}`));
     }
     if (have.size > 0 && want.size === 0) {
       say(
@@ -1351,6 +1501,17 @@ async function applyAsAdmin(
           `executeBefore ${iso(g.deadline)} (the window counts from NOW, not from when the proposer Safe signs)`,
       ),
     );
+    // The deadline is fixed now and the operation is Ready `minDelay` after the proposer Safe executes
+    // `scheduleBatch`: every hour the signing round takes is an hour less of the window, and a
+    // schedule later than `deadline - minDelay` is dead on arrival. Say when, in clock time, the
+    // proposer must have executed it (review G9e-5 / G11c).
+    const scheduleBy = g.deadline - minDelay;
+    console.log(
+      chalk.yellow(
+        `  the proposer Safe must execute scheduleBatch before ${iso(scheduleBy)} (dead on arrival afterwards); ` +
+          `advised: before ${iso(scheduleBy - WINDOW_MARGIN)}, so at least ${WINDOW_MARGIN / 3600n} h of window remain`,
+      ),
+    );
     for (const c of g.calls) console.log(`    ${c.description}`);
     if (g.lifts) {
       console.log(
@@ -1594,6 +1755,17 @@ async function executeScheduled(
           `${iso(BigInt(op.deadline))} (the window counts from when the batch was prepared); ${cancelHint(op.opId)}, then schedule again`,
       );
     }
+    // A window shorter than the margin is no window: blocks are 12 s apart and a simulation at `latest`
+    // can pass while the transaction lands after the deadline (`DeadlinePassed`, nothing executed).
+    const opens = ts > now ? ts : now;
+    if (BigInt(op.deadline) - opens < WINDOW_MARGIN) {
+      console.log(
+        chalk.yellow(
+          `WARNING: operation ${op.opId} has less than ${WINDOW_MARGIN / 3600n} h between ${ts > now ? "Ready" : "now"} (${iso(opens)}) and its ` +
+            `executeBefore deadline ${iso(BigInt(op.deadline))}: execute at once or ${cancelHint(op.opId)} and schedule again`,
+        ),
+      );
+    }
     pendingOps.push(op);
   }
   if (!pendingOps.length) {
@@ -1724,6 +1896,8 @@ async function executeScheduled(
     for (const op of stored.operations) if ((await timelock.getTimestamp(op.opId)) !== 1n) allDone = false;
     if (allDone) removeState(stateFile);
   }
+  if (scan.degraded)
+    console.log(chalk.yellow(`WARNING: other pending operations could NOT be listed (${scan.degraded})`));
   for (const other of await pendingOperations(ctx, scan)) {
     if (ops.some((o) => o.opId === other.opId)) continue;
     console.log(
@@ -1757,7 +1931,12 @@ type ScanOp = {
   salt?: string;
   kind?: "single" | "batch";
 };
-type Scan = { from: number | undefined; ops: Map<string, ScanOp> };
+type Scan = {
+  from: number | undefined;
+  ops: Map<string, ScanOp>;
+  /// Set when a tolerated scan could not list the queue (the reason): `ops` is then unknown, never empty.
+  degraded?: string;
+};
 
 /// Every `CallScheduled` of the timelock since its creation block, ALL targets (timelock-self and
 /// foreign targets are the dangerous ones; review R6D-14 / R6A-3). Fails closed unless `tolerate`:
@@ -1771,7 +1950,7 @@ async function timelockScan(hre: HardhatRuntimeEnvironment, ctx: Ctx, tolerate: 
     const msg = `the creation block of the timelock ${ctx.admin} is unknown (no deployment record): pass --timelock-block <N> or set CURATOR_GUARD_TIMELOCK_BLOCK, otherwise pending operations cannot be listed`;
     if (!tolerate) throw Error(`${msg} (--allow-pending to go on blind)`);
     console.log(chalk.yellow(`WARNING: ${msg}`));
-    return { from, ops };
+    return { from, ops, degraded: msg };
   }
   let logs: (Log | EventLog)[];
   try {
@@ -1780,7 +1959,26 @@ async function timelockScan(hre: HardhatRuntimeEnvironment, ctx: Ctx, tolerate: 
     const msg = `could not scan the timelock's CallScheduled events (${errorText(e)})`;
     if (!tolerate) throw Error(`${msg}: refusing to schedule blind (--allow-pending to override)`);
     console.log(chalk.yellow(`WARNING: ${msg}`));
-    return { from, ops };
+    return { from, ops, degraded: msg };
+  }
+  // Canary (review G10e-1): the timelock's constructor granted itself DEFAULT_ADMIN_ROLE at `from` or
+  // later; a scan that cannot see it while the role is held is an incomplete stream, and an empty queue
+  // built from it would let a pending operation hide behind "no operation pending".
+  try {
+    const adminRole: string = await timelock.DEFAULT_ADMIN_ROLE();
+    const seenSelf = (await scanLogs(hre, timelock, timelock.filters.RoleGranted(adminRole), from)).some(
+      (l) => lower(String((l as EventLog).args.account)) === lower(ctx.admin),
+    );
+    if (!seenSelf && (await timelock.hasRole(adminRole, ctx.admin))) {
+      const msg = `log stream incomplete: the timelock's RoleGranted(DEFAULT_ADMIN_ROLE, ${ctx.admin}) since block ${from} is missing from eth_getLogs although the role is held: the provider truncates or drops logs, so the queue cannot be listed`;
+      if (!tolerate) throw Error(`${msg}: refusing to schedule blind (--allow-pending to override)`);
+      console.log(chalk.yellow(`WARNING: ${msg}`));
+      return { from, ops, degraded: msg };
+    }
+  } catch (e: unknown) {
+    if (!tolerate) throw e;
+    console.log(chalk.yellow(`WARNING: ${errorText(e)}`));
+    return { from, ops, degraded: errorText(e) };
   }
   for (const l of logs) {
     const a = (l as EventLog).args;
@@ -1852,6 +2050,9 @@ async function creationBlock(hre: HardhatRuntimeEnvironment, ctx: Ctx): Promise<
   const explicit = ctx.blockArg ?? process.env.CURATOR_GUARD_TIMELOCK_BLOCK;
   if (explicit !== undefined && explicit !== "") {
     if (!/^\d+$/.test(explicit)) throw Error(`timelock block must be a block number, got ${explicit}`);
+    // After the head every scan is empty and the canary would blame the provider (review G11e-3).
+    const head = await hre.ethers.provider.getBlockNumber();
+    if (Number(explicit) > head) throw Error(`timelock block ${explicit} is after the chain head ${head}`);
     return Number(explicit);
   }
   const all = await hre.deployments.all();
@@ -1871,6 +2072,11 @@ async function creationBlock(hre: HardhatRuntimeEnvironment, ctx: Ctx): Promise<
   return undefined;
 }
 
+/// Above this many logs in one answer the chunk is split and asked again: a provider that silently
+/// caps an answer never says so, and the guard's own event volume never fills a chunk this far
+/// (review G10e-1, hostile log stream). A single block is always accepted as answered.
+const DENSE_CHUNK_LOGS = 1_000;
+
 /// `queryFilter` in adaptive chunks (public RPCs cap the range), never silently partial.
 async function scanLogs(
   hre: HardhatRuntimeEnvironment,
@@ -1885,7 +2091,12 @@ async function scanLogs(
   while (a <= head) {
     const b = Math.min(head, a + chunk - 1);
     try {
-      out.push(...(await contract.queryFilter(filter, a, b)));
+      const got = await contract.queryFilter(filter, a, b);
+      if (got.length >= DENSE_CHUNK_LOGS && b > a) {
+        chunk = Math.max(1, Math.floor(chunk / 4));
+        continue;
+      }
+      out.push(...got);
       a = b + 1;
     } catch (e: unknown) {
       if (chunk <= 1_000) throw Error(`log scan failed for blocks ${a}-${b}: ${errorText(e)}`);
@@ -1900,16 +2111,24 @@ async function scanLogs(
 //////////////////////////////////////////////////////////////*/
 
 /// Each wrapped call simulated as the admin; returns the summed gas estimate. Calls that depend on an
-/// earlier call of the same batch (`addAllowedValues` before its `allowFunction`: `NoOneOfRule`) are
-/// estimated by a heuristic instead.
+/// earlier call of the same batch (`addAllowedValues` before its `allowFunction`: `NoOneOfRule`; an add
+/// at a set's cap after a removal: `TooManyValues`) are estimated by a heuristic instead.
 async function simulateAsAdmin(hre: HardhatRuntimeEnvironment, ctx: Ctx, payloads: string[]): Promise<bigint> {
   const { ethers } = hre;
   let gas = 0n;
-  for (const data of payloads) {
+  const caps = await cappedSets(ctx, payloads);
+  for (const [i, data] of payloads.entries()) {
     try {
       gas += await ethers.provider.estimateGas({ from: ctx.admin, to: ctx.guard, data });
     } catch (e: unknown) {
       const decoded = decodeRevert(ctx, e);
+      // The contract checks `MAX_GUARDIANS` / `MAX_SELECTORS` after the add, so a removal earlier in
+      // the SAME batch makes room that a call simulated alone cannot see (the batch executes in
+      // order; review G11e-1): the running count decides, and the estimate is a heuristic.
+      if (decoded.startsWith("TooManyValues") && caps.fitsAt(i)) {
+        gas += 150_000n;
+        continue;
+      }
       if (decoded.startsWith("NoOneOfRule")) {
         const inner = unwrapExecuteBefore(ctx.guardIface, data);
         const members = inner ? Number(ctx.guardIface.decodeFunctionData("addAllowedValues", inner.data)[4].length) : 1;
@@ -1933,6 +2152,52 @@ async function simulateAsAdmin(hre: HardhatRuntimeEnvironment, ctx: Ctx, payload
     }
   }
   return gas;
+}
+
+/// Running sizes of the two capped sets (the per-Safe guardians, the selectors of each target) over an
+/// ORDERED batch, from the on-chain state: `fitsAt(i)` says whether the set that payload `i` adds to is
+/// within its cap once every earlier call of the batch has run (review G11e-1).
+async function cappedSets(ctx: Ctx, payloads: string[]): Promise<{ fitsAt: (i: number) => boolean }> {
+  const guard = ctx.guardContract;
+  const safe = lower(ctx.safe);
+  const guardians = new Set(((await guard.guardians(ctx.safe)) as string[]).map(lower));
+  const selectors = new Map<string, Set<string>>();
+  const sizeAfter: (number | undefined)[] = [];
+  const capOf: (number | undefined)[] = [];
+  for (const data of payloads) {
+    let size: number | undefined;
+    let cap: number | undefined;
+    const inner = unwrapExecuteBefore(ctx.guardIface, data);
+    let name: string | undefined;
+    let args: readonly unknown[] = [];
+    try {
+      const parsed = inner ? ctx.guardIface.parseTransaction({ data: inner.data }) : null;
+      name = parsed?.name;
+      args = parsed?.args ?? [];
+    } catch {
+      /* not a guard call: no set touched */
+    }
+    if (name === "setGuardian" && lower(String(args[0])) === safe) {
+      if (args[2]) guardians.add(lower(String(args[1])));
+      else guardians.delete(lower(String(args[1])));
+      size = guardians.size;
+      cap = MAX_GUARDIANS;
+    } else if ((name === "allowFunction" || name === "revokeFunction") && lower(String(args[0])) === safe) {
+      const target = String(args[1]);
+      if (!selectors.has(lower(target))) {
+        const live = ((await guard.selectors(ctx.safe, target)) as string[]).map((w) => lower(w).slice(0, 10));
+        selectors.set(lower(target), new Set(live));
+      }
+      const set = selectors.get(lower(target))!;
+      if (name === "allowFunction") set.add(lower(String(args[2])));
+      else set.delete(lower(String(args[2])));
+      size = set.size;
+      cap = MAX_SELECTORS;
+    }
+    sizeAfter.push(size);
+    capOf.push(cap);
+  }
+  return { fitsAt: (i) => sizeAfter[i] !== undefined && sizeAfter[i]! <= capOf[i]! };
 }
 
 function decodeRevert(ctx: Ctx, e: unknown): string {
@@ -1979,7 +2244,10 @@ function describeTimelockCall(ctx: Ctx, target: string, data: string): string {
       /^(grantRole|revokeRole|renounceRole|beginDefaultAdminTransfer|changeDefaultAdminDelay|setDeploymentGuardian|setGuardian|bypass|approveTransaction|enforce)\b/.test(
         text,
       );
-    return `${prefix}${text}${sensitive ? "  [ROLE / INCIDENT-SENSITIVE]" : ""}`;
+    // The tag belongs on the call's own line: an approval's description continues on further lines with what it
+    // authorises (review G11f), and the queue print joins calls with " | " (review P1b-5).
+    const [first, ...rest] = text.split("\n");
+    return [`${prefix}${first}${sensitive ? "  [ROLE / INCIDENT-SENSITIVE]" : ""}`, ...rest].join("\n");
   }
   if (ctx.timelock && lower(target) === lower(ctx.admin)) {
     try {
@@ -2005,10 +2273,77 @@ function describeGuardCall(iface: Interface, data: string): string {
         return JSON.stringify(a, (_, v) => (typeof v === "bigint" ? v.toString() : v));
       return String(a);
     });
-    return `${parsed.name}(${args.join(", ")})`;
+    const text = `${parsed.name}(${args.join(", ")})`;
+    if (parsed.name !== "approveTransaction") return text;
+    // The content of an approval is the custody (review G11f): say what it authorises, one level down.
+    const authorised = describeApprovedPayload(
+      String(parsed.args[0]),
+      String(parsed.args[2]),
+      String(parsed.args[4]),
+      BigInt(parsed.args[5]),
+    );
+    return `${text}\n      authorises ${authorised}`;
   } catch {
     return `undecodable ${data.slice(0, 10)}`;
   }
+}
+
+type PackedEntry = { operation: number; to: string; value: bigint; data: string };
+
+/// Unpacks `multiSend(bytes)`: op(1) | to(20) | value(32) | length(32) | data, repeated. `undefined` for
+/// anything that does not parse to the end (the contract refuses such a batch at use anyway).
+function unpackMultiSend(data: string): PackedEntry[] | undefined {
+  try {
+    const packed = String(AbiCoder.defaultAbiCoder().decode(["bytes"], "0x" + data.slice(10))[0]);
+    const bytes = getBytes(packed);
+    const out: PackedEntry[] = [];
+    let i = 0;
+    while (i < bytes.length) {
+      if (i + 85 > bytes.length) return undefined;
+      const length = Number(BigInt(hexlify(bytes.slice(i + 53, i + 85))));
+      if (i + 85 + length > bytes.length) return undefined;
+      out.push({
+        operation: bytes[i],
+        to: getAddress(hexlify(bytes.slice(i + 1, i + 21))),
+        value: BigInt(hexlify(bytes.slice(i + 21, i + 53))),
+        data: hexlify(bytes.slice(i + 85, i + 85 + length)),
+      });
+      i += 85 + length;
+    }
+    return out;
+  } catch {
+    return undefined;
+  }
+}
+
+/// One level of what an approval authorises: a Safe self-call by name, a plain call by selector, a
+/// delegatecall by library (a canonical `MultiSend` batch entry by entry, each entry described the same way).
+function describeApprovedPayload(safe: string, to: string, data: string, operation: bigint, depth = 0): string {
+  const pad = "        " + "  ".repeat(depth);
+  const sel = data.length >= 10 ? lower(data.slice(0, 10)) : "0x";
+  const name = data.length <= 2 ? "(empty calldata)" : (KNOWN_SIGNATURES.get(sel) ?? MIGRATION_NAMES.get(sel) ?? sel);
+  if (operation === 1n) {
+    const lib = CANONICAL_MULTISEND.get(lower(to)) ?? CANONICAL_MIGRATIONS.get(lower(to));
+    const flags =
+      (lib ? "" : "  [UNKNOWN CODE IN THE SAFE'S STORAGE CONTEXT: not a canonical Safe library]") +
+      (HANDLER_REINSTALLING.has(sel) ? "  [REINSTALLS A SIGNATURE-CAPABLE FALLBACK HANDLER]" : "") +
+      (MIGRATION_NAMES.has(sel) && !CANONICAL_MIGRATIONS.has(lower(to))
+        ? "  [MIGRATION SELECTOR ON A NON-CANONICAL LIBRARY]"
+        : "");
+    const head = `DELEGATECALL ${to} ${lib ? `(${lib}) ` : ""}${name}${flags}`;
+    const entries =
+      sel === MULTISEND_SELECTOR && CANONICAL_MULTISEND.has(lower(to)) ? unpackMultiSend(data) : undefined;
+    if (!entries) return head;
+    return [
+      head,
+      ...entries.map(
+        (e, i) =>
+          `${pad}#${i} ${e.value !== 0n ? `value ${e.value} ` : ""}${describeApprovedPayload(safe, e.to, e.data, BigInt(e.operation), depth + 1)}`,
+      ),
+    ].join("\n");
+  }
+  if (lower(to) === lower(safe)) return `SELF-CALL ${name}  [SAFE CONFIGURATION]`;
+  return `CALL ${to} ${name}`;
 }
 
 /// The PUSH solc emits for a 4-byte selector: leading zero bytes are dropped (`PUSH1`..`PUSH4`).
@@ -2115,7 +2450,9 @@ async function isForkNode(hre: HardhatRuntimeEnvironment): Promise<boolean> {
   return false;
 }
 
-/// The admin as a `TimelockController`, or `undefined` when it does not answer `getMinDelay()`.
+/// The admin as a `TimelockController`, or `undefined` when it does not answer `getMinDelay()` (an
+/// EVM-level answer); a transport error is thrown, never read as "not a timelock" (the queue, the
+/// council's timelock roles and the proposer check would silently drop out of the run; review G11e-3).
 async function timelockAt(hre: HardhatRuntimeEnvironment, admin: string): Promise<Contract | undefined> {
   const { ethers } = hre;
   if ((await ethers.provider.getCode(admin)) === "0x") return undefined;
@@ -2123,8 +2460,12 @@ async function timelockAt(hre: HardhatRuntimeEnvironment, admin: string): Promis
   try {
     await timelock.getMinDelay();
     return timelock;
-  } catch {
-    return undefined;
+  } catch (e: unknown) {
+    const code = (e as { code?: string }).code;
+    const message = errorText(e);
+    if (code === "CALL_EXCEPTION" || code === "BAD_DATA" || /revert|could not decode result data/i.test(message))
+      return undefined;
+    throw Error(`could not read ${admin} as a TimelockController (${message}): refusing to continue on a failed read`);
   }
 }
 
@@ -2265,6 +2606,31 @@ function ruleWord(r: PolicyRule, v: string): string {
   if (!/^0x([0-9a-fA-F]{2})*$/.test(v))
     throw Error(`tail rule value ${v} must be hex (a 32-byte hash, or the raw tail bytes)`);
   return /^0x[0-9a-fA-F]{64}$/.test(v) ? lower(v) : lower(keccak256(v));
+}
+
+/// A raw tail must be the CANONICAL encoding of the parameters from word `wordIndex` on (review G10b-1): with
+/// `wordIndex` zero words in front it must decode as the full parameter list and re-encode to the same bytes.
+/// Any other layout binds bytes whose meaning the callee reads differently: an offset that points back into a
+/// static word before `wordIndex` makes that word (unbound unless it carries its own rule) the length or the
+/// contents of the dynamic parameter, so the signers can change the payload the venue decodes without
+/// touching the hashed tail. A venue that does not decode the standard way can still be bound by giving the
+/// 32-byte hash itself, which this check does not see.
+function assertCanonicalTail(fragment: FunctionFragment, wordIndex: number, raw: string, where: string): void {
+  const full = "0x" + "00".repeat(32 * wordIndex) + raw.slice(2);
+  let decoded: unknown[];
+  try {
+    decoded = AbiCoder.defaultAbiCoder().decode(fragment.inputs, full).toArray();
+  } catch (e) {
+    throw Error(
+      `${where}: tail bytes do not decode as ${fragment.format("sighash")} from word ${wordIndex}: ${(e as Error).message}`,
+    );
+  }
+  if (lower(AbiCoder.defaultAbiCoder().encode(fragment.inputs, decoded)) !== lower(full))
+    throw Error(
+      `${where}: tail bytes are not the canonical encoding of ${fragment.format("sighash")} from word ${wordIndex} ` +
+        `(an offset points elsewhere, or the padding differs): the callee would read a payload the hash does not pin; ` +
+        `re-encode the reviewed call, or give the 32-byte hash for a venue that does not decode the standard way`,
+    );
 }
 
 function toWord(v: string, type?: string): string {
@@ -2448,7 +2814,8 @@ function validatePolicy(p: unknown): string[] {
     const rules = fn.rules ?? [];
     if (!Array.isArray(rules)) throw Error(`${where}: rules must be an array`);
     if (rules.length > MAX_RULES) throw Error(`${where}: at most ${MAX_RULES} rules`);
-    const types = headTypes(FunctionFragment.from(fn.signature));
+    const fragment = FunctionFragment.from(fn.signature);
+    const types = headTypes(fragment);
     let members = 0;
     const perWord = new Map<number, RuleKind[]>();
     for (const r of rules as unknown[]) {
@@ -2506,6 +2873,7 @@ function validatePolicy(p: unknown): string[] {
         if (rule.value !== undefined) throw Error(`${where}: OneOf takes 'values', not 'value'`);
         const words = new Set<string>();
         for (const v of rule.values) {
+          if (rule.tail && !/^0x[0-9a-fA-F]{64}$/.test(v)) assertCanonicalTail(fragment, rule.wordIndex, v, where);
           const w = rule.tail ? ruleWord(rule, v) : toWord(v, type);
           if (words.has(w)) throw Error(`${where}: OneOf member ${v} listed twice`);
           words.add(w);
@@ -2519,6 +2887,8 @@ function validatePolicy(p: unknown): string[] {
         if (typeof rule.value !== "string")
           throw Error(`${where}: ${rule.kind} needs 'value' as a string (decimal, address or 32-byte hex)`);
         if (rule.values !== undefined) throw Error(`${where}: ${rule.kind} takes 'value', not 'values'`);
+        if (rule.tail && !/^0x[0-9a-fA-F]{64}$/.test(rule.value))
+          assertCanonicalTail(fragment, rule.wordIndex, rule.value, where);
         const w = BigInt(rule.tail ? ruleWord(rule, rule.value) : toWord(rule.value, type));
         if (rule.kind === "LessThanOrEqual" && w === UINT256_MAX)
           throw Error(`${where}: LessThanOrEqual 2^256-1 on word ${rule.wordIndex} bounds nothing`);
@@ -2586,6 +2956,44 @@ function validatePolicy(p: unknown): string[] {
           );
         }
       }
+    }
+  }
+  // A settle repeats whatever mark is pending (`WrongNewTotalAssets` otherwise), a `securityCouncilUpdateTotalAssets`
+  // mark included once that role sits outside the Safe (docs section 8): a band on the mark entry alone then
+  // bounds nothing the settles cannot pay out. A banded mark needs the same band on both settles of its target
+  // (review G11b-2); the settles of an unconstrained mark stay free, as shipped.
+  const fns = p.functions as unknown as PolicyFunction[];
+  // Every word-0 rule of a function as the chain compares it (kind and value word(s)), in a canonical order. The
+  // band-shape check above lets a constrained mark carry a floor + ceiling, an `EqualTo` (a fixed mark) or a
+  // `OneOf` set on word 0: the settles must repeat whichever of these it carries, exactly (review P1b-1).
+  const navRules = (f: PolicyFunction): string[] =>
+    (f.rules ?? [])
+      .filter((r) => r.wordIndex === 0 && !r.tail)
+      .map((r) =>
+        r.kind === "EqualToSafe"
+          ? r.kind
+          : r.kind === "OneOf"
+            ? `${r.kind} {${(r.values ?? [])
+                .map((v) => BigInt(ruleWord(r, v)))
+                .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+                .join(", ")}}`
+            : `${r.kind} ${BigInt(ruleWord(r, r.value!))}`,
+      )
+      .sort();
+  for (const mark of fns) {
+    if (!BAND_SHAPED.has(selectorOf(mark)) || mark.unconstrained) continue;
+    const want = navRules(mark);
+    if (!want.length) continue; // unreachable: a constrained mark carries a floor and a ceiling (checked above)
+    for (const sig of SETTLE_SIGNATURES) {
+      const settle = fns.find(
+        (f) => lower(f.target) === lower(mark.target) && selectorOf(f) === selectorOfSignature(sig),
+      );
+      if (!settle) continue;
+      if (navRules(settle).join("; ") !== want.join("; "))
+        throw Error(
+          `${sig} on ${mark.target}: must repeat the NAV band of updateNewTotalAssets (${want.join(" + ")} on word 0): ` +
+            `the settle repeats whatever mark is pending, a securityCouncil mark included (review G11b-2)`,
+        );
     }
   }
   return warnings;

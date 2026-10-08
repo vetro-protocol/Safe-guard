@@ -48,8 +48,8 @@ jobs:
       - name: Lint the policy files (corpus)
         run: ./scripts/curator-guard-lint-corpus.sh
 
-      # Same solc settings as the deployed bytecode (10 runs, cancun). The *.e2e.ethereum suites need the
-      # ETHEREUM_FORK_NODE_URL secret (archive RPC).
+      # Same solc settings as the deployed bytecode (10 runs, cancun). The fork suites (*.e2e.ethereum, G10d_Fork,
+      # G11b_Policy, G9a_CanonicalProxyHashes) need the ETHEREUM_FORK_NODE_URL secret (archive RPC) at the pinned block.
       - name: Run tests
         run: forge test -vvv
         env:

@@ -492,7 +492,15 @@ async function auditTimelock(
 
 async function creationBlock(hre: HardhatRuntimeEnvironment, address: string): Promise<number | undefined> {
   const explicit = process.env.CURATOR_GUARD_TIMELOCK_BLOCK;
-  if (explicit) return Number(explicit);
+  if (explicit) {
+    // Validated as the sync task does: `Number("abc")` is NaN, every scan is then empty and the audit
+    // reports every expected holder as "held without a log" (review G11e-3).
+    if (!/^\d+$/.test(explicit)) throw Error(`CURATOR_GUARD_TIMELOCK_BLOCK must be a block number, got ${explicit}`);
+    const head = await hre.ethers.provider.getBlockNumber();
+    if (Number(explicit) > head)
+      throw Error(`CURATOR_GUARD_TIMELOCK_BLOCK ${explicit} is after the chain head ${head}`);
+    return Number(explicit);
+  }
   const d = Object.values(await hre.deployments.all()).find((x) => x.address.toLowerCase() === address.toLowerCase());
   if (d?.receipt?.blockNumber !== undefined) return Number(d.receipt.blockNumber);
   return undefined;

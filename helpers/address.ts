@@ -22,7 +22,7 @@ const A = {
       // Safe v1.4.1 (2-of-4) that is both `safe()` (custody) and `owner()` of every Lagoon.vault.Vetro_*
       // above. `CuratorGuard` policies are keyed by this address (policies/curator-guard/).
       lagoonCuratorSafe: "0x1b534a8543212F5957168D83311A41E0Ea1cfe48",
-      // CuratorGuard v2 roles (docs/curator-guard.md sections 4 and 12, IMPROVEMENTS_V2.md item 1).
+      // CuratorGuard v2 roles (docs/curator-guard.md sections 4 and 12; the v2 role split in section 13).
       // `curatorGuardProposers`: the Safes that PROPOSE widenings to the CuratorGuardTimelock, which is
       // the guard's DEFAULT_ADMIN. Proposed: the Vetro governance Safe (v1.4.1, 3-of-6) that is
       // `governor()` of every Vetro yield vault and of the Lagoon_Vetro_* strategies (same address as

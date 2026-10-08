@@ -1,0 +1,1 @@
+rule value: address 0x131ccfdffed712885aac31445d351e6b62656679 must be EIP-55 checksummed

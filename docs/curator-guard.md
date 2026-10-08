@@ -98,7 +98,7 @@ council Safe   ──────────────── enforce / lockdo
 guardians      ──────────────── lockdown(AndRevoke) / revoke / removeAllowedValues / revokeApproval ▶ CuratorGuard
 ```
 
-Roles (OpenZeppelin `AccessControlDefaultAdminRules`; see also IMPROVEMENTS_V2.md item 1):
+Roles (OpenZeppelin `AccessControlDefaultAdminRules`; the v2 role split is recorded in §13):
 
 - **admin** (`DEFAULT_ADMIN_ROLE`, exactly one account, two-step transfer with a delay; in production
   the `CuratorGuardTimelock`, an OpenZeppelin `TimelockController` whose role set is fixed by its
@@ -118,9 +118,11 @@ Roles (OpenZeppelin `AccessControlDefaultAdminRules`; see also IMPROVEMENTS_V2.m
   operation up to 30 days out, so the honest `scheduleBatch` reverts and the honest wrapper is dead on
   arrival, review G10c-1), calldata for a target without code (which `execute` refuses again)
   and an `updateDelay` outside the clamp): the only role that can **widen** a policy (`allowFunction(s)`,
-  `addAllowedValues`, `set…(true)`, re-allowing a seeded unwrapper hash, `setRequiredFallbackHandler`),
-  issue approvals of up to 180 days, open a `Bypass` window of up to 180 days in which nothing is
-  checked (except that the guard itself is never a call target), and administer roles. Every widening therefore sits in public for the timelock's `minDelay` (48 h by
+  `addAllowedValues`, `setNativeTransferAllowed` / `setMultiSendUnwrapper` / `setModuleAllowed` with
+  `true`, `setRequiredFallbackHandler`; re-allowing a seeded unwrapper hash and seating guardians are
+  admin OR council), issue approvals of up to 180 days, open a `Bypass` window of up to 180 days in
+  which nothing is checked (except that the guard itself is never a call target and a module must
+  still be allowlisted), and administer roles. Every widening therefore sits in public for the timelock's `minDelay` (48 h by
   default) and can be cancelled by a canceller before it bites; the sync task wraps every scheduled call
   in `executeBefore(deadline, …)` so a batch nobody executed in time is dead rather than a latent,
   permissionless action. For one day after any lockdown of a Safe the admin's `enforce`, `bypass` and
@@ -143,7 +145,10 @@ Roles (OpenZeppelin `AccessControlDefaultAdminRules`; see also IMPROVEMENTS_V2.m
   TRANSFER reads more (the council role, a live window and the per-Safe guardians of the pending
   admin), so a council that does not cooperate can stall a hand-over for as long as it holds the role:
   evict it in one batch, `[revokeRole(COUNCIL_ROLE, old), setGuardian(newAdmin, key, false),
-  lockdown(newAdmin)]`, then accept inside the 30 days, or begin again (review G9c-1). And no
+  lockdown(newAdmin)]`, then accept inside the 30 days, or begin again (review G9c-1; a key the council
+  plants after the batch was prepared survives it and costs one more operation, and a per-Safe guardian
+  set the council filled to its 32 makes the admin's own `setGuardian(safe, key, true)` revert
+  `TooManyValues` until the batch empties it, review G10c-6). And no
   role is honoured for a caller that answers as a Safe with THIS guard in its fallback-handler slot
   (`Unauthorized`; the timelock has the same rail for its proposers and its veto, `ForwardedCall`):
   such a Safe forwards anyone's call here with itself as the caller, so its role would be public. The admin
@@ -213,7 +218,7 @@ Per-Safe policy (`SafePolicy`):
 | `mode` / `bypassUntil` / `councilBypass` | `Lockdown` (default: deny all but approvals), `Enforced` (allowlist), `Bypass` (policy off until `bypassUntil`, emergency only; a council window keeps the council's self-call allowlist, the module allowlist, the unwrapper-only delegatecall rule and the gas-refund refusal, an admin window keeps the guard unreachable as a call target and the module allowlist). A window opened at `t` for `d` seconds (1 h ≤ d ≤ cap) covers `t … t+d-1`; at `t+d` the Safe reads as `Lockdown`, agreed by `mode()`, both hooks and the dry run (approvals, by contrast, are valid through their `expiry` second inclusive). `bypassWindow(safe)` returns the window end and who opened it |
 | `enforceFallbackHandler` / `requiredFallbackHandler` | when enforced, non-approved traffic requires the Safe's fallback handler to be NONE or the configured address (use `address(0)`); no handler is always acceptable (nothing signs, nothing is forwarded), so the council's `setFallbackHandler(0)` fixes every requirement. Never the Safe itself nor the guard (`InvalidTarget`) |
 | `functions[target][selector]` | `allowed`, `allowValue` (payable), `rules[]` (≤ 16, ANDed); at most 32 selectors per target |
-| `allowedValues[(target, selector, wordIndex, generation)]` | membership set (≤ 128 members) for a live `OneOf` rule; cleared when its rule is dropped, abandoned in O(1) when the function is revoked (the function's `generation` is bumped and folded into the key: a re-allow starts from empty sets and revocation never iterates members) |
+| `allowedValues[(target, selector, wordIndex, generation)]` | membership set (≤ 128 members) for a live `OneOf` rule; cleared when its rule is dropped (about 12k gas per committed member, 1.6 M for a full set; a re-allow that drops several full sets clears all of them in one call, which the lint's joint cap of 256 members per function keeps inside one transaction, review G11c-1), abandoned in O(1) when the function is revoked (the function's `generation` is bumped and folded into the key: a re-allow starts from empty sets and revocation never iterates members) |
 | `nativeTransferAllowed[target]` | empty-calldata calls (plain ETH transfers, also zero-value) |
 | `multiSendUnwrappers` | delegatecall targets whose `multiSend(bytes)` payload is unwrapped; their runtime code hash must be in the deployment-wide allowlist at registration and at every use. The allowlist can only ever contain the canonical `MultiSendCallOnly` v1.3.0 / v1.4.1 / v1.5.0 hashes seeded in the constructor (guardians forbid, the admin re-allows a seeded one; nothing else can be added: a new Safe release means a new guard) |
 | `modules` | Safe modules allowed to execute (v1.5.0 module guard path) |
@@ -283,10 +288,14 @@ Evaluation order in `checkTransaction` / `checkModuleTransaction` (the tests pin
 3. The Safe's guard slot of this path (the transaction-guard slot on the owner path, the module-guard
    slot on the module path) must name this guard → `GuardNotInstalled` otherwise (an account that
    cannot answer `getStorageAt` is `SafeConfigUnreadable`). A replacement guard is therefore inert
-   until the Safe adopts it and a retired one from the swap on: neither can spend approvals, use
-   windows or emit reports when the installed guard lets the Safe call it. Not checked in the
-   post-hook (an approved `setGuard` moves the slot inside the transaction and the Safe calls the
-   cached guard) nor in the dry runs (the pre-swap checklist simulates against the replacement).
+   until the Safe adopts it and a retired one from the swap on: neither can spend approvals or use
+   windows when the installed guard lets the Safe call it. Not checked in the post-hook (an approved
+   `setGuard` moves the slot inside the transaction and the Safe calls the cached guard) nor in the
+   dry runs (the pre-swap checklist simulates against the replacement); so a post-hook reached on
+   its own by a Safe that holds a live window on a guard it does not have installed still emits a
+   `Bypass` report from that guard (a replacement before adoption, through the installed guard's
+   admin window; a retired guard until its window ends or `lockdownAndRevoke`): a monitoring
+   artefact, never a transaction that guard checked (review G10a-1).
 4. Module path only: the module must be allowlisted (`ModuleNotAllowed`), in EVERY mode, approval or
    not: a guardian's `setModuleAllowed(false)` is a complete switch for that key, inside admin and
    council windows too (the read is of the guard's own storage, so it never stands in the way of a
@@ -339,7 +348,10 @@ Evaluation order in `checkTransaction` / `checkModuleTransaction` (the tests pin
    (`UnwrapperCodehashNotAllowed` otherwise), `value == 0`, payload strictly decoded; every entry
    is checked as in step 11; entries with `operation != 0` or `to == address(0)` are rejected (v1.5.0
    `MultiSendCallOnly` rewrites a zero `to` to the calling Safe). Any other delegatecall →
-   `DelegateCallNotAllowed`.
+   `DelegateCallNotAllowed`. Every entry is checked before the first one executes, against the guard's
+   state at that moment: a mode change that lands in the middle of the batch (a venue that holds a
+   guardian seat calling `lockdown`) does not stop the entries already admitted; the post-hook compares
+   the configuration digest, of which the mode is no part, and the NEXT transaction is refused.
 11. `Call`: `to == safe` → `SelfCallNotAllowed` (so `setGuard`, `enableModule`, `swapOwner`,
    `changeThreshold`, `setFallbackHandler`, `setModuleGuard` are unreachable except via an
    approval), with one exception: the empty, zero-value self-call Safe{Wallet} uses to reject a queued
@@ -355,8 +367,11 @@ Post-execution (`checkAfterExecution` / `checkAfterModuleExecution`), one transi
 
 - the call must be exactly the 68 bytes of an after-hook (`ForwardedHookCall` otherwise): a call
   forwarded by a Safe's fallback carries the caller's 20 bytes, at that exact length in the low bytes
-  of `success`, which the ABI decoder refuses as a dirty `bool`. A report can therefore never be
-  forged through a Safe whose fallback handler is the guard;
+  of `success`, which the ABI decoder refuses as a dirty `bool`. A report can therefore not be forged
+  through a forwarded hook call; a forwarded `executeBefore(deadline, checkAfterExecution(…))`
+  re-dispatches the hook to the guard at its own length with the Safe as caller and, inside a window,
+  forges one for any hash (review G9a-1, held: the `_refuseForwarded()` rail in `executeBefore` closes
+  it; until then the handler requirement is what keeps the Safe out of that state);
 
 - read and clear the slot **first**, so nothing can leak into a later Safe transaction of the same
   EVM transaction whatever happens next;
@@ -441,13 +456,13 @@ parameter decides where value ends up, and is it pinned?*
 
 | Venue call | Rule to pin |
 |---|---|
-| `ERC20.approve(spender, amount)` | `OneOf` on word 0 = the venues that may pull (never unconstrained: `approve(attacker, max)` + `transferFrom` is a full drain). |
+| `ERC20.approve(spender, amount)` | `OneOf` on word 0 = the venues that may pull (never unconstrained: `approve(attacker, max)` + `transferFrom` is a full drain). Optionally `LessThanOrEqual` on word 1: the allowance is what a venue that turns hostile (an upgraded implementation, a backdoor) takes in one allowlisted call, so a cap sized to one settlement bounds that take to one cap per curator approval, at the cost of an `approve` entry in every batch that settles a redeem (review G10d-1). |
 | `ERC20.transfer` / `transferFrom` | Do not allowlist. Use a one-shot approval for a deliberate transfer. |
 | `ERC4626.deposit(assets, receiver)` / `mint(shares, receiver)` | `EqualToSafe` on word 1. |
 | `ERC4626.withdraw(assets, receiver, owner)` / `redeem(shares, receiver, owner)` | `EqualToSafe` on words 1 and 2. |
 | Aave v3 `supply(asset, amount, onBehalfOf, ref)` / `withdraw(asset, amount, to)` | `EqualToSafe` on word 2; `OneOf` on word 0 if only some assets are allowed. |
 | Morpho Blue `supply(marketParams(5 words), assets, shares, onBehalf, data)` | static struct is inlined: `onBehalf` is word 7, `EqualToSafe`; market pinned with `EqualTo` on words 0–4. |
-| Lagoon `settleDeposit(uint256)` / `settleRedeem(uint256)` / `updateNewTotalAssets(uint256)` | a static band on word 0 of `updateNewTotalAssets` (`GreaterThanOrEqual` + `LessThanOrEqual` around the settled NAV; banding that one function suffices, the settles must repeat the proposed value) refuses unit mistakes and caps a single mark, and it is the one NAV control that needs no curator signature. It does not bound a malicious quorum (marks chain inside one block: a ±5 % band still costs about 0.25 % of NAV per cycle) and it must be re-synced with every funding step, or honest settlement stops at the ceiling. The validator demands a band or an explicit `"unconstrained": true`. NAV honesty remains a Lagoon-role question (§8): guardrails bound `updateNewTotalAssets` only once `securityCouncil` has activated them with real bounds, which is not the case on the live vaults. |
+| Lagoon `settleDeposit(uint256)` / `settleRedeem(uint256)` / `updateNewTotalAssets(uint256)` | a static band on word 0 of `updateNewTotalAssets` (`GreaterThanOrEqual` + `LessThanOrEqual` around the settled NAV; band the two settles of that vault with the SAME bounds: a settle repeats whatever mark is pending, `WrongNewTotalAssets` otherwise, and once `securityCouncil` sits outside the Safe (§8) a mark that role places meets no guardrail and, without the band on the settles, no guard either; the lint demands the repetition, review G11b-2) refuses unit mistakes and caps a single mark, and it is the one NAV control that needs no curator signature. It does not bound a malicious quorum (marks chain inside one block: a ±5 % band still costs about 0.25 % of NAV per cycle) and it must be re-synced with every funding step, or honest settlement stops at the ceiling. The validator demands a band or an explicit `"unconstrained": true`. NAV honesty remains a Lagoon-role question (§8): guardrails bound `updateNewTotalAssets` only once `securityCouncil` has activated them with real bounds, which is not the case on the live vaults. |
 | Payable calls (`WETH.deposit()`) | `allowValue: true`; plain ETH sends need `nativeTransfers`. |
 | Swaps (routers, aggregators, CowSwap) | Not expressible safely with static words alone (recipient + min-out + path all matter). Prefer a one-shot approval per swap, or Zodiac Roles. Never allowlist `SignMessageLib` delegatecalls: an EIP-1271-signed order can sell the Safe's balance. |
 
@@ -457,15 +472,23 @@ the signature and rejects a word rule on a dynamic word or beyond the head. `add
 functions such as Lagoon's `claimSharesOnBehalf(address[])` are fine to allow without rules
 because the beneficiaries are the controllers themselves.
 
-A dynamic payload can be bound exactly with a TAIL rule: `{"kind": "EqualTo", "wordIndex": N, "tail":
-true, "value": <hash or raw tail bytes>}` binds `keccak256(calldata[4 + 32·N:])`, everything from
-head word N to the end of the calldata; `OneOf` with `"values"` binds a set of reviewed payloads that
-guardians can trim. N must be the head word of the FIRST dynamic parameter: from there every offset
-word is inside the hash, and the static words before it keep their own rules. A later N would leave
-the offset word of an earlier dynamic parameter outside the hash, and an ABI decoder reads that
-parameter from wherever the offset points (empty, or another parameter's bytes), so the rule would
-bind the bytes but not their meaning; the lint refuses it. The value is the 32-byte hash, or the raw
-tail bytes, which the tool hashes.
+A dynamic payload can be bound exactly with a TAIL rule: `{"kind": "EqualTo", "wordIndex": N,
+"tail": true, "value": <hash or raw tail bytes>}` binds `keccak256(calldata[4 + 32·N:])`, everything
+from head word N to the end of the calldata (inside a batch, to the end of that entry's own
+calldata: the hash never reaches the next entry or the padding); `OneOf` with `"values"` binds a set
+of reviewed payloads that guardians can trim. N must be the head word of the FIRST dynamic
+parameter: from there every offset word is inside the hash, and the static words before it keep
+their own rules. A later N would leave the offset word of an earlier dynamic parameter outside the
+hash, and an ABI decoder reads that parameter from wherever the offset points (empty, or another
+parameter's bytes), so the rule would bind the bytes but not their meaning; the lint refuses it. The
+value is the 32-byte hash, or the raw tail bytes, which the tool hashes. Prefer the raw bytes: the
+lint checks that they are the canonical encoding of the parameters from word N (decoded with the
+signature and re-encoded to the same bytes). A reviewed payload that is NOT canonical binds bytes
+but not meaning even from the first dynamic word: its offset can point back into a static word
+before N, and a static word without a rule (the lint only warns for unbound `address` words) then
+becomes the length or the contents of the dynamic parameter, so the signers change what the venue
+decodes without touching the hashed tail (review G10b-1). The 32-byte hash is accepted unchecked,
+for a venue that does not decode calldata the standard way.
 Compute it from the exact calldata the signers will send (`cast keccak $(cast calldata … | cut -c
 <11 + 64·N>-)` on the hex after the selector and N words): a re-encoding of the same logical payload
 is a different hash and is refused. This is the honest way to allow ONE reviewed batch on a venue
@@ -501,8 +524,8 @@ Safe (via `helpers/safe.ts`), executed with `--execute` once `minDelay` has pass
 full desired state: an absent `multiSendUnwrappers` / `modules` / `nativeTransfers` key means
 "none", on-chain functions missing from the file are revoked, and `requiredFallbackHandler` and
 `guardians` are mandatory (`guardians` are this Safe's narrow-only responders, synced as a full set;
-deployment-wide responders hold `GUARDIAN_ROLE` instead). `mode` may only be `Lockdown` or
-`Enforced`, and moving a Safe out of `Lockdown` / `Bypass` needs `--allow-unlock`. The validator
+deployment-wide responders hold `GUARDIAN_ROLE` instead). Moving a Safe out of `Lockdown` /
+`Bypass` needs `--allow-unlock`. The validator
 is strict (unknown keys, non-boolean flags, missing or non-canonical signatures, selector/signature
 mismatch, word rules beyond the head or on dynamic words, unbounded lower bounds, more than 16 rules or
 128 `OneOf` members per rule, more than 32 functions per target and more than 32 guardians (contract
@@ -557,7 +580,8 @@ Blocked (all covered by tests in `test/guards/`):
   singleton or account, a release the guard was never reviewed against (`SafeNotSupported`), or next
   to a linked module the guard does not hook (`ModuleNotHooked`).
 - Driving the hooks without a Safe transaction: through the Safe's fallback forwarding (no approval
-  is spent and no report emitted that way, `ForwardedHookCall`), or on a guard the Safe does not have
+  is spent that way, `ForwardedHookCall`; a `Bypass` report can still be forged inside a window through
+  a forwarded `executeBefore`, review G9a-1, held), or on a guard the Safe does not have
   installed on that path, a replacement before adoption and a retired guard after the swap included
   (`GuardNotInstalled`).
 - Using a role through a role-holding Safe's fallback forwarding (the council Safe, a guardian Safe, a
@@ -591,6 +615,11 @@ Residual (document, monitor, mitigate outside the guard):
   `[revokeRole(old), grantRole(new), lockdownAndRevoke(safe)]` per Safe and never a lift: what a
   council did in its last hour (a 7-day window it opened, 7-day approvals, a guardian it planted)
   outlives the role, and the new council, which the cooldown does not hold back, clears it at once.
+  What it NARROWED in that hour (`revokeTarget`, `revokeFunction`, `clearAllowedValues`, an unwrapper
+  it de-registered) outlives the role too and the new council cannot restore it: only the timelock
+  widens those (a forbidden canonical hash is the one narrowing the new council undoes itself,
+  `setUnwrapperCodehash(h, true)`, §7.7), so chain the full re-assertion of the policy file behind the
+  rotation (§7.5) or settlement stays frozen for one more `minDelay` after the lift (review G10c-3).
 - **The veto Safe is the one trusted veto, and it proposes nothing.** A canceller can cancel its
   own removal. A canceller that could also propose would therefore be, once compromised, an unvetoed
   takeover: it schedules what it likes, nobody can cancel, and after one `minDelay` the council is
@@ -600,15 +629,25 @@ Residual (document, monitor, mitigate outside the guard):
   leave the Safe by a council-approved custody move to a fresh Safe (§7.6). The contract enforces the
   separation (`CancellerCannotPropose` / `ProposerCannotCancel`), the deploy script wants exactly one
   canceller, and a 2-of-3 veto Safe of three distinct governance parties turns even that deadlock
-  into a majority decision. A compromised proposer is cancellable and removable. The lockdown
+  into a majority decision. A compromised proposer is cancellable and removable, after one `minDelay`
+  and provided every operation it schedules is vetoed as it appears; its queue outlives its removal
+  (cancel everything it scheduled, review G10c-4). An operation id carries neither its proposer nor
+  its delay, so the timelock pins every operation delay to the live `getMinDelay()`: a proposer that
+  schedules the honest proposer's exact operation first only places that operation on time, and can
+  neither cancel it (a proposer is never a canceller) nor park it later (every schedule is at the live
+  minimum). With any longer delay allowed, as before review G10c-1, it could have parked the honest
+  operation, and its own removal, up to 30 days out. The lockdown
   cooldown protects against STALE honest operations, not against a hostile proposer: a widening, a
   role grant or an approval routed through a freshly granted council all execute during the cooldown,
-  so the cancel inside `minDelay` is the control, and bots page the veto Safe on any `CallScheduled`
-  that targets the timelock itself, a foreign contract, or carries `grantRole` / `revokeRole` /
-  `updateDelay` / `beginDefaultAdminTransfer`, and on `grantRole(CANCELLER_ROLE, …)` in particular
-  (the number of cancellers is not enforced on-chain: a rotation needs two for one batch). A guarded
-  veto Safe is a veto that cannot be used (`cancel` is a Safe transaction): `ChangedGuard` on it means
-  "the veto is gone" until §7.6 step 5 is run.
+  so the cancel inside `minDelay` is the control, and bots page the veto Safe on EVERY `CallScheduled`
+  whose id the operator's own state file and manifest do not hold: an approval, a window, a widening,
+  a guardian change or `changeDefaultAdminDelay` scheduled on the guard are as dangerous as a role
+  change and carry none of the selectors a selector list would name (review G10c-2), and the
+  timelock's self-calls and `grantRole(CANCELLER_ROLE, …)` page in particular (the number of
+  cancellers is not enforced on-chain: a rotation needs two for one batch). A guarded veto Safe is a
+  veto that cannot be used (`cancel` is a Safe transaction): `ChangedGuard` on it means "the veto is
+  gone" until the council opens a window on it (`cancel` is a plain call to a foreign contract and
+  passes there at once, review G10c-5) or §7.6 step 5 is run.
 - **Admin / council key overlap with the curator.** Today's governance Safe is 3-of-6 and three
   of its owners are curator-Safe owners, so with it as proposer three colluding curator keys could
   queue any widening, open a `Bypass` or approve anything. v2 makes this a deployment-time refusal:
@@ -640,10 +679,14 @@ Residual (document, monitor, mitigate outside the guard):
   still pays an outside depositor in proportion to that depositor's own stake), then `securityCouncil`
   at Vetro with guardrails activated with real bounds, and decide who holds `valuationManager`. Two
   guard-side rule kinds that would bound a mark absolutely and separate it in time from its settle
-  were designed and measured in round 8 and are recorded as the first open item of
-  IMPROVEMENTS_V2.md §4 (they change how settlement is operated, so they are a decision, not a fix).
-- **Settlement is the curator's.** Refusing or delaying settlement (or any Vetro freeze) is
-  illiquidity, not loss, for Vesper depositors: pending requests sit in Lagoon's silo or as
+  were designed and measured in round 8 and are recorded as an open decision in the round-8
+  entry of §13.2 (they change how settlement is operated, so they are a decision, not a fix).
+- **Settlement is the curator's.** `settleDeposit` ends by settling the pending redeems as well
+  (`Vault-v0.6.0.sol:515`): the two settle entries are ONE custody exit, so a responder that wants to
+  stop assets leaving the Safe narrows both, or the target, and a monitor keys on the vault's
+  `SettleRedeem` event rather than on the selector (review G11b-1). Refusing or delaying settlement
+  (or any Vetro freeze) is illiquidity, not loss, for Vesper depositors: pending requests sit in
+  Lagoon's silo or as
   pending shares, `LagoonBase.instantLiquidity()` only promises idle plus already-claimable
   redeems (idle only while the vault is paused), the keeper-side loss cap is `maxLossBps == 0` on
   all five strategies, and `reportLoss` is governor-only. Zero is not an operable setting once a
@@ -738,7 +781,9 @@ Residual (document, monitor, mitigate outside the guard):
   ahead of it in the same cycle. Removing the locker does not end the cooldown it started.
 - **Vault code.** The five vault proxies are upgradeable by their `DelayProxyAdmin` (owner: the
   curator Safe; one-day delay; target gated by Lagoon's registry, which today already whitelists a
-  v0.5.0 build without guardrails and would accept anything if it ever lost its owner). A submission
+  v0.5.0 build without guardrails; the registry is itself a `TransparentUpgradeableProxy` under
+  Lagoon's own admin, so the gate is whatever Lagoon's keys make it: Lagoon can widen what the Safe
+  may upgrade to, never push an upgrade, review g10d). A submission
   made before install never expires, and `submitImplementation` / `upgradeAndCall` are venue calls on
   the council lane: the pre-install checklist reads the implementation and the pending submission
   (§7.3), those calls are never approved on the council lane (§7.5), and the admin ownership moves to
@@ -761,13 +806,25 @@ Residual (document, monitor, mitigate outside the guard):
   pre-hook call, the exits included. The migration is therefore approved only as ONE batch that ends
   with `setGuard(guard)` (and `setModuleGuard(guard)`): the re-install runs on the NEW singleton,
   which asks its own ERC-165 question, so an incompatible release reverts the whole batch and the
-  Safe stays where it was (§7.5).
+  Safe stays where it was (§7.5). The guard deliberately has no non-reverting `fallback()` (Safe's
+  example guards keep one so that a later release calling a new selector cannot lock the account).
+  The brick needs a release that keeps the hook interface id yet calls a new hook, which the recipe's
+  re-install cannot see (a same-id release answers the ERC-165 question with yes) and only the
+  pinned-release rule above excludes. A fallback would not save a release that still calls the old
+  post-hook (`MissingSnapshot` outside a window), and against one that renames both hooks it trades
+  the brick for a Safe that is alive and unguarded: the fail-open the June 2026 Gnosis Pay incident
+  warns against (review G11f; measured at -6 bytes, the dispatcher's unknown-selector revert becoming
+  a stop; not applied).
 - **Seats with code.** The Safe counts an owner's signature whether a key, a stored `approveHash` or
   the owner's code produced it, and an owner can acquire code after it was vetted (an EIP-7702
-  delegation, a counterfactual address). The council lane refuses a new owner that has code when the
+  delegation, a counterfactual address). Under EIP-7702 that code is the 23-byte delegation designator,
+  and a delegate that answers EIP-1271 for anything (a phished authorisation, a session-key account)
+  hands that seat's CONTRACT signature to anyone: the quorum is then one key short of its threshold on
+  v1.4.1 and v1.5.0 alike, the owner list and the digest do not move, and the payload stays bounded by
+  the policy (review G11f). The council lane refuses a new owner that has code when the
   approval is issued or executed; nothing on-chain enforces "a threshold of KEYS" afterwards (a
-  per-Safe key-signatures-only flag was costed at about 430 bytes and is recorded in
-  IMPROVEMENTS_V2.md): the §7.7 "owner acquired code" alert is the control, and payloads stay bounded
+  per-Safe key-signatures-only flag was costed at about 430 bytes and is recorded in the
+  round-8 entry of §13.2): the §7.7 "owner acquired code" alert is the control, and payloads stay bounded
   by the policy either way.
 - **Guard overhead.** Warm, one owner: about 47.6k gas per owner-signed transaction (49.8k with
   three, 54.2k with seven; about 2k of it is the `TransactionChecked` event), measured in `CuratorGuardGas.t.sol` at the deployed optimizer setting; a venue that keeps most of its forwarded gas and still returns success forces a Safe transaction gas limit of about 64 times the post-hook cost (measured between 0.8 M and 1.6 M gas on the live Safe depending on how the venue burns it, growing with the owner count), which Lagoon's settlement functions, returning their unused gas, never do. Cold, on the live 4-owner Safe
@@ -838,12 +895,24 @@ replacement guard is deployed under a new alias, reusing the timelock, with
 `CURATOR_GUARD_ALIAS=CuratorGuard_v2 CURATOR_GUARD_TIMELOCK=<timelock> npx hardhat deploy --network
 ethereum --tags CuratorGuard`.
 
+A proposer, veto or council Safe created in Safe{Wallet} after 22 September 2026 runs Safe v1.5.0 by
+default. The guard and the timelock serve it (the proxy and singleton hashes are pinned, the
+forwarded-call probe reads `getStorageAt`), but the Transaction Service proposal path of the sync task
+(`helpers/safe.ts`, `@safe-global/protocol-kit` 6.1.2) refuses it before anything is signed: protocol-kit
+knows the releases up to v1.4.1 and throws `Invalid Safe version` for any other. Upgrade protocol-kit to
+a release that lists v1.5.0 before creating a v1.5.0 proposer Safe, or propose from Safe{Wallet}'s
+Transaction Builder (review G11f).
+
 ### 7.2 Configure the policy BEFORE the Safe installs the guard
 
 ```bash
 # 0. pin the deployed guard in the file first (the deploy script prints the line); outside rehearsals
 #    the task refuses an unpinned file. Run every command from the repository root: the state, batch
 #    and manifest files are written to the current directory.
+# 1. on today's chain EVERY run below is refused with "updateNewTotalAssets(uint256) on <vault> is
+#    unconstrained while the vault reports totalAssets() = …" (the five NAV entries are `unconstrained`
+#    and two vaults hold dust, V2-81): put a NAV band on the funded entries first (§5, §8), or add
+#    --allow-unconstrained-nav to each command below, knowingly (review G11a-2).
 npx hardhat curator-guard-sync --network ethereum --guard <CuratorGuard> \
   --policy policies/curator-guard/vetro-lagoon.ethereum.json --dry-run    # the diff, the queue, the simulation, the ids
 npx hardhat curator-guard-sync --network ethereum --guard <CuratorGuard> \
@@ -855,6 +924,10 @@ npx hardhat curator-guard-sync --network ethereum --guard <CuratorGuard> \
 npx hardhat curator-guard-sync --network ethereum --guard <CuratorGuard> \
   --policy policies/curator-guard/vetro-lagoon.ethereum.json --dry-run    # expect "already in sync" and an empty queue
 ```
+
+On a fork (a dev node declared with `CURATOR_GUARD_FORK=1`, or chain 31337) the `--proposer` command
+above applies the diff at once as the impersonated timelock and schedules nothing: pass `--via-timelock`
+to rehearse schedule → execute as the fork dry-run script of §7.5 does (review G11a-3).
 
 A fresh guard needs no flag. Three flags exist for the dangerous cases and must never become a
 habit: `--allow-unlock` when an already configured Safe is in `Lockdown` / `Bypass` (an incident
@@ -874,7 +947,9 @@ Every scheduled call is wrapped in `executeBefore(deadline, …)` (`--deadline-d
 `minDelay` by default), so a batch nobody executed in time is dead. Before anything is scheduled every
 call is simulated as the admin (dead on arrival is refused, a cooldown is reported with its end) and
 the batch's gas is estimated (refused above 12 M, warned above 8 M: one transaction, capped by
-EIP-7825). The operation ids, salts, predecessors and deadlines are persisted next to the Safe batch
+EIP-7825 at 16,777,216 gas; measured: the shipped policy's initial sync is 4.2 M as one batch of 40
+wrapped calls, a target filled to 32 selectors x 16 rules is 25.7 M in one `allowFunctions` and must be
+split over syncs, review G11c-1). The operation ids, salts, predecessors and deadlines are persisted next to the Safe batch
 file (`--execute` re-derives every id from the stored payloads, so a tampered file cannot name an
 operation the chain does not hold; `--execute --op <id>` rebuilds an operation from the timelock's
 own `CallScheduled` / `CallSalt` logs instead, for a second operator or a lost file, `schedule()`-made
@@ -909,7 +984,8 @@ against `validateTransaction` (e.g. with
 including a `MultiSendCallOnly` batch copied from the Safe's history. While the live Safe still
 carries the 1271-capable handler, every dry run reverts `FallbackHandlerNotAllowed` (allowed and
 disallowed calls alike): validate the allowlist with the fork dry-run script, which models the
-handler removal, or after install.
+handler removal (it syncs a copy of the file pinned to the guard it deploys, so the production pin
+of step 0 does not stop it; review G11a-1), or after install.
 
 ### 7.3 Pre-install checks and the fallback handler
 
@@ -931,6 +1007,9 @@ handler removal, or after install.
   each custody asset from the Safe's creation block (archive RPC or an explorer's approval
   checker), then `allowance(safe, spender)` for every spender seen; revoke any spender the policy
   does not intend (today: exactly the five vaults are expected, each at or near `uint256.max`).
+  With the per-settlement cap of §5 in the policy, reset those five to zero in the install batch
+  (`approve(vault, 0)`, allowed by the rule) and let the curator approve one settlement's worth before
+  each `settleRedeem`: a hostile vault implementation then takes one cap, not the custody (G10d-1).
 - Owners / threshold are what Vetro expects (today 2-of-4). Note that after install, owner changes
   require a council (or admin) approval.
 - **Fallback handler.** The policy enforces `requiredFallbackHandler = 0x0`. Approve
@@ -941,7 +1020,8 @@ handler removal, or after install.
   approval). Until it lands, every policy transaction reverts `FallbackHandlerNotAllowed`. The
   handler is NEVER the guard itself nor the Safe (the contract refuses both as a requirement; with
   the guard as handler anyone could call the hooks through the Safe: the guard then refuses to spend
-  approvals or emit reports, `ForwardedHookCall`, and only a council window carries the repair). Without
+  approvals, `ForwardedHookCall`, and only a council window carries the repair, inside which a stranger
+  can still forge a `Bypass` report through a forwarded `executeBefore`, review G9a-1, held). Without
   a handler the Safe cannot receive ERC-721 / ERC-1155 via safe-transfer callbacks and does not
   answer `isValidSignature`; neither is needed for Lagoon operations.
 
@@ -1012,8 +1092,8 @@ points at another guard. If the guard was installed before the policy sync execu
   v1.5.0 with `setModuleGuard`), any other fallback handler, and standing payloads of up to 180 days
   (pre-staged `pause()` per vault; a multi-vault emergency is five council approvals and five signing
   rounds, a short council window, or one pre-staged admin batch). `executor` is `0x0` for the
-  signers, never the Safe's own address (that binds the approval to the module path and the signers'
-  transaction fails on the policy). Approval ids are epoch-bound: an id printed at scheduling time is
+  signers, never the Safe's own address nor the guard (`InvalidTarget`: a non-zero executor names a
+  Safe module). Approval ids are epoch-bound: an id printed at scheduling time is
   stale once a window or a revocation bumped the epoch, so compute it at execution
   (`computeApprovalId`) or read it from `TransactionApproved`; an approval scheduled before a bump is
   issued, valid, in the new epoch. A delegatecall approval is also bound to the CODE at its target:
@@ -1027,9 +1107,14 @@ points at another guard. If the guard was installed before the policy sync execu
   failed approved execution reverts the whole Safe transaction either way (GS013 with
   `safeTxGas = 0`, `ApprovedExecutionFailed` otherwise), so the approval is never lost. Confirm an
   approved Safe self-call by the SAFE's own event (`ChangedGuard`, `ChangedModuleGuard`,
-  `ChangedMasterCopy`, `EnabledModule`, …), never by `ExecutionSuccess` plus
+  `EnabledModule`, …), never by `ExecutionSuccess` plus
   `TransactionChecked(Approval)` alone: with the handler at zero, a selector the current singleton
-  does not implement is a silent success that spends the approval.
+  does not implement is a silent success that spends the approval. `ChangedMasterCopy` is NOT a Safe
+  event: a canonical migration library emits it (`SafeMigration`, `SafeToL2Migration`,
+  `SafeToL2Setup`), and an approved delegatecall into any
+  other code can rewrite the singleton slot with no event at all (a pinned build keeps the policy
+  path running), so after every approved delegatecall confirm the singleton by reading
+  `masterCopy()` / slot 0, not by waiting for the event (round 10, G10e-2).
   `revokeApproval(id)` cancels one unused approval; `revokeAllApprovals(safe)` (admin, council or
   guardian) voids all of them, `lockdownAndRevoke(safe)` does that and freezes the Safe. Approvals are
   refused while the Safe is in `Bypass`.
@@ -1046,7 +1131,17 @@ points at another guard. If the guard was installed before the policy sync execu
   `MultiSend` (not `CallOnly`: the migration is a delegatecall entry), in this order:
   `[DELEGATECALL SafeMigration.migrateSingleton(), CALL safe.setGuard(guard), CALL
   safe.setModuleGuard(guard)]`. Never `migrateWithFallbackHandler()` (it reinstalls the canonical
-  signature-capable handler). The two re-installs run on the NEW singleton, which asks its own
+  signature-capable handler; it is also the one-transaction upgrade shape a wallet UI is built around, so
+  decode any wallet-built upgrade payload before approving it). The entries are what the veto reviews:
+  the approval pins the code of `to` (the `MultiSend` build), never what an entry addresses, and a
+  look-alike library at another address satisfies its own pin and writes slot 0 to whatever its deployer
+  chose, after which anyone moves the custody with no Safe transaction (review G11f). The migration entry
+  must address the canonical `SafeMigration` v1.5.0, `0x6439e7ABD8Bb915A5263094784C5CF561c4172AC`
+  (runtime code hash `0x52d7…14ea`; its `SAFE_SINGLETON()` `0xFf51…a44b`, `SAFE_L2_SINGLETON()`
+  `0xEdd1…C7e` and `SAFE_FALLBACK_HANDLER()` `0x3EfC…77f4` are the 1.5.0 deployments the guard pins),
+  and `to` the canonical `MultiSend` v1.4.1 `0x3886…B526` or v1.5.0 `0x2185…7eB7`; `curator-guard-verify
+  --op` prints what an approval authorises one level down (self-call, call, delegatecall, and a canonical
+  batch entry by entry with the canonical libraries named). The two re-installs run on the NEW singleton, which asks its own
   ERC-165 question about its own hook ABI: a release this guard cannot serve reverts the whole batch
   (GS300 / GS301), the Safe stays where it was and the approval is kept; a compatible one lands the
   migration and both guards in one transaction. Never approve the migration alone (a release with a
@@ -1059,7 +1154,9 @@ points at another guard. If the guard was installed before the policy sync execu
   `ChangedMasterCopy`, `ChangedGuard` and `ChangedModuleGuard`.
 - **Fork dry run** of the whole tooling on the production topology: `FORK_NODE_URL=<rpc> npx hardhat
   run scripts/curator-guard-fork-dryrun.ts --network hardhat` deploys the timelock + guard, schedules
-  the policy through the timelock as the impersonated proposer, refuses an early execute, warps past
+  the policy (a copy of the committed file pinned to that fresh guard: the task refuses a pin that
+  differs from `--guard` on every network, and the committed file carries the production pin from
+  §7.2 step 0 on) through the timelock as the impersonated proposer, refuses an early execute, warps past
   `minDelay`, executes, re-syncs (expects no drift), models the signers' handler removal + install,
   dry-runs representative curator calls (non-zero exit code on an unexpected allow), and ends with
   an incident drill (a stand-in council locks the Safe down, the lift is scheduled as its own chained
@@ -1093,10 +1190,12 @@ points at another guard. If the guard was installed before the policy sync execu
   add it to the policy at the same time.
 - **Committing.** The Safe sources are unstaged git submodules; when committing run
   `git add .gitmodules lib/safe-smart-account lib/safe-smart-account-v1.5.0` so CI checkouts
-  (`submodules: recursive`) get them, and `.github/workflows/curator-guard.yml` runs the suites.
+  (`submodules: recursive`) get them, and `.github/workflows/ci.yml` runs the suites.
 - **Replace the guard**: deploy the new guard under a new alias reusing the timelock
   (`CURATOR_GUARD_TIMELOCK=<timelock>`), sync the policy against it (functions, handler requirement,
-  per-Safe guardians), check `hasRole(COUNCIL_ROLE, council)` (the deploy script passes the council
+  per-Safe guardians), re-grant the deployment-wide responders on it (`setDeploymentGuardian(key,
+  true)` by the council or the admin: `GUARDIAN_ROLE` lives per guard and is not in the file; review
+  G11a-5), check `hasRole(COUNCIL_ROLE, council)` (the deploy script passes the council
   to the constructor; if it is missing, schedule the `grantRole` the script prints), then have the admin approve
   `setGuard(newGuard)` **on the currently installed guard** (approvals live in the guard that will check
   the transaction; one placed on the new guard is a stray to revoke): no task builds that operation,
@@ -1116,8 +1215,9 @@ points at another guard. If the guard was installed before the policy sync execu
   `lockdownAndRevoke` on the installed guard AND `lockdown` on the replacement, the replacement
   stays in `Lockdown` (allowlist synced) until the swap is confirmed and the council then `enforce`s
   it, and bots follow the Safe's `ChangedGuard` and `ChangedModuleGuard` and watch both guards. A
-  guard answers its hooks only on the path where the Safe has it installed (`GuardNotInstalled`
-  otherwise), so a replacement is inert until the swap and the old guard from the swap on; still do
+  guard answers its pre-hook only on the path where the Safe has it installed (`GuardNotInstalled`
+  otherwise; the post-hook's window report is the exception of §4 step 3), so a replacement is inert
+  until the swap and the old guard from the swap on; still do
   not pre-stage approvals on a replacement before it is installed (defence in depth, and an approval's
   clock runs from the moment it is issued). **Pre-swap checklist, before the approval is scheduled**
   (one paste error here stops settlement: an unsynced guard is `Lockdown`, has no unwrapper and no
@@ -1136,8 +1236,8 @@ points at another guard. If the guard was installed before the policy sync execu
   `lockdownAndRevoke` on the removed guard so a re-install by mistake is fail-closed and cannot revive
   unexpired approvals.
 - **Admin hand-over (timelock → new timelock or DAO executor)**: the current admin schedules
-  `beginDefaultAdminTransfer(newAdmin)` (refused for `address(0)`, for the council and for any address
-  that carries a policy: `AdminIsGuarded`); after `defaultAdminDelay` (3 days; between 1 and 30 days
+  `beginDefaultAdminTransfer(newAdmin)` (refused for `address(0)`, `AdminCannotBeZero`, and for the
+  council or any address that carries a policy, `AdminIsGuarded`); after `defaultAdminDelay` (3 days; between 1 and 30 days
   once changed) the new admin calls `acceptDefaultAdminTransfer` (itself a scheduled operation when
   the new admin is a timelock; the predicate is re-checked at acceptance) within 30 days of the
   schedule (`DeadlinePassed` afterwards: begin again); `cancelDefaultAdminTransfer` aborts a pending
@@ -1151,15 +1251,28 @@ points at another guard. If the guard was installed before the policy sync execu
   canceller cancel everything pending before the hand-over begins, and again before acceptance. Keep
   `defaultAdminDelay` above the timelock's `minDelay`: raise the guard's admin delay BEFORE raising
   `minDelay` to or above it, or a hand-over that slipped past the veto is accepted before the
-  scheduled cancel is ready.
+  scheduled cancel is ready. Answer a hostile `beginDefaultAdminTransfer` with a
+  `cancelDefaultAdminTransfer` CHAINED behind it (`predecessor` = the hostile operation id): anyone
+  executes it in the block the begin lands, whenever the attacker lands it, so it wins at any admin
+  delay, while an unchained cancel executed before the begin is a no-op and the next one is a
+  `minDelay` behind; a scheduled `changeDefaultAdminDelay(1 day)` is in effect two days after it
+  lands and makes exactly that unchained cancel a day late (review G10c-2).
 - **Council / proposer / guardian rotation**: `grantRole` / `revokeRole` of `COUNCIL_ROLE` are
   timelocked admin operations; a council NEVER gets a timelock role (`CANCELLER_ROLE` or
   `PROPOSER_ROLE`: it could veto or schedule its own removal, and the sync task refuses to run while
   it holds one). A council replacement is `[revokeRole(old), grantRole(new), lockdownAndRevoke(safe)]`
-  per Safe, never bundled with a lift (§6). A guard role is never granted to `address(0)`, to the
+  per Safe, never bundled with a lift (§6), and chained behind it with `predecessor`, in the same
+  cycle, the full re-assertion of the policy file for that Safe: every `allowFunction` and every
+  `addAllowedValues` (a revocation empties the `OneOf` sets), built from the file and not from the
+  sync task's diff (which reads the chain at preparation and sees nothing to do before the council
+  acts): a function the old council revokes at any time before the batch executes comes back with it,
+  and the new council's `enforce` restores settlement at once (review G10c-3). A guard role is never
+  granted to `address(0)`, to the
   admin or to an address the admin configured as a Safe (`AddressIsNull` / `AdminIsGuarded`: paste the
   council Safe, not the curator Safe). Proposer and canceller changes and `updateDelay` are
-  scheduled self-calls of the timelock: grant the successor first, then revoke (the contract keeps
+  scheduled self-calls of the timelock: grant the successor first, then revoke; revoking a proposer
+  leaves its queue in place, so after removing a compromised one cancel every operation it scheduled,
+  not only the ones that paged (review G10c-4) (the contract keeps
   the last proposer and the last canceller, refuses to drop the open executor or its own admin role,
   never grants that admin role to anyone else nor a gated role to itself, clamps `getMinDelay()` to
   [1 h, 30 d] and refuses an `updateDelay` outside that range, an operation delay other than the live
@@ -1257,7 +1370,9 @@ points at another guard. If the guard was installed before the policy sync execu
    runs `enforce` (executing while the window is open reverts `SafeInBypass`; the operation stays
    executable), the operation executes and the proposer's signers run the approved `setGuard(0)`.
    With a SECOND proposer no window is needed: it schedules the same approval, and the guarded
-   proposer's signers execute `setGuard(0)` once it lands. Without a second proposer and without a
+   proposer's signers execute `setGuard(0)` once it lands. A guarded VETO Safe cancels from inside a
+   council window at once (`cancel` is a plain call to a foreign contract), before its own exit is
+   even scheduled; the exit follows the recipe above. Without a second proposer and without a
    council, or with a sole proposer that lost its keys, nothing can
    ever be scheduled again: the guard stays as it is forever (no removal, no widening, no admin
    hand-over). Hence two proposer Safes (§7.1) and a `ChangedGuard` alert on every proposer and
@@ -1305,21 +1420,30 @@ the function at once: no per-member `AllowedValueRemoved` follows, so an indexer
 may repeat the current mode, and its order relative to `ApprovalsRevoked` differs between `bypass`
 and `lockdownAndRevoke`; the admin's cooldown ends one day after the block timestamp of the last
 `ModeUpdated(safe, Lockdown)`, whatever mode logs follow),
-`RequiredFallbackHandlerUpdated`, `TransactionApproved` (carries the full calldata, the absolute
+`RequiredFallbackHandlerUpdated` (emitted on every call, a repeated identical requirement included),
+`TransactionApproved` (carries the full calldata, the absolute
 expiry and the epoch), `ApprovalConsumed`, `ApprovalRevoked` (it may name a record that was already
 void or expired: the live set is what `approvalExpiry` reports), `ApprovalsRevoked` (also emitted by
 every `bypass` and by `lockdownAndRevoke`), `MultiSendUnwrapperUpdated` and `ModuleUpdated` (emitted
-only when the set changed), `UnwrapperCodehashUpdated` (only ever for one of the three seeded hashes;
+only when the set changed), `UnwrapperCodehashUpdated` (only ever for one of the three seeded hashes, and on every call, a repeated state included;
 on `false` the response is ONE council batch `[setUnwrapperCodehash(h, true),
 setDeploymentGuardian(key, false)]`, and a pending registration needs no rescheduling after it),
-`GuardianUpdated` (per Safe), `RoleGranted` / `RoleRevoked` (council and deployment-wide guardians),
+`GuardianUpdated` (per Safe), `RoleGranted` / `RoleRevoked` (council and deployment-wide guardians, and
+the admin role itself at a hand-over's acceptance),
 `DefaultAdminTransferScheduled` / `DefaultAdminTransferCanceled` / `DefaultAdminDelayChangeScheduled` /
 `DefaultAdminDelayChangeCanceled` / `RoleAdminChanged`, on the timelock `CallScheduled` / `CallSalt` /
 `CallExecuted` / `Cancelled` / `MinDelayChange` (it reports the RAW argument: the effective delay is
 `getMinDelay()`, clamped to [1 h, 30 d]) / `RoleGranted` (a new proposer or canceller; page the
-canceller on any `CallScheduled` whose target is the timelock itself or a foreign contract, or whose
-payload carries `grantRole` / `revokeRole` / `updateDelay` / `beginDefaultAdminTransfer`: queued role
-grants are not held back by the cooldown, so after a lockdown review and cancel them too), on the
+canceller on EVERY `CallScheduled` whose id is not in the operator's own state file or manifest, and
+name the timelock's self-calls, foreign targets, `grantRole` / `revokeRole` / `updateDelay` /
+`beginDefaultAdminTransfer` / `changeDefaultAdminDelay` / `approveTransaction` / `bypass` /
+`setRequiredFallbackHandler` / `setModuleAllowed` and every widening as the loudest: an approval of
+the curator Safe's own `setGuard(0)` or a 180-day admin window scheduled on the guard carries none of
+the selectors an earlier list named, lands for anyone after `minDelay`, and is exactly what a
+compromised proposer schedules (`curator-guard-verify --op` decodes such an operation and tags it
+`[ROLE / INCIDENT-SENSITIVE]`; reviews G10c-2 and G10e-3); queued role grants and widenings are not
+held back by the cooldown, so after a lockdown review and cancel them too, and after removing a
+proposer cancel its whole queue), on the
 Safe `ChangedFallbackHandler` (also on every council, proposer, veto and guardian Safe: a handler
 that is the guard or the timelock would make that Safe's role public, §6),
 `RoleRevoked` (a proposer or the veto losing its role), on the
@@ -1341,7 +1465,16 @@ unsettled), `RatesUpdated`, `SafeUpdated`, `ValuationManagerUpdated`, `SecurityC
 `TotalAssetsLifespanUpdated`, `SyncModeUpdated`, `Paused` / `Unpaused`, `StateUpdated`; each must sit
 in a transaction that also carries the guard's `TransactionChecked` for the curator Safe, otherwise a
 role has left the Safe: `lockdown` and page. Key every alert on receipts, never on simulations
-(`simulateAndRevert` lets anyone run the hooks as the Safe in a frame that always reverts). Send
+(`simulateAndRevert` lets anyone run the hooks as the Safe in a frame that always reverts). A refused
+transaction leaves no guard event, but the signers' attempt does leave a receipt: page on every
+reverted `execTransaction` to the curator Safe (status 0; the guard's error selector is in the revert
+data of a replay, `eth_call` at that block or a trace, since a receipt carries none); a quorum trying
+what the policy refuses is the earliest sign of a compromised signer, and the
+guard's events alone never show it. Lists rebuilt from `eth_getLogs` (the governance summary's
+council, guardians and standing approvals, the timelock's queue) are only as complete as the
+provider's answers: a provider that silently truncates or drops logs makes them optimistic, so use an
+archive RPC that answers completely and treat "council: none" or "no operation pending" from a public
+endpoint as unproven (the task's canaries refuse an incomplete stream, round 10 G10e-1). Send
 guardian and council incident transactions through a private relay: a `lockdown` in the public
 mempool is visible to the signers it is aimed at. After any lockdown, cancel the queued lifts,
 windows and approvals that should not survive it within the one-day cooldown. Alert on any widening and on any
@@ -1369,6 +1502,7 @@ the function's current generation); `isNativeTransferAllowed(safe, target)` per 
 | `SafeLockedDown` | the Safe is in `Lockdown` (incident, fresh guard, or an expired `Bypass`) | council `enforce`, or an approval for the one transaction |
 | `FunctionNotAllowed` / `ValueNotAllowed` / `NativeTransferNotAllowed` | target, selector, native value or plain transfer not in the policy | policy change through the timelock, or a council / admin approval |
 | `ParamRuleViolated` / `ParamOutOfRange` | an argument outside its rule (e.g. `approve` to a spender other than the vault), or calldata too short for a rule | fix the payload; or a policy change |
+| `MalformedCalldata` | calldata of 1 to 3 bytes: shorter than a selector, yet not the empty calldata of a plain transfer (a truncated payload, or a venue addressed by fewer bytes than a selector), at top level or as a batch entry | fix the payload: a plain transfer is empty calldata, a function call starts with its 4-byte selector (such bytes reach the venue only inside a council or admin window) |
 | `SelfCallNotAllowed` | a Safe self-call (owner rotation, threshold, guard, modules, handler) | council approval (owner management, `disableModule`, `setFallbackHandler(0)`), admin approval (`setGuard`, `setModuleGuard`, `enableModule`, any other handler) |
 | `GuardCallNotAllowed` | the Safe addressed the guard itself, at top level or as a batch entry (an approved canonical batch included) | nothing: the guard can never be a target, not even by approval (`InvalidTarget` at top level); remove that entry |
 | `DelegateCallNotAllowed` / `UnwrapperCodehashNotAllowed` / `MultiSendDelegateCallEntry` / `MalformedMultiSend` / `EmptyMultiSend` | a delegatecall to anything but the canonical `MultiSendCallOnly`, a forbidden build, an entry whose operation byte is not `0` (a delegatecall entry, or any other value), a non-canonical encoding (wrong head offset, trailing bytes, an entry cut short, a zero `to`) or an empty batch; an APPROVED batch must be canonically encoded too | use the Safe{Wallet} batch builder (plain calls only); council / admin re-allow a forbidden canonical hash |
@@ -1380,7 +1514,7 @@ the function's current generation); `isNativeTransferAllowed(safe, target)` per 
 | `SafeNotSupported` | the Safe's proxy or singleton code is not a build the guard pins | ask Vetro (§7.6 step 6): approvals and windows still work |
 | `ModuleNotHooked` | a module is linked on the Safe that the guard does not hook | council approval of `disableModule` (v1.5.0: or admin approval of `setModuleGuard(guard)`), §7.6 step 7 |
 | `GuardNotInstalled` | a hook reached a guard that is not in the Safe's slot for that path (a half-finished v1.5.0 swap) | finish the swap (§7.6 step 8) |
-| `ForwardedHookCall` | the Safe's fallback handler is the guard itself: no approval is spent and no report emitted while it is (anyone could otherwise drive the hooks through the Safe) | a council window, `setFallbackHandler(0)` inside it, `enforce`, then re-issue the approvals the window voided |
+| `ForwardedHookCall` | the Safe's fallback handler is the guard itself: no approval is spent while it is (anyone could otherwise drive the hooks through the Safe; a `Bypass` report can still be forged inside a window through a forwarded `executeBefore`, review G9a-1, held) | a council window, `setFallbackHandler(0)` inside it, `enforce`, then re-issue the approvals the window voided |
 | `LockdownCooldown` (admin operations only) | the admin tried to enforce, open a window or approve within a day of a lockdown of that Safe | wait out the day, or the council acts now; cancel queued operations that should not survive the incident |
 | `SafeConfigUnreadable` with an unusually low gas limit | a configuration read starved of gas (it gets 63/64 of what is left) is reported as unreadable rather than as out of gas | re-estimate / raise the gas limit; an `eth_call` of the Safe's `getOwners()` succeeding tells the two apart |
 | `NestedExecution` / `MissingSnapshot` / `SafeConfigChanged` / `ApprovedExecutionFailed` | a nested same-Safe transaction, a role action inside the curator's transaction, a configuration write during a policy transaction, a failed approved execution (a module's, or the signers' when the transaction carries `safeTxGas != 0`; the approval is kept) | structural: split the transaction, fix the payload and retry, or ask Vetro |
@@ -1429,6 +1563,13 @@ unconstrained `updateNewTotalAssets` on a vault whose `totalAssets()` is not zer
   and the only one that can push a NAV past them (`securityCouncilUpdateTotalAssets`). With the role at Vetro
   and guardrails activated with real bounds, the policy-allowed `updateNewTotalAssets` is bounded
   per settlement interval; without this, "guardrails bound NAV" is not true for these vaults.
+  The bound is annualised from the LAST SETTLEMENT (`lastFeeTime`, `hopper.storage.FeeManager` + 2,
+  advanced only by the Safe's settles) with `ONE_YEAR / timePast` in integer arithmetic, a scale that
+  rounds down to 1 once more than half a year has passed and to 0 after a year: from six months
+  after the last settlement a +20 %/yr bound admits +20 % in ONE mark, after one year any mark passes
+  (measured on the live v0.6.0 code, review G11b-4). The curator decides when settlements happen, so a
+  guarded vault needs an alert on `block.timestamp - lastFeeTime` well inside six months, and the §5
+  band on the mark and the settles is the bound that does not lapse.
 - **`owner` → Vetro governance (two-step).** Removes pause / unpause, `initiateClosing`,
   `activateAsyncOnly`, role rotation, `updateSafe` and fee-rate changes from the curator, independent
   of any future approval. Keep `safe` as is; call `lockUpdateSafe()` once custody is final.
@@ -1439,8 +1580,11 @@ unconstrained `updateNewTotalAssets` on a vault whose `totalAssets()` is not zer
   implementations gated by Lagoon's registry). Upgrades are blocked by the guard today (the admin
   is not an allowlisted target) but would ride on any future approval; consider moving the admin
   ownership to Vetro and re-verify the registry before approving any upgrade. Lagoon's registry
-  already whitelists its default v0.5.0 logic as a target: a downgrade keeps the allowlisted
-  selectors but drops guardrails and the security council, so the admin ownership must move to Vetro
+  already whitelists its default v0.5.0 logic as a target: a downgrade keeps four of the five
+  allowlisted selectors (`claimAssetsOnBehalf(address[])`, `0x26d6c82f`, is not dispatched by the
+  v0.5.0 default logic `0xE505…DEDf`: that entry reverts in the vault until the policy is re-synced,
+  and the sync task's selector probe reports it; read live, review G11f) and drops guardrails and the
+  security council, so the admin ownership must move to Vetro
   with or before guardrail activation, never after. After any Lagoon implementation change, run
   the Lagoon fork suite against the new code before the keeper reports again. The strategies'
   starved-call rule (§8 "Strategy upgrade") judges a vault call starved when it reverts without data
@@ -1503,8 +1647,10 @@ unconstrained `updateNewTotalAssets` on a vault whose `totalAssets()` is not zer
   strategy at the claim report (2% of a withdrawal of a fifth of the debt is 40 bp of it), so a
   fee-bearing vault, should one ever be funded, needs the cap sized to the fee rate times the
   largest withdrawal share; the five live vaults charge none and Lagoon only lets the rate decrease.
-- **Strategy upgrade.** The five `Lagoon_Vetro_*` proxies run `LagoonV06` 6.0.5 while the tree is
-  newer. On the live code `tvl()`, `balances()` and `instantLiquidity()` revert while a settled
+- **Strategy upgrade** (a `vesper-strategies` procedure: the strategies, their deploy scripts and
+  every command of this item live there, not in this repository). The five `Lagoon_Vetro_*` proxies
+  run `LagoonV06` 6.0.5 while that tree is newer. On the live code `tvl()`, `balances()` and
+  `instantLiquidity()` revert while a settled
   request waits to be claimed (the vault has no `getSettlement…FeeRate`), a profit report reverts
   `InsufficientBalance` when the pool has credit on offer, and the rounding remainder of a
   booked profit is queued as a redeem that Lagoon never settles, which blocks the pool's next
@@ -1845,8 +1991,10 @@ Allowed:
   in the file (deployment-wide guardians hold `GUARDIAN_ROLE` instead). `mode` is `Enforced`; the
   file can never request `Bypass`.
 
-Caveats: `updateNewTotalAssets` is unbounded until §8's guardrail step is done; `expireTotalAssets`
-must be added if `totalAssetsLifespan` is ever raised above zero (§7.5).
+Caveats: `updateNewTotalAssets` is unbounded until §8's guardrail step is done; `settleDeposit` also
+settles pending redeems, so the two settle entries are one custody exit (narrow both or the target,
+review G11b-1); a NAV band, when one is written, goes on the mark and on both settles (review
+G11b-2); `expireTotalAssets` must be added if `totalAssetsLifespan` is ever raised above zero (§7.5).
 
 Deliberately not allowed (use `approveTransaction` case by case; the council approves owner
 management and venue one-offs within 7 days, the admin everything else):
@@ -1865,12 +2013,13 @@ management and venue one-offs within 7 days, the admin everything else):
 
 ## 10. Test coverage
 
-`FOUNDRY_PROFILE=guards forge test` (26 test files plus three helpers, 32 test contracts, 350 unit
-tests plus 6 fork tests against the live Safe; one more file, contract and test under
-`FOUNDRY_PROFILE=precancun forge test`, which needs a Shanghai EVM; the default profile recompiles the whole via-IR tree for ~25 minutes, the
-`guards` profile only the guard tree; the fork suite needs
-`ETHEREUM_FORK_NODE_URL` and a pristine fork block, CI pins one through `.github/actions/fork-blocks`
-and runs `forge t --mc CuratorGuard`):
+`forge test` (75 test files plus nine shared helpers under `test/guards/`; seven are fork suites
+against the live Safe: the four `*.e2e.ethereum.t.sol` files need `ETHEREUM_FORK_NODE_URL` and
+`G9a_CanonicalProxyHashes`, `G10d_Fork` and `G11b_Policy` skip without it; one more file, contract
+and test under `FOUNDRY_PROFILE=precancun forge test`, which needs a Shanghai EVM and a prior
+`forge build`; in this repository the default profile IS the guard profile and `FOUNDRY_PROFILE=guards`
+is kept as an alias; CI pins a pristine fork block through `.github/actions/fork-blocks` and runs
+`forge test` in `.github/workflows/ci.yml`):
 
 - `CuratorGuard.t.sol`: real Safe v1.4.1 proxy with a curator EOA signer; genuine
   `execTransaction(setGuard)` install; ERC-165 ids and every storage-slot constant pinned to the
@@ -1906,7 +2055,7 @@ and runs `forge t --mc CuratorGuard`):
   owner-list swap, module guard, singleton swap to a working singleton, a singleton that lies in
   `getStorageAt` (caught through `masterCopy()`) and owner-count writes caught by the snapshot; the
   nonce slot documented as out of scope.
-- `CuratorGuardV2.t.sol` (IMPROVEMENTS_V2.md items 1-5): the role matrix (admin widens; council,
+- `CuratorGuardV2.t.sol` (the v2 items of §13): the role matrix (admin widens; council,
   both guardian kinds and strangers cannot; council fast lane; guardians narrow only, the per-Safe
   one scoped to its Safe and unable to touch deployment-wide state; `revokeApproval` scoped to the
   approval's Safe); council approval limits (`setGuard`, `setModuleGuard`, `enableModule`,
@@ -1962,7 +2111,8 @@ and runs `forge t --mc CuratorGuard`):
   typed, the canonical 36-byte `setFallbackHandler(0)`, a partial-selector self-call refused on the
   policy path, the admin refused on itself as a Safe, a singleton swapped mid-transaction typed,
   `ApprovalConsumed` naming the module on the module path).
-- `CuratorGuardRobustness.t.sol` (IMPROVEMENTS_V2.md items 8, 9, 12; v1.4.1 fixture plus a v1.5.0
+- `CuratorGuardRobustness.t.sol` (the v2 robustness items of §13.2: `SafeConfigUnreadable`,
+  `lockdownAndRevoke`, `TransactionChecked`; v1.4.1 fixture plus a v1.5.0
   module fixture): a configurable Safe look-alike whose configuration views panic, revert, answer a
   malformed owner array, or answer too few / too many / no storage words, each surfacing as
   `SafeConfigUnreadable` in the pre-hook and the dry run (the healthy one passes as a control); the
@@ -2005,8 +2155,8 @@ and runs `forge t --mc CuratorGuard`):
 - `test/guards-precancun/CuratorGuardPreCancun.t.sol` (`FOUNDRY_PROFILE=precancun`, EVM version
   Shanghai, compiled without Cancun opcodes): reads the guard's Cancun creation code from
   `out-guards/` and shows that a raw `create` fails on a pre-Cancun EVM while a plain contract deploys;
-  it skips itself wherever transient storage exists (a `PUSH0 TLOAD POP STOP` probe), so the default
-  profile, which compiles this directory too, is unaffected.
+  it skips itself wherever transient storage exists (a `PUSH0 TLOAD POP STOP` probe), so a profile that
+  compiles this directory on Cancun would be unaffected (the default profile compiles `test/guards/` only).
 - `CuratorGuardGas.t.sol`: per-transaction overhead, bounded at 80k gas (47.6k measured with one
   owner, of which about 2k is the `TransactionChecked` event).
 - `CuratorGuardRound8.t.sol` (round 8, §13.2 V2-83…): an approved truncated batch refused at use with
@@ -2071,9 +2221,55 @@ and runs `forge t --mc CuratorGuard`):
   fork suites: `G9f_SafeCodehashes.e2e` (all nine canonical proxy and singleton hashes against mainnet)
   and `G9f_Gas.e2e` (the hooks on the shipped policy and the live Safe). `FOUNDRY_PROFILE=guards_deep`
   runs the invariant suites at 1,024 runs x 50 depth without leaving the guard tree.
+- Round 10 (g10f) additions, `test/guards/G10f_*.t.sol`: `G10f_Gas` (every hook path on the shipped
+  policy shape applied to the local fixture, and the worst case of each: 16 rules of every kind, a
+  tail-hash rule over 1 KiB to 256 KiB, batches of 10 to 100 entries warm and 50 distinct targets cold,
+  4 to 50 owners, a council-window batch of self-calls, an approved batch decoded at use) and
+  `G10f_Pins` (killers for the 23 probes that survived the suite as shipped, none a defect: the
+  `NativeTransferUpdated` and `MultiSendUnwrapperUpdated` events, `revokeTarget`'s native event, the
+  `_checkAdmin` forwarding rail with an admin Safe, the Safe-shaped answer the forwarding probe
+  requires, the zero-address rail of `setDeploymentGuardian`, `addAllowedValues` needing a `OneOf`
+  rule on that word, a re-allow clearing the set of a moved `OneOf` rule, `targets` pruning, an
+  approved single call into canonical code staying unparsed, a role grant never reading the council
+  term, and six timelock fall-through arms). `G10f_HeldFixPins` is kept with the held round-9 code
+  changes, outside this repository, and pins each of them.
+- The other round-10 suites, all green on the shipped code: `G10a_*` (a reference model of the mode,
+  window, cooldown, approval and hand-over machine driven in lockstep with the guard through real Safe
+  v1.4.1 / v1.5.0 transactions: 14 invariant functions over four handlers, two Safes on one guard, the
+  timelock's counters under scheduled self-calls, and the G10a-1 / G10a-2 PoCs), `G10b_*` (a
+  differential corpus of 2,800 calldata vectors generated from section 4 alone, in
+  `test/guards/vectors/`, replayed through the dry run, the live hooks on a real Safe and the three
+  canonical Safe builds; the ABI edge cases), `G10c_*` (the governance game: id squatting, hostile
+  proposer and council, windows; the three `G10c_IdSquat` tests pin the G10c-1 rail: a longer
+  delay is refused and a squat at the honest delay is the honest operation; `G10e_Monitoring`'s
+  forged-report test flips with
+  G9a-1 and the `G10a_Findings` G10a-1 and G10a-2 tests with those items, review G11d-3), `G10d_*`
+  (the second adversary: hostile venue, hostile vault
+  implementation on the live Safe, compromised council and proposer), `G10e_Monitoring` (event
+  adjacency, uniqueness and ordering) and `G10g_*` (the `OneOf` gas and `_storeApproval` write-count
+  measurements behind two NatSpec claims).
+- Round 11 additions, all green on the shipped code: `G9a_*` and `G9c_*` (the round-9 Safe-integration and
+  governance PoCs adopted on g11d's request: the forwarded `executeBefore` forgery and `simulateAndRevert`
+  as the Safe, the canonical proxy hashes, the hand-over at the slowest successor delay, the council stall's
+  eviction, the rotation residue, the veto-only deadlock, the guarded-proposer recovery of 7.6 step 5),
+  `G11b_Policy` (the shipped policy shape on the live Safe: the one custody exit, the settles repeating a
+  council mark, the band's leak and the approve cap's cost), `G11c_*` (time boundaries fuzzed at the second,
+  the executor's gas floor on the fixture and the live Safe, the caps under committed storage, the lift
+  window against the signing round; the 11 exhaustive EIP-150 gas sweeps of `G11c_GasStarvation` need a
+  raised gas limit and 31 CPU-minutes and are kept with the round-11 review material, not in-tree), `G11d_*`
+  (traceability: every header citation, error and event asserted by some test, the 7.8 table complete; the
+  event payloads; the peers' failure modes as vectors: 1-3-byte calldata, `address(0)`, fallback targets,
+  pre-batch state, nested `execTransaction`, the OLAS stuck lock, the Gnosis Pay `staticcall` flag),
+  `G11f_*` (the one-batch migration against a new-id and a same-id release, a look-alike migration library,
+  the replacement swap and rollback, EIP-7702 owners and venues on both releases) and `G11g_Evidence` (the
+  claims behind five comment corrections).
 
-`forge coverage` cannot run over these suites (the vendored Safe sources are not via-IR
-compatible, which `--ir-minimum` requires), and `FOUNDRY_PROFILE=guards forge build --sizes` exits
+`forge coverage` cannot measure the guard contracts: without the optimizer the guard hits "stack too
+deep" (the 11-argument `checkTransaction`), and `--ir-minimum` dies in the vendored Safe sources,
+which are not via-IR compatible. Branch coverage is measured by mutation instead (round 10, g10f:
+every `if` decision of the three contracts forced each way and every `&&` / `||` operand
+neutralised; the branch map is kept with the round-10 review material).
+`FOUNDRY_PROFILE=guards forge build --sizes` exits
 non-zero only because the test-only `PolicyHandler` (invariant harness) exceeds the EIP-170 limit; the
 deployed contracts are checked by `scripts/check-contract-sizes.sh` on hardhat artifacts. Instead, round 2 ran a 71-mutant campaign against the
 guard contracts in a scratch harness (not kept in-tree): every non-equivalent mutant is killed by
