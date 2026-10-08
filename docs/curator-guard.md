@@ -113,7 +113,10 @@ Roles (OpenZeppelin `AccessControlDefaultAdminRules`; see also IMPROVEMENTS_V2.m
   refuses to drop the open executor or its own admin role, keeps the last proposer and the last
   canceller, never counts `address(0)` or the timelock itself as a holder of a gated role, never
   grants its admin role to anyone else, and refuses at `schedule` what would fail or misbehave late:
-  an operation delay above 30 days, calldata for a target without code (which `execute` refuses again)
+  an operation delay other than the live `getMinDelay()` (an operation id carries neither its proposer
+  nor its delay: with a longer one a compromised proposer could take the honest proposer's exact
+  operation up to 30 days out, so the honest `scheduleBatch` reverts and the honest wrapper is dead on
+  arrival, review G10c-1), calldata for a target without code (which `execute` refuses again)
   and an `updateDelay` outside the clamp): the only role that can **widen** a policy (`allowFunction(s)`,
   `addAllowedValues`, `set…(true)`, re-allowing a seeded unwrapper hash, `setRequiredFallbackHandler`),
   issue approvals of up to 180 days, open a `Bypass` window of up to 180 days in which nothing is
@@ -1159,8 +1162,8 @@ points at another guard. If the guard was installed before the policy sync execu
   scheduled self-calls of the timelock: grant the successor first, then revoke (the contract keeps
   the last proposer and the last canceller, refuses to drop the open executor or its own admin role,
   never grants that admin role to anyone else nor a gated role to itself, clamps `getMinDelay()` to
-  [1 h, 30 d] and refuses an `updateDelay` outside that range, an operation delay above 30 days and
-  calldata for a target without code when they are PROPOSED, so a value typed in the wrong unit or
+  [1 h, 30 d] and refuses an `updateDelay` outside that range, an operation delay other than the live
+  `getMinDelay()` and calldata for a target without code when they are PROPOSED, so a value typed in the wrong unit or
   an address typed wrong fails at `schedule`, not after the delay; a proposer is never granted the
   veto and the veto never the proposer role,
   so a rotation of the veto Safe is `[grantRole(CANCELLER_ROLE, new), revokeRole(CANCELLER_ROLE,

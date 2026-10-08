@@ -35,11 +35,14 @@ import {TimelockController} from "@openzeppelin/contracts/governance/TimelockCon
 ///           from inside an operation someone else scheduled: a phantom proposer for the last-holder
 ///           rail, and as a canceller a veto in every proposer's hands) ever holds a gated role;
 ///         - a proposer is never granted `CANCELLER_ROLE`, a canceller never `PROPOSER_ROLE`.
-///         Proposal-time rails (`schedule` / `scheduleBatch`): an operation delay above
-///         `MIN_DELAY_CAP` is refused (a unit mistake would park the operation, and the queue, for
-///         years), as is calldata for a target without code (it would "execute" and be Done with
-///         nothing run; `execute` refuses it again) and a scheduled `updateDelay` outside the clamp
-///         (refused when proposed instead of being silently read as the floor or the cap).
+///         Proposal-time rails (`schedule` / `scheduleBatch`): an operation delay other than the live
+///         `getMinDelay()` is refused (an operation id carries neither its proposer nor its delay, so
+///         with a longer delay one proposer could take another proposer's exact operation up to 30
+///         days out, leaving the honest schedule to revert and the honest `executeBefore` wrapper dead
+///         on arrival; a unit mistake would park the operation, and the queue, for years), as is
+///         calldata for a target without code (it would "execute" and be Done with nothing run;
+///         `execute` refuses it again) and a scheduled `updateDelay` outside the clamp (refused when
+///         proposed instead of being silently read as the floor or the cap).
 ///         Not enforced on-chain: the NUMBER of cancellers (a rotation needs two for one batch);
 ///         monitoring pages on any `grantRole(CANCELLER_ROLE, …)`. Only a canceller can clear a
 ///         pending operation, a dead one included, and cancelling a predecessor does not cancel its
@@ -119,13 +122,15 @@ contract CuratorGuardTimelock is TimelockController {
         super.scheduleBatch(targets_, values_, payloads_, predecessor_, salt_, delay_);
     }
 
-    /// @dev Proposal-time rails. (1) An operation delay above the cap is a unit mistake: it would park the
-    ///      operation for years, and near 2^256 `block.timestamp + delay` is a bare `Panic`. (2) A scheduled
+    /// @dev Proposal-time rails. (1) An operation delay is exactly the live `getMinDelay()` (the base refuses
+    ///      a shorter one): a longer one would let a proposer take another proposer's exact operation (same
+    ///      id, up to 30 days out; round 10, G10c-1), a unit mistake would park the operation for years, and
+    ///      near 2^256 `block.timestamp + delay` is a bare `Panic`. (2) A scheduled
     ///      `updateDelay` outside the clamp is refused instead of being stored and silently read as the
     ///      floor or the cap (`updateDelay` can only ever run as a scheduled self-call, so this covers it).
     ///      (3) Calldata for an account without code would "execute" (`_execute` below refuses it too).
     function _checkScheduled(address target_, bytes calldata data_, uint256 delay_) private view {
-        if (delay_ > MIN_DELAY_CAP) revert DelayOutOfRange(delay_);
+        if (delay_ > getMinDelay()) revert DelayOutOfRange(delay_);
         if (data_.length != 0 && target_.code.length == 0) revert TargetHasNoCode(target_);
         if (target_ == address(this) && data_.length >= 36 && bytes4(data_[:4]) == this.updateDelay.selector) {
             uint256 _newDelay = uint256(bytes32(data_[4:36]));

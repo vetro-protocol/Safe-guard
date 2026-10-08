@@ -197,7 +197,9 @@ contract CuratorGuardRound8TimelockTest is Test {
         vm.prank(p1);
         tl.schedule(stranger, 1 ether, "", NO_PRED, "v", 3 days); // plain value transfer to a key: allowed
         vm.prank(p1);
-        tl.schedule(guardLike, 0, "", NO_PRED, "e", 30 days); // the cap itself is fine
+        // G10c-1: only the live minDelay schedules; a longer delay would let one proposer take another's operation id.
+        vm.expectRevert(abi.encodeWithSelector(CuratorGuardTimelock.DelayOutOfRange.selector, 30 days));
+        tl.schedule(guardLike, 0, "", NO_PRED, "e", 30 days);
         address[] memory _t = new address[](0);
         bytes[] memory _pl = new bytes[](0);
         uint256[] memory _v = new uint256[](0);
