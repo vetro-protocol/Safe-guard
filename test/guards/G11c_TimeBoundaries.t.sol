@@ -333,7 +333,7 @@ contract CuratorGuardG11cTimeBoundariesTest is CuratorGuardTestBase {
     ///      `updateDelay` edges are inclusive.
     function testFuzz_timelock_ready_at_exactly_scheduled_plus_delay(uint64 t_, uint256 minDelay_) public {
         uint64 _t = _base(t_);
-        uint256 _minDelay = bound(minDelay_, 1 hours, 30 days);
+        uint256 _minDelay = bound(minDelay_, 1 days, 30 days);
         (CuratorGuardTimelock _tl, address _proposer, ) = _timelock(_minDelay);
         CuratorGuardHarness _g = new CuratorGuardHarness(0, address(_tl), council);
         bytes memory _call = abi.encodeCall(_g.enforce, (address(safe)));
@@ -362,10 +362,12 @@ contract CuratorGuardG11cTimeBoundariesTest is CuratorGuardTestBase {
         _tl.execute(address(_g), 0, _call, bytes32(0), bytes32("s"));
         assertEq(uint8(_g.mode(address(safe))), uint8(CuratorGuardPolicy.Mode.Enforced));
 
-        // `updateDelay` edges, checked at proposal: 1 hour and 30 days accepted, one second outside refused.
-        _scheduleUpdateDelay(_tl, _proposer, _minDelay, 1 hours - 1, true);
+        // `updateDelay` edges, checked at proposal: 1 day and 30 days accepted, one second outside refused
+        // (the floor is a day since the round-13 follow-up; an hour is outside).
+        _scheduleUpdateDelay(_tl, _proposer, _minDelay, 1 days - 1, true);
+        _scheduleUpdateDelay(_tl, _proposer, _minDelay, 1 hours, true);
         _scheduleUpdateDelay(_tl, _proposer, _minDelay, uint256(30 days) + 1, true);
-        _scheduleUpdateDelay(_tl, _proposer, _minDelay, 1 hours, false);
+        _scheduleUpdateDelay(_tl, _proposer, _minDelay, 1 days, false);
         _scheduleUpdateDelay(_tl, _proposer, _minDelay, 30 days, false);
     }
 
@@ -382,11 +384,11 @@ contract CuratorGuardG11cTimeBoundariesTest is CuratorGuardTestBase {
     ///      both edges of the clamp.
     function testFuzz_timelock_effective_delay_is_the_stored_one_inside_the_clamp(uint64 t_, uint256 minDelay_) public {
         _base(t_);
-        uint256 _minDelay = bound(minDelay_, 1 hours, 30 days);
+        uint256 _minDelay = bound(minDelay_, 1 days, 30 days);
         (CuratorGuardTimelock _tl, , ) = _timelock(_minDelay);
         assertEq(_tl.getMinDelay(), _minDelay);
-        vm.expectRevert(abi.encodeWithSelector(CuratorGuardTimelock.DelayOutOfRange.selector, uint256(1 hours) - 1));
-        _timelock(uint256(1 hours) - 1);
+        vm.expectRevert(abi.encodeWithSelector(CuratorGuardTimelock.DelayOutOfRange.selector, uint256(1 days) - 1));
+        _timelock(uint256(1 days) - 1);
         vm.expectRevert(abi.encodeWithSelector(CuratorGuardTimelock.DelayOutOfRange.selector, uint256(30 days) + 1));
         _timelock(uint256(30 days) + 1);
     }

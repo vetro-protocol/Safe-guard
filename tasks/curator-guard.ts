@@ -8,8 +8,11 @@ import {
   getBytes,
   hexlify,
   isAddress,
+  concat,
   keccak256,
+  solidityPacked,
   toBeHex,
+  toUtf8Bytes,
   zeroPadValue,
 } from "ethers";
 import type { Contract, EventLog, Interface, Log } from "ethers";
@@ -422,8 +425,22 @@ task("curator-guard-sync", "Reconcile a CuratorGuard policy for a Safe against a
       const queue = await pendingOperations(ctx, scan);
       if (queue.length) {
         console.log(chalk.yellow(`${queue.length} operation(s) pending on the timelock ${ctx.admin}:`));
-        for (const q of queue)
+        // A flood is itself the incident (review G13f-1): the timelock caps nothing, a bare operation never
+        // expires, and every run pays one read per scanned id, so the print is capped and the burst named.
+        for (const q of queue.slice(0, QUEUE_PRINT_CAP))
           console.log(chalk.yellow(`  ${q.opId} (scheduled in block ${q.block}): ${q.description}`));
+        if (queue.length > QUEUE_PRINT_CAP)
+          console.log(
+            chalk.yellow(
+              `  ... and ${queue.length - QUEUE_PRINT_CAP} more (curator-guard-verify --op <id> decodes any one)`,
+            ),
+          );
+        if (queue.length > QUEUE_FLOOD_WARN)
+          console.log(
+            chalk.red(
+              `WARNING: ${queue.length} pending operations is a burst, not a backlog: a compromised proposer floods the queue with operations that never expire (review G13f-1); page the veto Safe, which cancels every abandoned id in ONE MultiSend transaction, and remove that proposer`,
+            ),
+          );
       } else if (scan.degraded) {
         // A tolerated scan that could not list the queue must never read as an empty queue (review P1b-2).
         console.log(
@@ -470,27 +487,52 @@ task("curator-guard-sync", "Reconcile a CuratorGuard policy for a Safe against a
 
 task(
   "curator-guard-verify",
-  "Decode a queued timelock operation from the chain's logs and compare it with the policy file",
+  "Decode a queued timelock operation from the chain's logs (--op), or a signer manifest's proposal before it is signed (--manifest), and compare it with the policy file",
 )
   .addParam("guard", "CuratorGuard address")
   .addParam("policy", "Path to the policy JSON")
-  .addParam("op", "Operation id(s), comma-separated")
+  .addOptionalParam("op", "Operation id(s), comma-separated: queued operations, rebuilt from the timelock's logs")
+  .addOptionalParam(
+    "manifest",
+    "A signer manifest written by curator-guard-sync: decode its scheduleBatch calldata against the committed file and print the proposer Safe's EIP-712 hashes to compare with the hardware wallet BEFORE signing",
+  )
+  .addOptionalParam(
+    "proposer",
+    "With --manifest: the proposer Safe the proposal is for (default: the manifest's proposer)",
+  )
+  .addOptionalParam(
+    "nonce",
+    "With --manifest: the Safe nonce of the proposal (default: the proposer Safe's live nonce())",
+  )
   .addOptionalParam("timelockBlock", "Block the admin timelock was deployed at (also CURATOR_GUARD_TIMELOCK_BLOCK)")
   .setAction(
     async (
-      args: { guard: string; policy: string; op: string; timelockBlock?: string },
+      args: {
+        guard: string;
+        policy: string;
+        op?: string;
+        manifest?: string;
+        proposer?: string;
+        nonce?: string;
+        timelockBlock?: string;
+      },
       hre: HardhatRuntimeEnvironment,
     ) => {
+      if (!args.op === !args.manifest) throw Error("pass exactly one of --op <id> or --manifest <file>");
       const { policy } = loadPolicy(args.policy);
       const ctx = await guardContext(hre, args.guard, policy, args.timelockBlock);
       if (!ctx.timelock) throw Error(`the guard admin ${ctx.admin} is not a TimelockController`);
+      if (args.manifest) {
+        await verifyManifest(hre, ctx, policy, args.manifest, args.proposer, args.nonce);
+        return;
+      }
       const scan = await timelockScan(hre, ctx, false);
       const plan = await planDiff(hre, ctx, policy, true, true);
       const wanted = new Set(plan.calls.map((c) => c.data));
       let allMatch = true;
       let syncShaped = 0;
       let pendingNamed = 0;
-      for (const id of args.op.split(",")) {
+      for (const id of args.op!.split(",")) {
         const op = await rebuildOperation(ctx, scan, id.trim());
         const ts: bigint = await ctx.timelock.getTimestamp(op.opId);
         // An executed operation's calls left the diff when they landed: it is not judged against the current
@@ -555,6 +597,274 @@ task(
       );
     },
   );
+
+type ManifestFile = {
+  chainId?: string | number;
+  timelock?: string;
+  guard?: string;
+  proposer?: string | null;
+  operations?: { opId?: string; scheduleBatchCalldata?: string }[];
+};
+
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+// Safe v1.3.0+ EIP-712 constants (`Safe.sol`: DOMAIN_SEPARATOR_TYPEHASH, SAFE_TX_TYPEHASH).
+const SAFE_DOMAIN_TYPEHASH = keccak256(toUtf8Bytes("EIP712Domain(uint256 chainId,address verifyingContract)"));
+const SAFE_TX_TYPEHASH = keccak256(
+  toUtf8Bytes(
+    "SafeTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce)",
+  ),
+);
+// The canonical `MultiSendCallOnly` protocol-kit wraps two or more proposed calls in, per Safe release
+// (helpers/address.ts `Safe.multiSendCallOnly_*`; the policy file registers the same three).
+const MULTISEND_CALL_ONLY: Record<string, string> = {
+  "1.3.0": "0x40A2aCCbd92BCA938b02010E17A5b8929b49130D",
+  "1.4.1": "0x9641d764fc13c8B624c04430C7356C1C7C8102e2",
+  "1.5.0": "0xA83c336B20401Af773B6219BA5027174338D1836",
+};
+
+/// The three hashes a signer compares with the hardware wallet (domain hash and message hash on a
+/// blind-signing display, `safeTxHash` in Safe{Wallet}'s transaction details), for a proposal with no gas
+/// refund (`safeTxGas`, `baseGas`, `gasPrice` 0, `gasToken` and `refundReceiver` zero), as `Safe.sol`
+/// v1.3.0+ computes them.
+function safeTxHashes(
+  chainId: bigint,
+  safe: string,
+  to: string,
+  data: string,
+  operation: number,
+  nonce: bigint,
+): { domain: string; message: string; safeTxHash: string } {
+  const coder = AbiCoder.defaultAbiCoder();
+  const domain = keccak256(coder.encode(["bytes32", "uint256", "address"], [SAFE_DOMAIN_TYPEHASH, chainId, safe]));
+  const message = keccak256(
+    coder.encode(
+      [
+        "bytes32",
+        "address",
+        "uint256",
+        "bytes32",
+        "uint8",
+        "uint256",
+        "uint256",
+        "uint256",
+        "address",
+        "address",
+        "uint256",
+      ],
+      [SAFE_TX_TYPEHASH, to, 0n, keccak256(data), operation, 0n, 0n, 0n, ZERO_ADDRESS, ZERO_ADDRESS, nonce],
+    ),
+  );
+  return { domain, message, safeTxHash: keccak256(concat(["0x1901", domain, message])) };
+}
+
+/// `--manifest`: the signer-side check of a proposal BEFORE it is signed. The manifest, the Safe{Wallet} page and
+/// the Transaction Service proposal all come from the operator's machine, so a signer trusts none of them:
+/// everything is rebuilt from the manifest's `scheduleBatchCalldata` alone, on the signer's own clone of the
+/// committed file and their own RPC: the operation id (locally, `keccak256(abi.encode(...))` as OpenZeppelin
+/// hashes it), every decoded call against the diff the committed file produces right now, the chain of
+/// predecessors, the delay against the live `getMinDelay()`, and the EIP-712 hashes the proposer Safe's signers
+/// see on a hardware wallet for the proposal protocol-kit builds (one operation: a plain call to the timelock;
+/// two or more: one `MultiSendCallOnly` delegatecall, as `helpers/safe.ts` proposes them). A proposal whose
+/// hash is not the one printed is not the manifest's transaction, whatever the page shows (review G12a-2).
+async function verifyManifest(
+  hre: HardhatRuntimeEnvironment,
+  ctx: Ctx,
+  policy: Policy,
+  file: string,
+  proposerArg: string | undefined,
+  nonceArg: string | undefined,
+): Promise<void> {
+  const timelock = ctx.timelock!;
+  let m: ManifestFile;
+  try {
+    m = JSON.parse(fs.readFileSync(file, "utf8")) as ManifestFile;
+  } catch (e: unknown) {
+    throw Error(`${file} is not a readable manifest (${errorText(e)})`);
+  }
+  if (!Array.isArray(m.operations) || !m.operations.length) throw Error(`${file}: no operations`);
+  if (String(m.chainId) !== String(ctx.chainId))
+    throw Error(`${file} was written for chain ${m.chainId}; this network is ${ctx.chainId}`);
+  if (lower(String(m.timelock)) !== lower(ctx.admin) || lower(String(m.guard)) !== lower(ctx.guard))
+    throw Error(`${file} names timelock ${m.timelock} / guard ${m.guard}, not ${ctx.admin} / ${ctx.guard}`);
+  const proposer = proposerArg ?? m.proposer ?? undefined;
+  if (!proposer || !isAddress(proposer)) throw Error("pass --proposer <Safe>: the manifest names no proposer Safe");
+  const safeAddress = getAddress(proposer);
+
+  const plan = await planDiff(hre, ctx, policy, true, true);
+  const wanted = new Set(plan.calls.map((c) => c.data));
+  const minDelay: bigint = await timelock.getMinDelay();
+  const coder = AbiCoder.defaultAbiCoder();
+  let allMatch = true;
+  let previousId = ZERO_HASH;
+  const calldatas: string[] = [];
+  for (const [i, op] of m.operations.entries()) {
+    const calldata = String(op.scheduleBatchCalldata ?? "");
+    if (!/^0x[0-9a-fA-F]+$/.test(calldata)) throw Error(`${file}: operation #${i} carries no scheduleBatch calldata`);
+    const parsed = timelock.interface.parseTransaction({ data: calldata });
+    if (!parsed || (parsed.name !== "scheduleBatch" && parsed.name !== "schedule"))
+      throw Error(
+        `${file}: operation #${i} is not a schedule / scheduleBatch call (${parsed?.name ?? calldata.slice(0, 10)})`,
+      );
+    const batch = parsed.name === "scheduleBatch";
+    const targets: string[] = batch ? (parsed.args[0] as string[]).map(String) : [String(parsed.args[0])];
+    const values: bigint[] = batch ? (parsed.args[1] as bigint[]).map(BigInt) : [BigInt(parsed.args[1])];
+    const payloads: string[] = batch ? (parsed.args[2] as string[]).map(String) : [String(parsed.args[2])];
+    const predecessor = String(parsed.args[3]);
+    const salt = String(parsed.args[4]);
+    const delay = BigInt(parsed.args[5]);
+    const opId = batch
+      ? keccak256(
+          coder.encode(
+            ["address[]", "uint256[]", "bytes[]", "bytes32", "bytes32"],
+            [targets, values, payloads, predecessor, salt],
+          ),
+        )
+      : keccak256(
+          coder.encode(
+            ["address", "uint256", "bytes", "bytes32", "bytes32"],
+            [targets[0], values[0], payloads[0], predecessor, salt],
+          ),
+        );
+    console.log(
+      chalk.blue(`operation #${i} ${opId}: ${parsed.name}, delay ${delay}s, predecessor ${predecessor}, salt ${salt}`),
+    );
+    if (op.opId && lower(String(op.opId)) !== lower(opId)) {
+      allMatch = false;
+      console.log(chalk.red(`  the manifest says ${op.opId}: its decoded list does not describe this calldata`));
+    }
+    if (i > 0 && lower(predecessor) !== lower(previousId)) {
+      allMatch = false;
+      console.log(chalk.red(`  predecessor is not operation #${i - 1}: the chain of operations is not the manifest's`));
+    }
+    if (delay !== minDelay) {
+      allMatch = false;
+      console.log(chalk.red(`  delay ${delay}s is not the live getMinDelay() ${minDelay}s (the timelock refuses it)`));
+    }
+    const scheduledAt: bigint = await timelock.getTimestamp(opId);
+    if (scheduledAt !== 0n)
+      console.log(
+        chalk.yellow(
+          `  already on the timelock (${scheduledAt === 1n ? "executed" : `ready at ${iso(scheduledAt)}`}): scheduling it again reverts`,
+        ),
+      );
+    for (const [j, p] of payloads.entries()) {
+      const guardTarget = lower(targets[j]) === lower(ctx.guard);
+      const inner = unwrapExecuteBefore(ctx.guardIface, p);
+      const stillWanted = guardTarget && values[j] === 0n && inner !== undefined && wanted.has(inner.data);
+      allMatch &&= stillWanted;
+      const [first, ...rest] = describeTimelockCall(ctx, targets[j], p).split("\n");
+      console.log(
+        `  [${j}] ${first}` +
+          (guardTarget
+            ? stillWanted
+              ? chalk.green("  (in the current diff)")
+              : chalk.red("  (NOT in the current diff)")
+            : chalk.red("  (NOT a guard call)")) +
+          (values[j] !== 0n ? chalk.red(`  value ${values[j]}`) : "") +
+          rest.map((line) => `\n${line}`).join(""),
+      );
+    }
+    previousId = opId;
+    calldatas.push(calldata);
+  }
+
+  // What the proposer Safe's signers will be asked to sign: protocol-kit proposes one call directly and two or
+  // more as one MultiSendCallOnly delegatecall (helpers/safe.ts).
+  const { ethers } = hre;
+  const safe = new ethers.Contract(
+    safeAddress,
+    [
+      "function nonce() view returns (uint256)",
+      "function VERSION() view returns (string)",
+      "function getTransactionHash(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,uint256) view returns (bytes32)",
+    ],
+    ethers.provider,
+  );
+  const hasCode = (await ethers.provider.getCode(safeAddress)) !== "0x";
+  let nonce: bigint;
+  if (nonceArg !== undefined) {
+    if (!/^\d+$/.test(nonceArg)) throw Error(`--nonce must be a number, got ${nonceArg}`);
+    nonce = BigInt(nonceArg);
+  } else if (hasCode) nonce = BigInt(await safe.nonce());
+  else throw Error(`${safeAddress} has no code on this network: pass --nonce <n>`);
+  let version = "unknown";
+  if (hasCode) {
+    try {
+      version = String(await safe.VERSION());
+    } catch {
+      /* not a Safe that answers VERSION() */
+    }
+  }
+  let to = ctx.admin;
+  let data = calldatas[0];
+  let operation = 0;
+  if (calldatas.length > 1) {
+    const lib = MULTISEND_CALL_ONLY[version];
+    if (!lib)
+      throw Error(
+        `${calldatas.length} operations are proposed as one MultiSendCallOnly batch and Safe v${version} has no canonical ` +
+          `MultiSendCallOnly in this table: compare the operations one by one`,
+      );
+    const packed = concat(
+      calldatas.map((d) =>
+        solidityPacked(["uint8", "address", "uint256", "uint256", "bytes"], [0, ctx.admin, 0, (d.length - 2) / 2, d]),
+      ),
+    );
+    to = lib;
+    data = new ethers.Interface(["function multiSend(bytes)"]).encodeFunctionData("multiSend", [packed]);
+    operation = 1;
+  }
+  const { domain, message, safeTxHash } = safeTxHashes(BigInt(ctx.chainId), safeAddress, to, data, operation, nonce);
+  console.log(
+    chalk.blue(
+      `proposal for Safe ${safeAddress} (v${version}) at nonce ${nonce}: to ${to}, value 0, operation ${
+        operation === 0 ? "0 (Call)" : "1 (DelegateCall into MultiSendCallOnly)"
+      }, safeTxGas 0, baseGas 0, gasPrice 0, gasToken 0x0, refundReceiver 0x0${nonceArg === undefined ? " (nonce read live: pass --nonce if the Transaction Service assigned another)" : ""}`,
+    ),
+  );
+  console.log(chalk.blue(`  calldata keccak256 ${keccak256(data)} (${(data.length - 2) / 2} bytes)`));
+  console.log(chalk.blue(`  EIP-712 domain hash  ${domain}`));
+  console.log(chalk.blue(`  EIP-712 message hash ${message}`));
+  console.log(chalk.blue(`  safeTxHash           ${safeTxHash}`));
+  if (hasCode) {
+    try {
+      const own: string = await safe.getTransactionHash(
+        to,
+        0,
+        data,
+        operation,
+        0,
+        0,
+        0,
+        ZERO_ADDRESS,
+        ZERO_ADDRESS,
+        nonce,
+      );
+      if (own === safeTxHash) console.log(chalk.green("  the Safe's own getTransactionHash agrees"));
+      else {
+        allMatch = false;
+        console.log(
+          chalk.red(`  the Safe's own getTransactionHash answers ${own}: this Safe does not hash like Safe v1.3.0+`),
+        );
+      }
+    } catch (e: unknown) {
+      console.log(
+        chalk.yellow(`  the Safe did not answer getTransactionHash (${errorText(e)}): compare the hashes above`),
+      );
+    }
+  }
+  console.log(
+    allMatch
+      ? chalk.green(
+          "every decoded call is part of the diff the committed policy file produces right now: sign ONLY the proposal whose " +
+            "safeTxHash is the one above (Safe{Wallet} shows it in the transaction details; a hardware wallet shows the domain and message hashes)",
+        )
+      : chalk.red(
+          "some decoded calls are NOT what the committed policy file would produce right now, or the manifest does not describe " +
+            "its own calldata: do not sign",
+        ),
+  );
+}
 
 /// The guard functions a policy sync emits (every call of `planDiff`); any other guard call is a one-off.
 const SYNC_SELECTORS = new Set(
@@ -915,10 +1225,28 @@ async function planDiff(
     desired.set(k, { target, selector, allowValue: f.allowValue === true, rules: (f.rules ?? []).map(toRule), src: f });
   }
 
-  // The go-live gate behind `"unconstrained": true` on a NAV-marking function (docs sections 5 and 8):
-  // tolerable only while the vault it marks holds nothing a colluding quorum could mark away.
+  // The go-live gate on a NAV-marking function (docs sections 5 and 8): tolerable only while the vault
+  // it marks holds nothing a colluding quorum could mark away. An `"unconstrained": true` entry bounds
+  // nothing by its own admission and is gated on every sync. A BANDED entry is gated at its FIRST sync
+  // (no floor and ceiling on chain yet): a band the live `totalAssets()` does not sit in, or one wider
+  // than +-50 % of it, caps nothing either (`[1, 2^256-2]` passes the contract and lints valid) while it
+  // reads as a bound in the diff (review G13a-1). A band already on chain moves under the loosening
+  // gate instead (`loosensRules`: anchored on the live NAV and no wider is a shift, anything else a
+  // loosening).
   for (const d of desired.values()) {
-    if (!d.src.unconstrained || !BAND_SHAPED.has(d.selector)) continue;
+    const bandWord = BAND_SHAPED.get(d.selector);
+    if (bandWord === undefined) continue;
+    let band: { lo: bigint; hi: bigint } | undefined;
+    if (!d.src.unconstrained) {
+      const floor = d.rules.find((r) => r.wordIndex === bandWord && r.kind === 4);
+      const ceil = d.rules.find((r) => r.wordIndex === bandWord && r.kind === 3);
+      if (!floor || !ceil) continue; // an EqualTo / OneOf mark is tight by construction
+      const [allowed, , rawRules] = await guard.functionPermission(safe, d.target, d.selector);
+      const has = (k: number) =>
+        rawRules.some((r: [bigint, bigint, string]) => Number(r[0]) === k && Number(r[1]) === bandWord);
+      if (allowed && has(3) && has(4)) continue;
+      band = { lo: BigInt(floor.value), hi: BigInt(ceil.value) };
+    }
     let assets = 0n;
     try {
       assets = await new ethers.Contract(
@@ -930,7 +1258,16 @@ async function planDiff(
       continue; // not an ERC-4626 vault: nothing to gate on
     }
     if (assets === 0n) continue;
-    const msg = `${d.src.signature} on ${d.target} is unconstrained while the vault reports totalAssets() = ${assets}: a colluding curator quorum can mark that custody away (docs section 8); put a NAV band on it, or pass --allow-unconstrained-nav`;
+    let msg: string;
+    if (band === undefined) {
+      msg = `${d.src.signature} on ${d.target} is unconstrained while the vault reports totalAssets() = ${assets}: a colluding curator quorum can mark that custody away (docs section 8); put a NAV band on it, or pass --allow-unconstrained-nav`;
+    } else {
+      let shape: string;
+      if (band.lo > assets || assets > band.hi) shape = "that does not contain";
+      else if (band.hi - band.lo > assets) shape = "wider than +-50 % of";
+      else continue;
+      msg = `${d.src.signature} on ${d.target} carries a band [${band.lo}, ${band.hi}] ${shape} the vault's totalAssets() = ${assets}: a band only on paper caps nothing a colluding curator quorum marks away (docs sections 5 and 8); tighten it around the settled NAV, or pass --allow-unconstrained-nav knowingly (review G13a-1)`;
+    }
     if (!allowUnconstrainedNav) throw Error(msg);
     say(chalk.red(`WARNING: ${msg}`));
   }
@@ -993,12 +1330,48 @@ async function planDiff(
         // Already allowed: print what changes and whether it loosens.
         const before = `allowValue=${allowValue} [${rules.map(ruleText).join(", ")}]`;
         const after = `allowValue=${d.allowValue} [${d.rules.map(ruleText).join(", ")}]`;
-        const why = loosensRules(rules, d.rules, allowValue, d.allowValue);
+        // A NAV band (floor + ceiling on word 0 of a NAV-shaped function or of its settles) that moves to
+        // follow the vault's live totalAssets() is the re-sync of docs section 5, not a loosening.
+        let anchor: bigint | undefined;
+        if (
+          d.rules.some((r) => r.wordIndex === 0 && r.kind === 3) &&
+          d.rules.some((r) => r.wordIndex === 0 && r.kind === 4)
+        ) {
+          try {
+            anchor = await new ethers.Contract(
+              d.target,
+              ["function totalAssets() view returns (uint256)"],
+              ethers.provider,
+            ).totalAssets();
+          } catch {
+            anchor = undefined; // not a vault: no exemption
+          }
+        }
+        const { why, shifted } = loosensRules(rules, d.rules, allowValue, d.allowValue, anchor);
         say(
           chalk.yellow(
-            `~ rules   ${label} on ${d.target}: ${before} -> ${after}${why.length ? chalk.red(`  LOOSENING: ${why.join("; ")}`) : ""}`,
+            `~ rules   ${label} on ${d.target}: ${before} -> ${after}${why.length ? chalk.red(`  LOOSENING: ${why.join("; ")}`) : ""}${shifted.length ? `  (${shifted.join("; ")})` : ""}`,
           ),
         );
+        // A shift is exempt from the loosening gate, so the move itself is said out loud: the anchor is the
+        // vault's live `totalAssets()`, the curator's own last settled mark, and a band that follows it is a
+        // ratchet bounded by the band's width per sync; the reviewer of the file judges the move, not the
+        // flag (review G13g-8).
+        if (shifted.length && anchor !== undefined) {
+          const ceilBefore = rules.find((r) => r.wordIndex === 0 && r.kind === 3);
+          const ceilAfter = d.rules.find((r) => r.wordIndex === 0 && r.kind === 3);
+          if (ceilBefore && ceilAfter) {
+            const from = BigInt(ceilBefore.value);
+            const to = BigInt(ceilAfter.value);
+            const bps = from === 0n ? 0n : ((to - from) * 10_000n) / from;
+            say(
+              chalk.yellow(
+                `          band ceiling ${from} -> ${to} (${bps >= 0n ? "+" : ""}${Number(bps) / 100} %) to follow totalAssets() = ${anchor}: ` +
+                  `that number is the curator's last settled mark; the move is reviewed in the file, never confirmed by a flag`,
+              ),
+            );
+          }
+        }
         if (why.length) loosenings.push(`${label} on ${d.target}: ${why.join("; ")}`);
       }
     }
@@ -1223,24 +1596,57 @@ async function planDiff(
 }
 
 /// Why `after` is weaker than `before` for a function that is already allowed (empty = not weaker).
+/// A band (a floor and a ceiling on one word) that MOVES without growing is not weaker: it is the
+/// re-sync docs section 5 asks for at every funding step (the settled NAV moved, the band follows).
+/// Such a shift is reported as `shifted`, never as a loosening, so the flag that must never become a
+/// habit (`--confirm-loosening`) is asked for only when the band widens, a bound goes, a floor falls
+/// below the old floor while the ceiling stays, or `allowValue` switches on (review G12c).
 function loosensRules(
   before: OnChainRule[],
   after: OnChainRule[],
   valueBefore: boolean,
   valueAfter: boolean,
-): string[] {
+  anchor?: bigint,
+): { why: string[]; shifted: string[] } {
   const why: string[] = [];
+  const shifted: string[] = [];
   if (!valueBefore && valueAfter) why.push("allowValue switched on");
+  const bandWords = new Set<number>();
+  for (const b of before) {
+    if (b.kind !== 3 && b.kind !== 4) continue;
+    const other = before.find((o) => o.wordIndex === b.wordIndex && o.kind === (b.kind === 3 ? 4 : 3));
+    const sameCeil = after.find((a) => a.kind === 3 && a.wordIndex === b.wordIndex);
+    const sameFloor = after.find((a) => a.kind === 4 && a.wordIndex === b.wordIndex);
+    if (!other || !sameCeil || !sameFloor) continue;
+    const ceilBefore = BigInt((b.kind === 3 ? b : other).value);
+    const floorBefore = BigInt((b.kind === 4 ? b : other).value);
+    const ceilAfter = BigInt(sameCeil.value);
+    const floorAfter = BigInt(sameFloor.value);
+    const sameDirection =
+      (ceilAfter >= ceilBefore && floorAfter >= floorBefore) || (ceilAfter <= ceilBefore && floorAfter <= floorBefore);
+    // The width is compared relative to the band's centre (a +-5 % band around a larger NAV is wider in
+    // raw units and no looser), with one part in a million of slack for the file's rounding.
+    const notWider =
+      (ceilAfter - floorAfter) * (ceilBefore + floorBefore) * 1_000_000n <=
+      (ceilBefore - floorBefore) * (ceilAfter + floorAfter) * 1_000_001n;
+    // Only a band that lands on the vault's live `totalAssets()` (the anchor the caller read) is a
+    // re-sync; a band moved away from it is a loosening like any other.
+    const anchored = anchor !== undefined && floorAfter <= anchor && anchor <= ceilAfter;
+    if (sameDirection && notWider && anchored) bandWords.add(b.wordIndex);
+  }
+  for (const w of bandWords)
+    shifted.push(`band on word ${w} shifted (relative width not grown, the vault's totalAssets() inside)`);
   for (const b of before) {
     const same = after.find((a) => a.kind === b.kind && a.wordIndex === b.wordIndex);
     if (!same) {
       why.push(`${RULE_KINDS[b.kind]} on word ${b.wordIndex} removed`);
       continue;
     }
+    if (bandWords.has(b.wordIndex) && (b.kind === 3 || b.kind === 4)) continue;
     if (b.kind === 3 && BigInt(same.value) > BigInt(b.value)) why.push(`ceiling on word ${b.wordIndex} raised`);
     if (b.kind === 4 && BigInt(same.value) < BigInt(b.value)) why.push(`floor on word ${b.wordIndex} lowered`);
   }
-  return why;
+  return { why, shifted };
 }
 
 /// Functions revoked on-chain for this Safe (`FunctionRevoked` logs), so a re-allow is said out loud.
@@ -1891,10 +2297,20 @@ async function executeScheduled(
   }
   if (args.dryRun) return;
   // The state file goes only when every operation it lists is done; --op never touches it (R7C-05).
+  // "Done" is read at ONE confirmation: a reorg that drops the execution afterwards leaves the operation
+  // Ready with no file, and `--execute --op <id>` is the way back (review G13c-2), so say the ids out loud.
   if (!args.op && stored) {
     let allDone = true;
     for (const op of stored.operations) if ((await timelock.getTimestamp(op.opId)) !== 1n) allDone = false;
-    if (allDone) removeState(stateFile);
+    if (allDone) {
+      removeState(stateFile);
+      console.log(
+        chalk.blue(
+          `state file removed (every operation done at block ${await ethers.provider.getBlockNumber()}); if a reorg ` +
+            `drops an execution, land it again with --execute --op ${stored.operations.map((o) => o.opId).join(" / --op ")}`,
+        ),
+      );
+    }
   }
   if (scan.degraded)
     console.log(chalk.yellow(`WARNING: other pending operations could NOT be listed (${scan.degraded})`));
@@ -2071,6 +2487,12 @@ async function creationBlock(hre: HardhatRuntimeEnvironment, ctx: Ctx): Promise<
   }
   return undefined;
 }
+
+/// The routine queue print shows at most this many pending operations, and above the lower bound it
+/// names the burst for what it is (review G13f-1): a proposer floods the timelock at no cost, the veto
+/// clears the flood in one batched cancel.
+const QUEUE_PRINT_CAP = 50;
+const QUEUE_FLOOD_WARN = 20;
 
 /// Above this many logs in one answer the chunk is split and asked again: a provider that silently
 /// caps an answer never says so, and the guard's own event volume never fills a chunk this far
@@ -2547,6 +2969,11 @@ function selectorOf(f: PolicyFunction): string {
   const fragment = FunctionFragment.from(f.signature);
   if (fragment.format("sighash") !== f.signature)
     throw Error(`${f.signature}: not canonical, write it as ${fragment.format("sighash")}`);
+  // ethers parses `uint256[0]` and `()` as canonical types; no Solidity contract can declare them, so such an
+  // entry would allowlist a selector nothing implements (review G12f-4).
+  const parameterList = f.signature.slice(f.signature.indexOf("(") + 1, f.signature.lastIndexOf(")"));
+  if (/\[0\]|\(\)/.test(parameterList))
+    throw Error(`${f.signature}: a zero-length array or an empty tuple is not a type a contract can implement`);
   if (f.selector && lower(f.selector) !== fragment.selector)
     throw Error(`${f.signature}: selector ${f.selector} does not match ${fragment.selector}`);
   const known = KNOWN_SIGNATURES.get(fragment.selector);
@@ -2622,7 +3049,8 @@ function assertCanonicalTail(fragment: FunctionFragment, wordIndex: number, raw:
     decoded = AbiCoder.defaultAbiCoder().decode(fragment.inputs, full).toArray();
   } catch (e) {
     throw Error(
-      `${where}: tail bytes do not decode as ${fragment.format("sighash")} from word ${wordIndex}: ${(e as Error).message}`,
+      `${where}: tail bytes do not decode as ${fragment.format("sighash")} from word ${wordIndex}: ${(e as Error).message} ` +
+        `(a \`string\` payload that is not valid UTF-8 cannot be re-encoded here: give its 32-byte hash instead)`,
     );
   }
   if (lower(AbiCoder.defaultAbiCoder().encode(fragment.inputs, decoded)) !== lower(full))
@@ -2647,6 +3075,15 @@ function toWord(v: string, type?: string): string {
     if (type === "address" && word >> 160n !== 0n) throw Error(`rule value ${v} does not fit an address word`);
     if (type === "bool" && word > 1n) throw Error(`rule value ${v} is not a bool`);
     if (m && word >> BigInt(m[1]) !== 0n) throw Error(`rule value ${v} does not fit ${type}`);
+    // A `bytesN` parameter occupies the HIGH N bytes of its head word (the ABI left-aligns it); a decimal, or a hex
+    // word with its bytes on the right, is a word no canonical call ever carries, so the rule is dead (review G12f-1).
+    const b = /^bytes(\d+)$/.exec(type);
+    if (b && Number(b[1]) < 32 && word !== 0n && (word & ((1n << BigInt(8 * (32 - Number(b[1])))) - 1n)) !== 0n) {
+      throw Error(
+        `rule value ${v} is not left-aligned for ${type}: the ABI puts the ${b[1]} bytes in the high bytes of the word ` +
+          `(write the 32-byte word 0x<${2 * Number(b[1])} hex digits>${"00".repeat(32 - Number(b[1]))}); a number is right-aligned and can never match`,
+      );
+    }
   }
   return lower(zeroPadValue(toBeHex(word), 32));
 }
@@ -2766,6 +3203,17 @@ function validatePolicy(p: unknown): string[] {
     if (!isAddressString(f.target)) throw Error(`${where}: target must be an address`);
     assertChecksummed(f.target, where);
     if (reserved(f.target)) throw Error(`${where}: the zero address, the Safe and the guard can never be targets`);
+    // The policy's required fallback handler counts as part of the Safe on the council lane (unreachable
+    // as a call target: a handler answers calls from the Safe as the Safe's own) but the policy lane has no
+    // such notion, so an entry on it would let the signers reach the handler's Safe-only surface (an
+    // `ExtensibleFallbackHandler`'s `setSafeMethod`) through an allowlisted call (review G12b-1).
+    if (
+      !isZeroAddress(p.requiredFallbackHandler.handler) &&
+      lower(f.target) === lower(p.requiredFallbackHandler.handler)
+    )
+      throw Error(
+        `${where}: the policy's required fallback handler is part of the Safe (the council lane refuses every call to it); it can never be a policy target`,
+      );
     if (typeof f.signature !== "string")
       throw Error(`${where}: signature (canonical, e.g. "approve(address,uint256)") is required`);
     if (f.selector !== undefined && !(typeof f.selector === "string" && /^0x[0-9a-fA-F]{8}$/.test(f.selector)))
@@ -2855,13 +3303,24 @@ function validatePolicy(p: unknown): string[] {
       const kinds = perWord.get(onChainWordIndex(rule)) ?? [];
       if (kinds.includes(rule.kind))
         throw Error(
-          `${where}: two ${rule.kind} rules on word ${rule.wordIndex} (the chain keeps one set / one bound per word)`,
+          `${where}: two ${rule.kind} rules on word ${rule.wordIndex} (redundant: every rule is evaluated and ANDed; a OneOf word has one set)`,
         );
       kinds.push(rule.kind);
       perWord.set(onChainWordIndex(rule), kinds);
       if (/^int\d*$/.test(type))
         warnings.push(
           `${where}: word ${rule.wordIndex} is ${type}; the guard compares words unsigned, a negative value reads as a huge one`,
+        );
+      // A bound compares the whole word as an unsigned number; on a `bytesN` word (N < 32) that number is the N bytes
+      // shifted into the high end, so a ceiling or a floor on it bounds nothing an author means (review G12f-1).
+      if (
+        /^bytes\d+$/.test(type) &&
+        type !== "bytes32" &&
+        (rule.kind === "LessThanOrEqual" || rule.kind === "GreaterThanOrEqual")
+      )
+        throw Error(
+          `${where}: ${rule.kind} on word ${rule.wordIndex} which is ${type}: a bound compares the left-aligned word as a number and ` +
+            `means nothing for fixed bytes; pin the word with EqualTo or OneOf`,
         );
       if (rule.kind === "OneOf") {
         if (!Array.isArray(rule.values) || !rule.values.every((v) => typeof v === "string"))
@@ -2945,6 +3404,24 @@ function validatePolicy(p: unknown): string[] {
           `${where}: NAV-shaped function needs a floor and a ceiling on word ${bandWord} (a band around the settled NAV ` +
             `refuses unit mistakes and caps a single mark; re-sync it with every funding step) or "unconstrained": true`,
         );
+      }
+      // Offline the live NAV is unknown, but a ceiling more than 100 times the floor is a band only on
+      // paper: `[1, 2^256-2]` passes the pairing checks above and the contract's, and caps nothing a NAV
+      // band is for. The sync refuses such a band's first sync against the vault's live `totalAssets()`
+      // (review G13a-1); the warning keeps a reviewer from reading a floor and a ceiling as a bound.
+      const lo = (rules as PolicyRule[]).find(
+        (r) => r.wordIndex === bandWord && r.kind === "GreaterThanOrEqual" && !r.tail,
+      );
+      const hi = (rules as PolicyRule[]).find(
+        (r) => r.wordIndex === bandWord && r.kind === "LessThanOrEqual" && !r.tail,
+      );
+      if (lo?.value !== undefined && hi?.value !== undefined) {
+        const loW = BigInt(toWord(lo.value));
+        const hiW = BigInt(toWord(hi.value));
+        if (hiW > loW * 100n)
+          warnings.push(
+            `${where}: the NAV band on word ${bandWord} spans [${loW}, ${hiW}], a ceiling more than 100 times the floor: it reads as a band and caps nothing (a NAV band sits around the settled NAV; the sync refuses its first sync unless the vault's live totalAssets() sits inside it and the band is no wider than +-50 % of it, or --allow-unconstrained-nav is given knowingly)`,
+          );
       }
     }
     const valueWords = ALLOWANCE_SHAPED.get(selector);

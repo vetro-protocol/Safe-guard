@@ -37,9 +37,10 @@ This repository was split out of `vesper-strategies`. The Lagoon strategies the 
 ## Setup
 
 ```bash
-git clone --recurse-submodules git@github.com:bloqpriv/Safe-gaurd.git
+git clone --recurse-submodules https://github.com/bloqpriv/Safe-gaurd.git   # or the SSH form with a registered key
 cd Safe-gaurd
-npm ci
+git checkout <the branch or commit under review>   # a fresh clone lands on main
+npm ci --ignore-scripts   # as CI does: nothing in the lockfile needs a lifecycle script to run
 cp .env.example .env   # fill in RPCs and keys as needed
 ```
 
@@ -52,6 +53,7 @@ forge test --no-match-path '*e2e*'                       # unit suites, no RPC n
 ETHEREUM_FORK_BLOCK_NUMBER=25570000 forge test           # everything, needs ETHEREUM_FORK_NODE_URL (archive RPC)
 FOUNDRY_PROFILE=guards_deep forge test --mt invariant    # deep invariant search
 forge build && FOUNDRY_PROFILE=precancun forge test      # pre-Cancun deployment refusal
+FOUNDRY_PROFILE=osaka forge test --no-match-path '*e2e*'   # the unit suites on the EVM mainnet runs today (Osaka)
 npm run lint:policies                                    # policy lint corpus
 THRESHOLD_PCT=96 npm run sizes                           # EIP-170 size gate (hardhat artifacts)
 FORK_NODE_URL=<rpc> FORK_BLOCK_NUMBER=25570000 \
@@ -64,7 +66,7 @@ the upstream of the in-process `hardhat` network.
 
 The fork block must come before the guard was installed on the Vetro curator Safe (the fork tests assert the Safe has no guard and no modules); without `ETHEREUM_FORK_NODE_URL` the `*.e2e.ethereum` suites fail to resolve the `ethereum` RPC alias and the other fork suites skip.
 
-The guard and its timelock compile at 10 optimizer runs on the legacy pipeline, with `evm_version = cancun`, in both Foundry and Hardhat. CI checks that the two toolchains produce identical runtime bytecode.
+The guard and its timelock compile at 10 optimizer runs on the legacy pipeline, with `evm_version = cancun`, in both Foundry and Hardhat. CI checks that the two toolchains produce identical runtime bytecode, and `test/guards/G12a_BuildPin.t.sol` pins both runtimes (metadata stripped) to the reviewed build: a dependency or compiler change that moves the bytecode fails `forge test` until it is re-pinned with a review. `@openzeppelin/contracts` is a Solidity dependency of the deployed contracts: treat a bump of it as a contract change (`.github/dependabot.yml` keeps Dependabot off it).
 
 ## Deploy
 

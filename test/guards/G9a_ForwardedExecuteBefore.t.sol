@@ -22,8 +22,8 @@ import {CuratorGuardTestBase, MockProtocol} from "test/guards/CuratorGuardTestBa
 ///        handler requirement, by first parking a snapshot with the forwarded pre-hook, which the
 ///        documented residual says "dies with the stranger's transaction": here it is cleared and
 ///        reported instead). The precondition is the one V2-89 names (the guard in the handler slot).
-///        These tests pass against the current code and fail once `executeBefore` refuses a forwarded
-///        caller (fixes/G9a-1-executeBefore-refuse-forwarded.diff).
+///        Applied after round 13: `executeBefore` refuses a forwarded caller (`Unauthorized`) before it
+///        delegatecalls anything. The tests below pin that refusal; the V2-89 control checks stay.
 contract G9a_ForwardedExecuteBeforeTest is CuratorGuardTestBase {
     bytes32 internal constant FORGED = keccak256("no Safe transaction ever carried this hash");
     bytes32 internal constant REPORT_SIG = keccak256("TransactionChecked(address,bytes32,uint8,uint8)");
@@ -68,9 +68,9 @@ contract G9a_ForwardedExecuteBeforeTest is CuratorGuardTestBase {
     /// @dev Shipped policy shape (handler requirement enforced at zero), the guard in the handler slot
     ///      (V2-89's precondition), a council window open (the documented repair state). The direct
     ///      forwarded after-hook is refused (V2-89 holds); the same after-hook wrapped in `executeBefore`
-    ///      is accepted and a `Bypass` report is forged under an arbitrary hash: no Safe transaction, the
-    ///      nonce does not move, the caller is a stranger.
-    function test_poc_forwarded_executeBefore_forges_a_bypass_report() public {
+    ///      is refused as well since the round-13 follow-up (`Unauthorized`, the forwarded-caller rail
+    ///      first): no report, no Safe transaction, the nonce does not move.
+    function test_pin_forwarded_executeBefore_cannot_forge_a_bypass_report() public {
         _enforce();
         _allow(address(protocol), MockProtocol.settleDeposit.selector);
         vm.prank(vetro);
@@ -91,23 +91,20 @@ contract G9a_ForwardedExecuteBeforeTest is CuratorGuardTestBase {
         // calldata (68 bytes) and `msg.sender` still the Safe.
         vm.recordLogs();
         vm.prank(attacker);
-        (_ok, ) = address(safe).call(_wrapped(_afterHook(FORGED)));
-        assertTrue(_ok, "forwarded executeBefore(checkAfterExecution) accepted");
-        (uint256 _count, bytes32 _hash, uint256 _outcome, uint256 _path) = _reports(vm.getRecordedLogs());
-        assertEq(_count, 1, "one forged report");
-        assertEq(_hash, FORGED, "under the stranger's hash");
-        assertEq(_outcome, uint256(CuratorGuard.Outcome.Bypass));
-        assertEq(_path, 0);
+        (_ok, _ret) = address(safe).call(_wrapped(_afterHook(FORGED)));
+        assertFalse(_ok, "forwarded executeBefore(checkAfterExecution) refused");
+        assertEq(bytes4(_ret), CuratorGuardPolicy.Unauthorized.selector, "the forwarded-caller rail, before the delegatecall");
+        (uint256 _count, , , ) = _reports(vm.getRecordedLogs());
+        assertEq(_count, 0, "no report");
         assertEq(safe.nonce(), _nonce, "no Safe transaction ran");
     }
 
     /// @dev Same precondition on a policy that does not enforce a handler requirement (the validator
     ///      allows that with `$allowUnenforcedHandler`): the forwarded pre-hook parks a snapshot (the
-    ///      documented residual), the wrapped after-hook clears it and reports `Policy` under an arbitrary
-    ///      hash, and the slot is clean again, so the laundering is invisible: a genuine Safe transaction
-    ///      later in the same EVM transaction no longer trips `NestedExecution` (which the residual test
-    ///      `test_residual_a_forwarded_policy_pre_hook_only_parks_a_transient_snapshot` relies on).
-    function test_poc_forwarded_executeBefore_launders_a_parked_snapshot_into_a_policy_report() public {
+    ///      documented residual); the wrapped after-hook can no longer clear it and report `Policy` under
+    ///      an arbitrary hash. The snapshot stays parked and dies with the stranger's transaction, exactly
+    ///      as the residual says (`test_residual_a_forwarded_policy_pre_hook_only_parks_a_transient_snapshot`).
+    function test_pin_a_parked_snapshot_cannot_be_laundered_through_executeBefore() public {
         _enforce();
         _allow(address(protocol), MockProtocol.settleDeposit.selector);
         _handler(address(guard));
@@ -115,26 +112,20 @@ contract G9a_ForwardedExecuteBeforeTest is CuratorGuardTestBase {
 
         vm.recordLogs();
         vm.startPrank(attacker);
-        (bool _ok, ) = address(safe).call(_preHook(_settle));
-        assertTrue(_ok, "forwarded policy pre-hook parks a snapshot");
-        (_ok, ) = address(safe).call(_wrapped(_afterHook(FORGED)));
-        assertTrue(_ok, "forwarded executeBefore(checkAfterExecution) clears it");
+        (bool _ok, bytes memory _ret) = address(safe).call(_preHook(_settle));
+        assertTrue(_ok, "forwarded policy pre-hook parks a snapshot (the documented residual)");
+        (_ok, _ret) = address(safe).call(_wrapped(_afterHook(FORGED)));
+        assertFalse(_ok, "forwarded executeBefore(checkAfterExecution) refused");
+        assertEq(bytes4(_ret), CuratorGuardPolicy.Unauthorized.selector);
         vm.stopPrank();
-        (uint256 _count, bytes32 _hash, uint256 _outcome, ) = _reports(vm.getRecordedLogs());
-        assertEq(_count, 1, "one forged report");
-        assertEq(_hash, FORGED);
-        assertEq(_outcome, uint256(CuratorGuard.Outcome.Policy), "reported as a POLICY pass");
+        (uint256 _count, , , ) = _reports(vm.getRecordedLogs());
+        assertEq(_count, 0, "no report");
         assertEq(protocol.calls(), 0, "nothing executed");
-
-        // The slot is clean: the curator's genuine transaction in the same EVM transaction passes, where
-        // the parked snapshot alone would have made it revert `NestedExecution`.
-        assertTrue(_execSafeTx(address(protocol), 0, _settle, Operation.Call));
-        assertEq(protocol.calls(), 1);
     }
 
-    /// @dev The pre-hook can be wrapped too (it was already forwardable directly), so one `executeBefore`
-    ///      pair is a complete fake "transaction" on the policy path, pre- and post-hook, from a stranger.
-    function test_poc_both_hooks_wrapped_in_executeBefore_make_a_complete_fake_policy_transaction() public {
+    /// @dev Both hooks wrapped in `executeBefore` are refused the same way: no fake "transaction" on the
+    ///      policy path, pre- or post-hook, from a stranger.
+    function test_pin_both_hooks_wrapped_in_executeBefore_are_refused() public {
         _enforce();
         _allow(address(protocol), MockProtocol.settleDeposit.selector);
         _handler(address(guard));
@@ -142,15 +133,15 @@ contract G9a_ForwardedExecuteBeforeTest is CuratorGuardTestBase {
 
         vm.recordLogs();
         vm.startPrank(attacker);
-        (bool _ok, ) = address(safe).call(_wrapped(_preHook(_settle)));
-        assertTrue(_ok, "wrapped pre-hook");
-        (_ok, ) = address(safe).call(_wrapped(_afterHook(FORGED)));
-        assertTrue(_ok, "wrapped after-hook");
+        (bool _ok, bytes memory _ret) = address(safe).call(_wrapped(_preHook(_settle)));
+        assertFalse(_ok, "wrapped pre-hook refused");
+        assertEq(bytes4(_ret), CuratorGuardPolicy.Unauthorized.selector);
+        (_ok, _ret) = address(safe).call(_wrapped(_afterHook(FORGED)));
+        assertFalse(_ok, "wrapped after-hook refused");
+        assertEq(bytes4(_ret), CuratorGuardPolicy.Unauthorized.selector);
         vm.stopPrank();
-        (uint256 _count, bytes32 _hash, uint256 _outcome, ) = _reports(vm.getRecordedLogs());
-        assertEq(_count, 1);
-        assertEq(_hash, FORGED);
-        assertEq(_outcome, uint256(CuratorGuard.Outcome.Policy));
+        (uint256 _count, , , ) = _reports(vm.getRecordedLogs());
+        assertEq(_count, 0, "no report");
     }
 
     /// @dev What the wrapper does NOT open (so the finding stays at forged reports): the approval branch
@@ -165,12 +156,9 @@ contract G9a_ForwardedExecuteBeforeTest is CuratorGuardTestBase {
         vm.startPrank(attacker);
         (bool _ok, bytes memory _ret) = address(safe).call(_wrapped(_preHook(_settle)));
         assertFalse(_ok);
-        // `ForwardedHookCall` on the current code (the approval branch reads the handler slot);
-        // `Unauthorized` once `executeBefore` refuses a forwarded caller (fixes/G9a-1).
-        assertTrue(
-            bytes4(_ret) == CuratorGuard.ForwardedHookCall.selector || bytes4(_ret) == CuratorGuardPolicy.Unauthorized.selector,
-            "approval branch still refused"
-        );
+        // `Unauthorized`: the forwarded-caller rail of `executeBefore` runs before the approval branch
+        // (which would refuse by itself, `ForwardedHookCall`, since it reads the handler slot).
+        assertEq(bytes4(_ret), CuratorGuardPolicy.Unauthorized.selector, "the rail, before the approval branch");
         assertGt(guard.approvalExpiry(_id), 0, "approval intact");
         // A role action wrapped and forwarded is refused by the role rail (V2-100), whatever the wrapper.
         (_ok, _ret) = address(safe).call(_wrapped(abi.encodeCall(guard.lockdown, (address(protocol)))));

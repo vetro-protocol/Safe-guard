@@ -147,12 +147,11 @@ contract G10e_MonitoringTest is CuratorGuardTestBase {
         assertEq(_logsOf(address(guard), TX_CHECKED, _logs), 1);
     }
 
-    /// G9a-1 second opinion: a report forged through a Safe whose fallback handler is the guard has NO
-    /// `ExecutionSuccess` in its transaction, so the 7.7 adjacency join rejects it; only a monitor that
-    /// counts `TransactionChecked` alone is fooled. Pins the HELD defect G9a-1 as current behaviour
-    /// (`executeBefore` re-dispatches a forwarded call): once that fix lands the forged call reverts
-    /// and this test must flip to expect it (docs section 10, review G11d-3).
-    function test_forged_report_through_executeBefore_has_no_ExecutionSuccess_beside_it() public {
+    /// G9a-1, applied after round 13: a forwarded `executeBefore` reverts `Unauthorized` before it
+    /// re-dispatches anything, so a Safe whose fallback handler is the guard yields no report at all and
+    /// the 7.7 adjacency join has nothing to reject. (Until the fix the forged report was an orphan with
+    /// no `ExecutionSuccess` beside it, which the join rejected; review G11d-3.)
+    function test_a_forwarded_executeBefore_leaves_no_report_to_join() public {
         vm.prank(address(safe));
         (bool _ok, ) = address(safe).call(abi.encodeWithSignature("setFallbackHandler(address)", address(guard))); // the state 7.3 forbids
         assertTrue(_ok);
@@ -160,13 +159,14 @@ contract G10e_MonitoringTest is CuratorGuardTestBase {
         bytes memory _inner = abi.encodeWithSelector(CuratorGuard.checkAfterExecution.selector, keccak256("forged"), true);
         vm.recordLogs();
         vm.prank(attacker);
-        IForwarded(address(safe)).executeBefore(uint64(block.timestamp + 1 hours), _inner);
+        (bool _okF, bytes memory _ret) = address(safe).call(
+            abi.encodeWithSelector(IForwarded.executeBefore.selector, uint64(block.timestamp + 1 hours), _inner)
+        );
+        assertFalse(_okF, "forwarded executeBefore refused");
+        assertEq(bytes4(_ret), CuratorGuardPolicy.Unauthorized.selector);
         Vm.Log[] memory _logs = vm.getRecordedLogs();
-        assertEq(_logs.length, 1, "exactly the forged report");
-        assertEq(_logs[0].emitter, address(guard));
-        assertEq(_logs[0].topics[0], TX_CHECKED);
-        assertEq(uint256(_logs[0].topics[3]), uint256(CuratorGuard.Outcome.Bypass));
-        assertEq(_logsOf(address(safe), EXEC_SUCCESS, _logs), 0, "orphan: no ExecutionSuccess to join");
+        assertEq(_logs.length, 0, "no report at all");
+        assertEq(_logsOf(address(safe), EXEC_SUCCESS, _logs), 0);
     }
 
     /// 7.7 says a refused transaction "leaves no event"; the receipt of the signers' attempt is still a

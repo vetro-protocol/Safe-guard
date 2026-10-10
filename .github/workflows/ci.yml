@@ -17,12 +17,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (tag resolved 2026-10-09; a tag is re-pointable, a SHA is not)
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Use nvmrc
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version-file: ".nvmrc"
           cache: npm
@@ -31,7 +32,7 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
         with:
           version: ${{ env.FOUNDRY_VERSION }}
 
@@ -55,6 +56,13 @@ jobs:
         env:
           ETHEREUM_FORK_NODE_URL: ${{ secrets.ETHEREUM_FORK_NODE_URL }}
 
+      # The same suites on the EVM mainnet runs today (Osaka): the bytecode is the default build's, only the
+      # test EVM moves (review G13c). The fork suites are covered by the step above.
+      - name: Run the unit suites on the live fork's EVM
+        run: forge test --no-match-path '*e2e*'
+        env:
+          FOUNDRY_PROFILE: osaka
+
       # The guard must refuse to deploy on a pre-Cancun EVM (constructor EIP-1153 probe): this profile
       # compiles for Shanghai and deploys the Cancun creation code the default build above produced.
       - name: Pre-Cancun deployment refusal
@@ -74,12 +82,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (tag resolved 2026-10-09; a tag is re-pointable, a SHA is not)
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Use nvmrc
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version-file: ".nvmrc"
           cache: npm
@@ -88,7 +97,7 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Cache hardhat artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             artifacts
@@ -120,7 +129,7 @@ jobs:
       # The Hardhat artifact must be byte-identical (metadata tail excluded) to the Foundry build
       # the test job exercises: same solc, same 10 runs, same evm version.
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
         with:
           version: ${{ env.FOUNDRY_VERSION }}
       - name: Toolchain parity of the guard bytecode

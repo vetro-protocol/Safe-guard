@@ -135,6 +135,69 @@ async function main() {
     await guard.guardians(SAFE),
   );
 
+  // The NAV gate on a band that only looks like one (review G13a-1): on a vault that holds anything, a
+  // band the live totalAssets() does not sit in, or one wider than +-50 % of it, is refused at its first
+  // sync like an unconstrained mark; the flag admits it knowingly. The settles carry the mark's band
+  // (the validator demands the repetition).
+  console.log("--- band gate: a band on paper is refused at its first sync ---");
+  type PolicyFn = { target: string; signature: string; rules?: unknown[]; [k: string]: unknown };
+  const policyRun = JSON.parse(fs.readFileSync(POLICY_RUN, "utf8")) as { functions: PolicyFn[] };
+  const vaultAbi = ["function totalAssets() view returns (uint256)"];
+  let dusty: { target: string; assets: bigint } | undefined;
+  for (const f of policyRun.functions) {
+    if (f.signature !== "updateNewTotalAssets(uint256)") continue;
+    const assets: bigint = await new hre.ethers.Contract(f.target, vaultAbi, hre.ethers.provider).totalAssets();
+    if (assets > 0n) {
+      dusty = { target: f.target, assets };
+      break;
+    }
+  }
+  if (!dusty) {
+    console.log("no vault holds assets on this fork: the band gate has nothing to refuse (step skipped)");
+  } else {
+    const dustyTarget = dusty.target;
+    const banded = (lo: bigint, hi: bigint) => ({
+      ...policyRun,
+      functions: policyRun.functions.map((f) =>
+        f.target === dustyTarget &&
+        ["updateNewTotalAssets(uint256)", "settleDeposit(uint256)", "settleRedeem(uint256)"].includes(f.signature)
+          ? {
+              target: f.target,
+              signature: f.signature,
+              rules: [
+                { kind: "GreaterThanOrEqual", wordIndex: 0, value: lo.toString() },
+                { kind: "LessThanOrEqual", wordIndex: 0, value: hi.toString() },
+              ],
+            }
+          : f,
+      ),
+    });
+    for (const [label, lo, hi, expect] of [
+      ["wider than the NAV", 1n, (1n << 256n) - 2n, "wider than +-50 %"],
+      ["away from the NAV", dusty.assets * 2n + 1n, dusty.assets * 3n + 1n, "does not contain"],
+    ] as const) {
+      const file = `${POLICY_RUN}.${label.replace(/ /g, "-")}.json`;
+      fs.writeFileSync(file, JSON.stringify(banded(lo, hi), null, 2));
+      let refusedBand = false;
+      try {
+        await hre.run("curator-guard-sync", { guard: d.address, policy: file, dryRun: true });
+      } catch (e: unknown) {
+        const m = e instanceof Error ? e.message : String(e);
+        refusedBand = m.includes(expect);
+        console.log(`band ${label} refused:`, m.slice(0, 140));
+      }
+      if (!refusedBand) throw Error(`BUG: a band ${label} was not refused at its first sync (expected "${expect}")`);
+      await hre.run("curator-guard-sync", {
+        allowUnconstrainedNav: true,
+        guard: d.address,
+        policy: file,
+        dryRun: true,
+      });
+      console.log(`band ${label} admitted with --allow-unconstrained-nav (dry run)`);
+      fs.unlinkSync(file);
+    }
+  }
+
   // Install step the signers execute on mainnet (approved self-calls): drop the EIP-1271 capable
   // fallback handler, then install the guard. Impersonate the Safe for the fork.
   await hre.network.provider.send("hardhat_impersonateAccount", [SAFE]);

@@ -26,8 +26,8 @@ const A = {
       // `curatorGuardProposers`: the Safes that PROPOSE widenings to the CuratorGuardTimelock, which is
       // the guard's DEFAULT_ADMIN. Proposed: the Vetro governance Safe (v1.4.1, 3-of-6) that is
       // `governor()` of every Vetro yield vault and of the Lagoon_Vetro_* strategies (same address as
-      // `feeCollector`). CAVEAT (verified on-chain 2026-10-04): three of its six owners are also owners
-      // of `lagoonCuratorSafe`. The deploy script REFUSES a proposer, canceller or council that shares a
+      // `feeCollector`). CAVEAT (verified on-chain 2026-10-09; three on 2026-10-04): two of its six owners
+      // are also owners of `lagoonCuratorSafe`. The deploy script REFUSES a proposer, canceller or council that shares a
       // signer with the curator Safe (CURATOR_GUARD_ALLOW_KEY_OVERLAP=1 downgrades it to a warning on
       // fork rehearsals only), so a dedicated governance Safe without curator keys must replace this
       // before mainnet. List two proposers so a single lost Safe cannot strand the guard; a proposer

@@ -54,8 +54,9 @@ contract G11gEvidenceTest is CuratorGuardTestBase {
     ///      handler is the guard (`ForwardedHookCall`). The 68-byte rule holds for a forwarded hook call;
     ///      a forwarded `executeBefore` re-dispatches the hook to itself at exactly 68 bytes with the Safe
     ///      as caller and, inside a window, emits a `TransactionChecked(Bypass)` for a hash of the
-    ///      stranger's choice (the held review G9a-1; the forgery needs the forbidden handler state).
-    function test_a_stranger_forges_a_bypass_report_through_executeBefore_while_the_guard_is_the_handler() public {
+    ///      stranger's choice: that was the held review G9a-1, applied after round 13, so the wrapped call
+    ///      is refused as well (`Unauthorized`) and nothing is reported.
+    function test_a_stranger_cannot_forge_a_bypass_report_through_executeBefore_while_the_guard_is_the_handler() public {
         vm.prank(address(safe));
         Safe(payable(address(safe))).setFallbackHandler(address(guard));
         _bypass(1 days);
@@ -67,12 +68,13 @@ contract G11gEvidenceTest is CuratorGuardTestBase {
         (bool _ok, bytes memory _ret) = address(safe).call(_hook);
         assertFalse(_ok, "direct forwarded hook call refused");
         assertEq(bytes4(_ret), CuratorGuard.ForwardedHookCall.selector, "ForwardedHookCall");
-        // The forwarded `executeBefore` is not.
-        vm.expectEmit(true, true, true, true, address(guard));
-        emit CuratorGuard.TransactionChecked(address(safe), _hash, 0, CuratorGuard.Outcome.Bypass);
+        // The forwarded `executeBefore` is refused too: no report.
+        vm.recordLogs();
         vm.prank(attacker);
-        (_ok, ) = address(safe).call(_wrapped);
-        assertTrue(_ok, "forged report emitted");
+        (_ok, _ret) = address(safe).call(_wrapped);
+        assertFalse(_ok, "forwarded executeBefore refused");
+        assertEq(bytes4(_ret), CuratorGuardPolicy.Unauthorized.selector, "Unauthorized");
+        assertEq(vm.getRecordedLogs().length, 0, "no forged report");
     }
 
     /// @dev `CuratorGuardPolicy.sol:954-955`: the member-wise store writes the packed record with ONE

@@ -278,13 +278,13 @@ contract CuratorGuardRound8TimelockTest is Test {
 
     /// The clamp's edges are inclusive on the scheduled path and anything outside is refused when proposed.
     function test_updateDelay_edges_are_inclusive_and_outside_is_refused_at_proposal() public {
-        _selfCall(p1, abi.encodeCall(TimelockController.updateDelay, (1 hours)), "edge-lo");
-        assertEq(tl.getMinDelay(), 1 hours);
+        _selfCall(p1, abi.encodeCall(TimelockController.updateDelay, (1 days)), "edge-lo");
+        assertEq(tl.getMinDelay(), 1 days);
         _selfCall(p1, abi.encodeCall(TimelockController.updateDelay, (30 days)), "edge-hi");
         assertEq(tl.getMinDelay(), 30 days);
         vm.prank(p1);
-        vm.expectRevert(abi.encodeWithSelector(CuratorGuardTimelock.DelayOutOfRange.selector, 1 hours - 1));
-        tl.schedule(address(tl), 0, abi.encodeCall(TimelockController.updateDelay, (1 hours - 1)), NO_PRED, "lo-1", 30 days);
+        vm.expectRevert(abi.encodeWithSelector(CuratorGuardTimelock.DelayOutOfRange.selector, 1 days - 1));
+        tl.schedule(address(tl), 0, abi.encodeCall(TimelockController.updateDelay, (1 days - 1)), NO_PRED, "lo-1", 30 days);
         vm.prank(p1);
         vm.expectRevert(abi.encodeWithSelector(CuratorGuardTimelock.DelayOutOfRange.selector, 30 days + 1));
         tl.schedule(address(tl), 0, abi.encodeCall(TimelockController.updateDelay, (30 days + 1)), NO_PRED, "hi+1", 30 days);
