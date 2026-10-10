@@ -278,13 +278,13 @@ contract CuratorGuardG10fTimelockPinsTest is CuratorGuardTestBase {
         _p[0] = proposer;
         address[] memory _c = new address[](1);
         _c[0] = veto;
-        return new CuratorGuardTimelock(1 hours, _p, _c);
+        return new CuratorGuardTimelock(1 days, _p, _c);
     }
 
     function _run(address target_, uint256 value_, bytes memory data_, bytes32 salt_) internal {
         vm.prank(proposer);
-        tl.schedule(target_, value_, data_, bytes32(0), salt_, 1 hours);
-        vm.warp(block.timestamp + 1 hours);
+        tl.schedule(target_, value_, data_, bytes32(0), salt_, 1 days);
+        vm.warp(block.timestamp + 1 days);
         tl.execute(target_, value_, data_, bytes32(0), salt_);
     }
 
@@ -299,11 +299,11 @@ contract CuratorGuardG10fTimelockPinsTest is CuratorGuardTestBase {
         _payloads[0] = abi.encodeCall(MockProtocol.settleDeposit, (1));
         vm.prank(proposer);
         vm.expectRevert(abi.encodeWithSignature("TimelockInvalidOperationLength(uint256,uint256,uint256)", 2, 1, 2));
-        tl.scheduleBatch(_targets, _values, _payloads, bytes32(0), bytes32(0), 1 hours);
+        tl.scheduleBatch(_targets, _values, _payloads, bytes32(0), bytes32(0), 1 days);
         // TB008O1: the updateDelay clamp applies to the timelock's own payload only; a venue's
         // `updateDelay(uint256)`-shaped call with a value outside the clamp is schedulable.
         vm.prank(proposer);
-        tl.schedule(address(protocol), 0, abi.encodeWithSelector(tl.updateDelay.selector, uint256(0)), bytes32(0), bytes32("foreign"), 1 hours);
+        tl.schedule(address(protocol), 0, abi.encodeWithSelector(tl.updateDelay.selector, uint256(0)), bytes32(0), bytes32("foreign"), 1 days);
         // TB010O1: a value-only operation to a key executes (the no-code rail is about calldata).
         address _key = makeAddr("payee");
         vm.deal(address(tl), 1 ether);

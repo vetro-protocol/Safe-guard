@@ -166,7 +166,7 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
     );
   }
   // Delays typed in the wrong unit: a 48-second timelock makes every widening executable at once; the
-  // contract clamps `getMinDelay()` to [1 h, 30 d] and refuses a constructor value outside it.
+  // contract clamps `getMinDelay()` to [1 d, 30 d] and refuses a constructor value outside it.
   // A fresh timelock cannot be constructed below the floor (`DelayOutOfRange`); no override.
   if (TIMELOCK_DELAY < MIN_DELAY_FLOOR && !EXISTING_TIMELOCK) {
     throw Error(

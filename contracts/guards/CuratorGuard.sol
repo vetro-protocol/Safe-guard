@@ -441,7 +441,9 @@ contract CuratorGuard is CuratorGuardPolicy, ISafeTransactionGuard, ISafeModuleG
     function _afterExecution(address safe_, uint8 path_, bytes32 txHash_, bool success_) internal {
         // Both after-hooks are exactly `4 + 64` bytes. `FallbackManager` appends the caller's 20 bytes to
         // what it forwards: a forwarded call of that exact length carries them in the low bytes of
-        // `success`, which the ABI decoder has already refused as a dirty `bool`.
+        // `success`, which the ABI decoder has already refused as a dirty `bool`. The only way to reach
+        // this frame at the canonical length with the Safe as caller is `executeBefore`'s delegatecall to
+        // self, which refuses a forwarded caller before it re-dispatches (`CuratorGuardPolicy`, G9a-1).
         if (msg.data.length != 68) revert ForwardedHookCall();
         bytes32 _key = _stateKey(safe_, path_);
         bytes32 _state = _tload(_key);
@@ -540,16 +542,17 @@ contract CuratorGuard is CuratorGuardPolicy, ISafeTransactionGuard, ISafeModuleG
         _digest = keccak256(abi.encodePacked(_masterCopy, _core, _owners, _modulesHead, _fallback, _guard, _moduleGuard));
     }
 
-    /// @dev The hooks answer only the Safe whose guard slot of `path_` (transaction guard, module guard)
-    ///      names this guard: a replacement that is not installed yet, a guard the Safe has moved away
-    ///      from and any account that is not a guarded Safe cannot spend approvals, use windows or emit
-    ///      reports here (`GuardNotInstalled`; an account that cannot answer `getStorageAt` is
+    /// @dev The pre-hook answers only the Safe whose guard slot of `path_` (transaction guard, module
+    ///      guard) names this guard: a replacement that is not installed yet, a guard the Safe has moved
+    ///      away from and any account that is not a guarded Safe cannot spend approvals or use windows
+    ///      here (`GuardNotInstalled`; an account that cannot answer `getStorageAt` is
     ///      `SafeConfigUnreadable` like every configuration read). Only `getStorageAt` is consulted, so a
     ///      Safe whose OWNER LIST is unreadable (section 7.6 step 4) keeps the approval and window exits.
     ///      Checked before the window and approval branches; not in the post-hook (an approved or
     ///      admin-window `setGuard` moves the slot inside the transaction and the cached guard still gets
-    ///      the post-hook) and not in the dry runs (the pre-swap checklist simulates against the
-    ///      replacement).
+    ///      the post-hook; so a post-hook a Safe calls directly, while it holds a live window on this
+    ///      guard, still emits a `Bypass` report, see rule 2 of the contract NatSpec) and not in the
+    ///      dry runs (the pre-swap checklist simulates against the replacement).
     function _requireInstalled(address safe_, uint8 path_) private view {
         if (_slotWord(safe_, path_ == PATH_OWNER ? GUARD_STORAGE_SLOT : MODULE_GUARD_STORAGE_SLOT) != _self()) {
             revert GuardNotInstalled(safe_);
@@ -740,12 +743,12 @@ contract CuratorGuard is CuratorGuardPolicy, ISafeTransactionGuard, ISafeModuleG
         FunctionPermission storage _f = $.functions[to_][_selector];
         if (!_f.allowed) revert FunctionNotAllowed(to_, _selector);
         // A function call to an account without code never does what the policy author reviewed (a
-        // mistyped target one bit off a venue "succeeds" and keeps the value): fail closed. Post-Cancun
-        // a contract's code cannot disappear (an EIP-7702 delegated account passes this check with its
-        // 23-byte designator and loses it when its key clears the delegation: an upgradeable venue whose
-        // single admin is that key, failing closed here once revoked; never allowlist one), a
-        // counterfactual target becomes callable once deployed, and the native lane above is untouched,
-        // so this costs no liveness.
+        // mistyped target one bit off a venue "succeeds" and keeps the value): fail closed. This costs
+        // no liveness: post-Cancun a contract's code cannot disappear, a counterfactual target becomes
+        // callable once deployed, and the native lane above is untouched. The one account whose code
+        // can go is an EIP-7702 delegated EOA: its 23-byte designator passes this check and vanishes
+        // when its key clears the delegation, so such a target fails closed here from then on. It is an
+        // upgradeable venue with a single-key admin: never allowlist one.
         if (to_.code.length == 0) revert NotAContract(to_);
         if (value_ != 0 && !_f.allowValue) revert ValueNotAllowed(to_, _selector);
         uint256 _count = _f.rules.length;

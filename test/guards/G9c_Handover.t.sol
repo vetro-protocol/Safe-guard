@@ -157,21 +157,26 @@ contract G9c_HandoverTest is G9cBase {
         g.setDeploymentGuardian(address(tlB), true);
     }
 
-    /// @dev Info. Every role surface refuses a Safe whose fallback handler is this guard (V2-100), except
-    ///      `acceptDefaultAdminTransfer`: a stranger completes a hand-over to such a Safe through its
-    ///      forwarding (the admin loses the option to cancel late). The new admin can then do nothing
-    ///      until it changes its handler, a plain Safe transaction.
-    function test_a_stranger_completes_a_handover_to_a_safe_whose_handler_is_the_guard() public {
+    /// @dev Every role surface refuses a Safe whose fallback handler is this guard (V2-100), the acceptance
+    ///      included since the round-13 follow-up (G9a-3 / G9c-3): a stranger cannot complete a hand-over to
+    ///      such a Safe through its forwarding, the admin keeps its late cancel, and the pending Safe accepts
+    ///      only after it changes its handler, a plain Safe transaction.
+    function test_a_stranger_cannot_complete_a_handover_to_a_safe_whose_handler_is_the_guard() public {
         (ISafe _dao, uint256 _daoPk) = _newSafe("dao-safe");
         _exec(_dao, _daoPk, address(_dao), 0, abi.encodeWithSelector(0xf08a0323, address(g)), Operation.Call); // setFallbackHandler(guard)
         _adminCall(_wrap(uint64(block.timestamp + 30 days), abi.encodeCall(g.beginDefaultAdminTransfer, (address(_dao)))), "begin");
         vm.warp(block.timestamp + ADMIN_DELAY + 1);
+        address _adminBefore = g.defaultAdmin();
         vm.prank(stranger);
-        (bool _ok, ) = address(_dao).call(acceptData);
-        assertTrue(_ok, "forwarded acceptance");
+        (bool _ok, bytes memory _ret) = address(_dao).call(acceptData);
+        assertFalse(_ok, "forwarded acceptance refused");
+        assertEq(bytes4(_ret), CuratorGuardPolicy.Unauthorized.selector);
+        assertEq(g.defaultAdmin(), _adminBefore, "admin unchanged");
+        (address _pending, ) = g.pendingDefaultAdmin();
+        assertEq(_pending, address(_dao), "the hand-over stays pending: the admin can still cancel");
+        // Once the Safe drops the handler it accepts as itself, through a plain Safe transaction.
+        _exec(_dao, _daoPk, address(_dao), 0, abi.encodeWithSelector(0xf08a0323, address(0)), Operation.Call);
+        assertTrue(_exec(_dao, _daoPk, address(g), 0, acceptData, Operation.Call), "accepted as itself");
         assertEq(g.defaultAdmin(), address(_dao));
-        vm.prank(address(_dao));
-        vm.expectRevert(CuratorGuardPolicy.Unauthorized.selector);
-        g.lockdown(address(curatorSafe));
     }
 }

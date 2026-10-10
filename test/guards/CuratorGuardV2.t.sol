@@ -649,12 +649,12 @@ contract CuratorGuardV2Test is CuratorGuardTestBase {
     }
 
     function test_admin_delay_applies_to_the_admin_transfer_itself() public {
-        (CuratorGuard _g, CuratorGuardTimelock _tl, address _proposer, ) = _timelockFixture(1 hours);
+        (CuratorGuard _g, CuratorGuardTimelock _tl, address _proposer, ) = _timelockFixture(1 days);
         address _dao = makeAddr("dao-executor");
         bytes memory _begin = abi.encodeCall(_g.beginDefaultAdminTransfer, (_dao));
         vm.prank(_proposer);
-        _tl.schedule(address(_g), 0, _begin, bytes32(0), bytes32(0), 1 hours);
-        vm.warp(block.timestamp + 1 hours);
+        _tl.schedule(address(_g), 0, _begin, bytes32(0), bytes32(0), 1 days);
+        vm.warp(block.timestamp + 1 days);
         _tl.execute(address(_g), 0, _begin, bytes32(0), bytes32(0));
         (address _pending, uint48 _schedule) = _g.pendingDefaultAdmin();
         assertEq(_pending, _dao);

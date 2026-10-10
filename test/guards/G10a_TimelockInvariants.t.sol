@@ -136,9 +136,9 @@ contract G10aTimelockHandler {
     /// @dev `updateDelay` outside the clamp is refused when PROPOSED; inside it executes and moves the
     ///      effective delay.
     function delay(uint256 seed_) external {
-        uint256[5] memory _d = [uint256(3599), 3600, 7 days, 30 days, 30 days + 1];
-        uint256 _new = _d[seed_ % 5];
-        bool _inRange = _new >= 1 hours && _new <= 30 days;
+        uint256[6] memory _d = [uint256(1 hours), 1 days - 1, 1 days, 7 days, 30 days, 30 days + 1];
+        uint256 _new = _d[seed_ % 6];
+        bool _inRange = _new >= 1 days && _new <= 30 days;
         bytes memory _data = abi.encodeCall(tl.updateDelay, (_new));
         bytes32 _salt = bytes32(++salt);
         uint256 _delay = tl.getMinDelay();
@@ -177,8 +177,8 @@ contract G10aTimelockInvariantsTest is Test {
         _p[1] = p2;
         address[] memory _c = new address[](1);
         _c[0] = veto;
-        tl = new CuratorGuardTimelock(1 hours, _p, _c);
-        handler = new G10aTimelockHandler(tl, p1, p2, veto, x, y, 1 hours);
+        tl = new CuratorGuardTimelock(1 days, _p, _c);
+        handler = new G10aTimelockHandler(tl, p1, p2, veto, x, y, 1 days);
         targetContract(address(handler));
     }
 

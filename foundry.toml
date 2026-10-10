@@ -23,6 +23,8 @@ fs_permissions = [
     { access = "read", path = "./contracts/guards" },
     { access = "read", path = "./docs/curator-guard.md" },
     { access = "read", path = "./test/guards" },
+    # review g12f: the exported differential-fuzz vectors and the canonical Safe v1.4.1 codes the replay suite reads
+    { access = "read", path = "./test/guards/vectors-g12f" },
 ]
 
 auto_detect_remappings = false
@@ -51,6 +53,13 @@ runs = 1024
 depth = 50
 fail_on_revert = true
 shrink_run_limit = 5000
+
+# The live fork's EVM: `FOUNDRY_PROFILE=osaka forge test --no-match-path '*e2e*'`. solc 0.8.25 knows no target
+# past cancun, so the bytecode is byte-identical to the default build (review G13c: stripped-runtime sha
+# 2ef656ec / 90bb0171 under cancun, prague and osaka, after the round-13 follow-up); only the EVM the tests run on moves (EIP-7702
+# designators, Osaka pricing; forge's EVM enforces no EIP-7825 cap on any of them). Same out/cache as default.
+[profile.osaka]
+evm_version = "osaka"
 
 # Pre-Cancun check: `FOUNDRY_PROFILE=precancun forge test` (after a default build). Compiles only
 # `test/guards-precancun` for a Shanghai EVM and deploys the Cancun creation code from `out-guards/`

@@ -26,7 +26,10 @@ import {TimelockController} from "@openzeppelin/contracts/governance/TimelockCon
 ///         Guard rails, enforced on the timelock's own scheduled self-calls and, for the last-holder
 ///         rail, on a holder's own `renounceRole` too:
 ///         - `getMinDelay()` is clamped to [`MIN_DELAY_FLOOR`, `MIN_DELAY_CAP`]: an `updateDelay` typed
-///           in the wrong unit can neither make widenings instant nor take years to undo;
+///           in the wrong unit can neither make widenings instant nor take years to undo; the floor is
+///           a day, not an hour: a scheduled `updateDelay(1 hours)` is one vetoable operation that, if
+///           missed, would shrink the veto's window on EVERY later operation to an hour, below the
+///           time a multisig veto needs to convene (round 13, G13f-3; applied after round 13);
 ///         - the open executor cannot be revoked (nothing could execute again, the repair included);
 ///         - the timelock cannot drop its own admin role (the role set would be frozen for good) and
 ///           never grants it to anyone else (a second admin would manage roles with no delay and no
@@ -51,7 +54,7 @@ import {TimelockController} from "@openzeppelin/contracts/governance/TimelockCon
 ///         one included, and cancelling a predecessor does not cancel its successor (cancel chained
 ///         operations as a pair).
 contract CuratorGuardTimelock is TimelockController {
-    uint256 public constant MIN_DELAY_FLOOR = 1 hours;
+    uint256 public constant MIN_DELAY_FLOOR = 1 days;
     uint256 public constant MIN_DELAY_CAP = 30 days;
 
     error CancellerCannotPropose(address account);

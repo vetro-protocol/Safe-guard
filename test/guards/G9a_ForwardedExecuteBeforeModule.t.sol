@@ -6,6 +6,7 @@ import {Safe as Safe150} from "safe-contracts-v1.5.0/contracts/Safe.sol";
 import {SafeProxy as SafeProxy150} from "safe-contracts-v1.5.0/contracts/proxies/SafeProxy.sol";
 
 import {CuratorGuard} from "contracts/guards/CuratorGuard.sol";
+import {CuratorGuardPolicy} from "contracts/guards/CuratorGuardPolicy.sol";
 import {ISafe} from "contracts/interfaces/safe/ISafe.sol";
 import {Operation} from "contracts/interfaces/safe/ISafeGuard.sol";
 import {CuratorGuardHarness, MockProtocol} from "test/guards/CuratorGuardTestBase.sol";
@@ -47,7 +48,8 @@ contract G9a_ForwardedExecuteBeforeModuleTest is SafeTxHelper {
         guard.enforce(address(safe));
     }
 
-    function test_poc_forwarded_executeBefore_forges_a_module_path_bypass_report() public {
+    /// @dev Applied after round 13: the wrapped module after-hook is refused like the owner-path one.
+    function test_pin_forwarded_executeBefore_cannot_forge_a_module_path_bypass_report() public {
         vm.prank(council);
         guard.bypass(address(safe), 1 hours);
         bytes memory _after = abi.encodeCall(guard.checkAfterModuleExecution, (FORGED, true));
@@ -58,21 +60,17 @@ contract G9a_ForwardedExecuteBeforeModuleTest is SafeTxHelper {
         assertFalse(_ok);
         assertEq(bytes4(_ret), CuratorGuard.ForwardedHookCall.selector);
 
-        // Wrapped in `executeBefore`: accepted, a path-1 Bypass report under the stranger's hash.
+        // Wrapped in `executeBefore`: refused by the forwarded-caller rail (G9a-1), no report at all.
         vm.recordLogs();
         vm.prank(attacker);
-        (_ok, ) = address(safe).call(abi.encodeCall(guard.executeBefore, (uint64(block.timestamp + 1 hours), _after)));
-        assertTrue(_ok, "forwarded executeBefore(checkAfterModuleExecution) accepted");
+        (_ok, _ret) = address(safe).call(abi.encodeCall(guard.executeBefore, (uint64(block.timestamp + 1 hours), _after)));
+        assertFalse(_ok, "forwarded executeBefore(checkAfterModuleExecution) refused");
+        assertEq(bytes4(_ret), CuratorGuardPolicy.Unauthorized.selector);
         Vm.Log[] memory _logs = vm.getRecordedLogs();
         uint256 _count;
         for (uint256 i; i < _logs.length; ++i) {
-            if (_logs[i].emitter != address(guard) || _logs[i].topics[0] != REPORT_SIG) continue;
-            ++_count;
-            assertEq(_logs[i].topics[1], bytes32(uint256(uint160(address(safe)))));
-            assertEq(_logs[i].topics[2], FORGED);
-            assertEq(uint256(_logs[i].topics[3]), uint256(CuratorGuard.Outcome.Bypass));
-            assertEq(abi.decode(_logs[i].data, (uint256)), 1, "module path");
+            if (_logs[i].emitter == address(guard) && _logs[i].topics[0] == REPORT_SIG) ++_count;
         }
-        assertEq(_count, 1, "one forged module-path report");
+        assertEq(_count, 0, "no forged module-path report");
     }
 }

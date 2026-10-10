@@ -127,11 +127,13 @@ contract CuratorGuardTimelockTest is Test {
         new CuratorGuardTimelock(2 days, new address[](0), _list(veto));
         vm.expectRevert(CuratorGuardTimelock.NoCanceller.selector);
         new CuratorGuardTimelock(2 days, _list(p1, p2), new address[](0));
-        vm.expectRevert(abi.encodeWithSelector(CuratorGuardTimelock.DelayOutOfRange.selector, 3599));
-        new CuratorGuardTimelock(3599, _list(p1, p2), _list(veto));
+        vm.expectRevert(abi.encodeWithSelector(CuratorGuardTimelock.DelayOutOfRange.selector, 1 days - 1));
+        new CuratorGuardTimelock(1 days - 1, _list(p1, p2), _list(veto));
+        vm.expectRevert(abi.encodeWithSelector(CuratorGuardTimelock.DelayOutOfRange.selector, 1 hours));
+        new CuratorGuardTimelock(1 hours, _list(p1, p2), _list(veto)); // the pre-round-13 floor is refused
         vm.expectRevert(abi.encodeWithSelector(CuratorGuardTimelock.DelayOutOfRange.selector, 30 days + 1));
         new CuratorGuardTimelock(30 days + 1, _list(p1, p2), _list(veto));
-        assertEq(new CuratorGuardTimelock(1 hours, _list(p1, p2), _list(veto)).getMinDelay(), 1 hours);
+        assertEq(new CuratorGuardTimelock(1 days, _list(p1, p2), _list(veto)).getMinDelay(), 1 days);
         assertEq(new CuratorGuardTimelock(30 days, _list(p1, p2), _list(veto)).getMinDelay(), 30 days);
     }
 
@@ -143,18 +145,18 @@ contract CuratorGuardTimelockTest is Test {
         CuratorGuardTimelock _tl = _deploy();
         bytes32 _slot = bytes32(uint256(2)); // `_minDelay` (forge inspect storage-layout)
         vm.store(address(_tl), _slot, bytes32(uint256(48)));
-        assertEq(_tl.getMinDelay(), 1 hours, "floor");
+        assertEq(_tl.getMinDelay(), 1 days, "floor");
         vm.prank(p2);
-        vm.expectRevert(abi.encodeWithSelector(TimelockController.TimelockInsufficientDelay.selector, 48, 1 hours));
+        vm.expectRevert(abi.encodeWithSelector(TimelockController.TimelockInsufficientDelay.selector, 48, 1 days));
         _tl.schedule(address(_tl), 0, "", NO_PREDECESSOR, "x", 48);
         vm.store(address(_tl), _slot, bytes32(uint256(172_800_000)));
         assertEq(_tl.getMinDelay(), 30 days, "cap");
         vm.store(address(_tl), _slot, bytes32(type(uint256).max));
         assertEq(_tl.getMinDelay(), 30 days, "no overflow in schedule");
-        vm.store(address(_tl), _slot, bytes32(uint256(1 hours - 1)));
-        assertEq(_tl.getMinDelay(), 1 hours, "3599 s reads as the floor");
-        vm.store(address(_tl), _slot, bytes32(uint256(1 hours + 1)));
-        assertEq(_tl.getMinDelay(), 1 hours + 1, "3601 s is inside the range");
+        vm.store(address(_tl), _slot, bytes32(uint256(1 days - 1)));
+        assertEq(_tl.getMinDelay(), 1 days, "1 d - 1 s reads as the floor");
+        vm.store(address(_tl), _slot, bytes32(uint256(1 days + 1)));
+        assertEq(_tl.getMinDelay(), 1 days + 1, "1 d + 1 s is inside the range");
         vm.store(address(_tl), _slot, bytes32(uint256(30 days + 1)));
         assertEq(_tl.getMinDelay(), 30 days, "30 d + 1 s reads as the cap");
         vm.store(address(_tl), _slot, bytes32(uint256(30 days - 1)));

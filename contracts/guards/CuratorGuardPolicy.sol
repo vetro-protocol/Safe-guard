@@ -248,11 +248,12 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     /// @dev Upper bound on rules per `(target, selector)`; bounds the per-call check cost.
     uint256 internal constant MAX_RULES = 16;
     /// @dev Upper bound on members of one `OneOf` set; keeps `clearAllowedValues` and a re-allow that
-    ///      drops ONE `OneOf` rule (both iterate the set, about 12k gas per committed member) inside one
-    ///      transaction (EIP-7825 caps a transaction at 16,777,216 gas). A re-allow that drops several
-    ///      full sets at once iterates all of them: the tooling's joint cap of 256 members per function
-    ///      keeps that inside the limit, sixteen full sets would not fit (`revokeFunction` abandons them
-    ///      in O(1) instead, and `clearAllowedValues` empties one set at a time).
+    ///      drops ONE `OneOf` rule (both iterate the set, a storage clear per member; §4 of
+    ///      `docs/curator-guard.md` carries the measured cost) inside one transaction (EIP-7825 caps a
+    ///      transaction at 16,777,216 gas). A re-allow that drops several full sets at once iterates all
+    ///      of them: the tooling's joint cap of 256 members per function keeps that inside the limit,
+    ///      sixteen full sets would not fit (`revokeFunction` abandons them in O(1) instead, and
+    ///      `clearAllowedValues` empties one set at a time).
     uint256 internal constant MAX_ALLOWED_VALUES = 128;
     /// @dev Upper bound on allowed selectors per target; bounds what `revokeTarget` iterates.
     uint256 internal constant MAX_SELECTORS = 32;
@@ -322,8 +323,8 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     ///      any other code runs in the Safe's storage context, can plant dangling `modules[x]` /
     ///      `owners[x]` entries the configuration digest cannot see, and can even call the hooks to
     ///      replace the snapshot with one of the modified configuration. A new Safe release therefore
-    ///      means a new guard (approved `setGuard`),
-    ///      never a widening of this set. Guardians may forbid a hash; the admin may re-allow a seeded one.
+    ///      means a new guard (approved `setGuard`), never a widening of this set. Guardians may forbid
+    ///      a hash; the admin may re-allow a seeded one.
     mapping(bytes32 codehash => bool) internal _unwrapperCodehashes;
     mapping(bytes32 codehash => bool) internal _canonicalCodehashes;
     /// @dev Runtime code hashes of the Safe proxies and singletons this guard supports: the proxy the
@@ -430,7 +431,14 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     ///         passed, as the caller (`delegatecall` to self keeps `msg.sender`). For operations that
     ///         sit in a timelock queue: a queued `bypass` / `approveTransaction` / widening that nobody
     ///         executed in time is then dead instead of a latent, permissionless action months later.
+    /// @dev    Refused for a caller that is a Safe with this guard in its fallback-handler slot
+    ///         (`Unauthorized`, like every role check): such a Safe forwards anyone's `executeBefore`
+    ///         with itself as the caller, and the delegatecall below re-dispatches `call_` as the whole
+    ///         calldata of the inner frame, so the after-hooks' 68-byte check (`ForwardedHookCall`)
+    ///         would see a canonical call and a stranger could report a transaction that never ran
+    ///         (round 9, G9a-1; applied after round 13).
     function executeBefore(uint64 deadline_, bytes calldata call_) external returns (bytes memory) {
+        _refuseForwarded();
         if (block.timestamp > deadline_) revert DeadlinePassed(deadline_);
         (bool _ok, bytes memory _ret) = address(this).delegatecall(call_);
         if (!_ok) {
@@ -920,7 +928,12 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     ///      bounds when it may be accepted (`MAX_ADMIN_DELAY` after the schedule; a successor timelock
     ///      at the slowest delay still makes it), so an abandoned hand-over cannot be accepted years
     ///      later by keys nobody watches any more. The admin re-arms it by beginning again.
+    ///      Refused for a forwarded caller like every other role entry (`Unauthorized`): a pending-admin
+    ///      Safe whose fallback handler is this guard would otherwise let any stranger complete the
+    ///      hand-over on its behalf and cost the outgoing admin its late cancel (round 9, G9a-3 /
+    ///      G9c-3; applied after round 13).
     function _acceptDefaultAdminTransfer() internal virtual override {
+        _refuseForwarded();
         _requireUnguarded(msg.sender, true);
         (, uint48 _schedule) = pendingDefaultAdmin();
         unchecked {
@@ -1003,7 +1016,8 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     /// @dev The library's own role surface gets the same refusal: `onlyRole` (grants, revocations, the
     ///      begin and cancel of the admin transfer, for an admin that is a Safe) and `renounceRole` (a
     ///      forwarded stranger must not be able to make a Safe drop its role). The acceptance
-    ///      (`acceptDefaultAdminTransfer`) is not `onlyRole` and carries no such refusal.
+    ///      (`acceptDefaultAdminTransfer`) is not `onlyRole`: `_acceptDefaultAdminTransfer` carries the
+    ///      refusal itself, as does `executeBefore`, the one re-dispatcher.
     function _checkRole(bytes32 role_, address account_) internal view virtual override {
         _refuseForwarded();
         super._checkRole(role_, account_);

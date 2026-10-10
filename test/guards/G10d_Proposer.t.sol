@@ -123,26 +123,35 @@ contract G10d_ProposerTest is G10dBase {
         assertEq(_balance(), _custody, "custody never moved");
     }
 
-    /// @dev `updateDelay(1 hours)` is inside the clamp, so a proposer may schedule it; once the veto misses
-    ///      it, every later operation of the compromised proposer is Ready in one hour instead of two days,
-    ///      and the delay comes back only through a (one-hour) operation the honest proposer schedules.
-    function test_residual_a_missed_updateDelay_shrinks_the_veto_window_to_one_hour() public {
-        bytes memory _shrink = abi.encodeCall(tl.updateDelay, (1 hours));
-        _schedule(p1, p1Pk, address(tl), _shrink, NONE, "U");
+    /// @dev `updateDelay(1 hours)` was inside the clamp until the round-13 follow-up: a proposer could schedule
+    ///      it and, once the veto missed it, every later operation of a compromised proposer was Ready in one
+    ///      hour instead of two days. The floor is a day now (G13f-3): the hour is refused when PROPOSED (through
+    ///      the proposer's Safe: `GS013`), the lowest a proposer can go is a day, the veto keeps a day on every
+    ///      later operation, and the delay comes back through a one-day operation the honest proposer schedules.
+    function test_fixed_updateDelay_below_a_day_is_refused_and_the_floor_keeps_the_veto_a_day() public {
+        uint256 _live = tl.getMinDelay();
+        bytes memory _hour = abi.encodeCall(tl.updateDelay, (1 hours));
+        bytes memory _proposal = abi.encodeCall(tl.schedule, (address(tl), 0, _hour, NONE, bytes32("U"), _live));
+        vm.expectRevert(bytes("GS013"));
+        _exec(p1, p1Pk, address(tl), 0, _proposal, Operation.Call);
+
+        bytes memory _floor = abi.encodeCall(tl.updateDelay, (1 days));
+        _schedule(p1, p1Pk, address(tl), _floor, NONE, "U");
         vm.warp(block.timestamp + MIN_DELAY);
-        _execute(address(tl), _shrink, NONE, "U");
-        assertEq(tl.getMinDelay(), 1 hours);
+        _execute(address(tl), _floor, NONE, "U");
+        assertEq(tl.getMinDelay(), 1 days, "the floor");
 
         (address[] memory _t, bytes[] memory _p) = _takeover();
         bytes32 _id = _scheduleBatch(p1, p1Pk, _t, _p, NONE, "A");
-        assertFalse(tl.isOperationReady(_id));
         vm.warp(block.timestamp + 1 hours);
-        assertTrue(tl.isOperationReady(_id), "the veto now has one hour per operation");
+        assertFalse(tl.isOperationReady(_id), "not ready after an hour");
+        vm.warp(block.timestamp + 1 days - 1 hours);
+        assertTrue(tl.isOperationReady(_id), "the veto has a full day per operation");
         _cancel(_id);
 
         bytes memory _restore = abi.encodeCall(tl.updateDelay, (2 days));
         _schedule(p2, p2Pk, address(tl), _restore, NONE, "V");
-        vm.warp(block.timestamp + 1 hours);
+        vm.warp(block.timestamp + 1 days);
         _execute(address(tl), _restore, NONE, "V");
         assertEq(tl.getMinDelay(), 2 days);
     }
