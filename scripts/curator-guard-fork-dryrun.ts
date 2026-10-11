@@ -72,7 +72,12 @@ async function main() {
   // so it syncs a copy of the file pinned to that guard; everything else in the file is unchanged
   // (review G11a-1).
   const committed = JSON.parse(fs.readFileSync(POLICY, "utf8")) as Record<string, unknown>;
-  const POLICY_RUN = path.join(os.tmpdir(), `curator-guard-fork-dryrun.${d.address.toLowerCase()}.json`);
+  // A per-run directory: the shared temp directory of a multi-session host must never let one rehearsal's copy
+  // be deleted or overwritten by another's (review G16g-3).
+  const POLICY_RUN = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), "curator-guard-fork-dryrun-")),
+    `policy.${d.address.toLowerCase()}.json`,
+  );
   fs.writeFileSync(POLICY_RUN, JSON.stringify({ ...committed, guard: d.address }, null, 2));
   console.log("policy copy for this rehearsal (pinned to the fresh guard):", POLICY_RUN);
 

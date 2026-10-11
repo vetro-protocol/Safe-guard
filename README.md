@@ -26,7 +26,7 @@ This repository was split out of `vesper-strategies`. The Lagoon strategies the 
 | ------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
 | `contracts/guards/`                                          | `CuratorGuard`, `CuratorGuardPolicy`, `CuratorGuardTimelock`                             |
 | `contracts/interfaces/safe/`, `contracts/interfaces/lagoon/` | Safe and Lagoon interfaces (Lagoon is used by the tests)                                 |
-| `test/guards/`                                               | Foundry unit, fuzz, invariant and mutation suites; `*.e2e.ethereum.t.sol`, `G10d_Fork`, `G11b_Policy`, `G11c_ExecutorFloor.e2e` and `G9a_CanonicalProxyHashes` are fork tests |
+| `test/guards/`                                               | Foundry unit, fuzz, invariant and mutation suites; `*.e2e.ethereum.t.sol`, `G10d_Fork`, `G11b_Policy`, `G11c_ExecutorFloor.e2e`, `G9a_CanonicalProxyHashes` and `G13b_CrossSystem` are fork tests |
 | `test/guards-precancun/`                                     | Checks that the guard refuses to deploy on a pre-Cancun EVM                              |
 | `policies/curator-guard/`                                    | Policy files and the lint corpus                                                         |
 | `deploy/ethereum/guards/`                                    | hardhat-deploy script for the timelock and guard (`--tags CuratorGuard`)                 |
@@ -49,11 +49,13 @@ You need [Foundry](https://book.getfoundry.sh) (CI pins `v1.5.1`) and Node from 
 ## Test
 
 ```bash
-forge test --no-match-path '*e2e*'                       # unit suites, no RPC needed (the three non-e2e fork suites report skipped)
+forge test --no-match-path '*e2e*'                       # unit suites, no RPC needed (the four non-e2e fork suites report skipped)
 ETHEREUM_FORK_BLOCK_NUMBER=25570000 forge test           # everything, needs ETHEREUM_FORK_NODE_URL (archive RPC)
 FOUNDRY_PROFILE=guards_deep forge test --mt invariant    # deep invariant search
 forge build && FOUNDRY_PROFILE=precancun forge test      # pre-Cancun deployment refusal
 FOUNDRY_PROFILE=osaka forge test --no-match-path '*e2e*'   # the unit suites on the EVM mainnet runs today (Osaka)
+G16F_MIN_DELAY=86400 forge test --match-contract G16f_     # the recovery matrix at the one-day timelock floor (default: the 48 h deploy delay)
+python3 test/guards/matrix/gen_matrix.py && cp test/guards/matrix/out/G12e_*.sol test/guards/ && rm -r test/guards/matrix/out   # regenerate the access matrix after a change of its expectations (never leave out/ in place: it is inside Foundry's test glob)
 npm run lint:policies                                    # policy lint corpus
 THRESHOLD_PCT=96 npm run sizes                           # EIP-170 size gate (hardhat artifacts)
 FORK_NODE_URL=<rpc> FORK_BLOCK_NUMBER=25570000 \
@@ -87,3 +89,11 @@ Before a mainnet run, fill in the `Vetro.curatorGuard*` roles in `helpers/addres
 - a fork rehearsal with the size gate and the toolchain-parity check
 
 The fork jobs need the repository secret `ETHEREUM_FORK_NODE_URL`, set to an archive-capable mainnet RPC.
+
+## Review material
+
+The review record is [docs/curator-guard.md](docs/curator-guard.md) section 13.2. The round reports, the diffs of the
+decisions still held (section 13.2 lists them), and the suites that are not in this tree (the `halmos` symbolic
+suites of round 12, the differential fuzz of the rule language, the EIP-150 gas sweeps, the mutation campaigns'
+results) are kept in the owner's review archive, which the test headers and section 10 call "the review material";
+it is supplied to auditors with the audit prompt, together with a manifest of its files.

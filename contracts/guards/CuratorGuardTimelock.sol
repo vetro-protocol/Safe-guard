@@ -27,9 +27,9 @@ import {TimelockController} from "@openzeppelin/contracts/governance/TimelockCon
 ///         rail, on a holder's own `renounceRole` too:
 ///         - `getMinDelay()` is clamped to [`MIN_DELAY_FLOOR`, `MIN_DELAY_CAP`]: an `updateDelay` typed
 ///           in the wrong unit can neither make widenings instant nor take years to undo; the floor is
-///           a day, not an hour: a scheduled `updateDelay(1 hours)` is one vetoable operation that, if
-///           missed, would shrink the veto's window on EVERY later operation to an hour, below the
-///           time a multisig veto needs to convene (round 13, G13f-3; applied after round 13);
+///           a day, not an hour: at an hour, a scheduled `updateDelay(1 hours)` would be one vetoable
+///           operation that, if missed, shrinks the veto's window on EVERY later operation to an hour,
+///           below the time a multisig veto needs to convene (round 13, G13f-3; applied after round 13);
 ///         - the open executor cannot be revoked (nothing could execute again, the repair included);
 ///         - the timelock cannot drop its own admin role (the role set would be frozen for good) and
 ///           never grants it to anyone else (a second admin would manage roles with no delay and no

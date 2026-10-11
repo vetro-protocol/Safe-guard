@@ -12,8 +12,9 @@ import {Operation} from "contracts/interfaces/safe/ISafeGuard.sol";
 import {CuratorGuardHarness, MockProtocol} from "test/guards/CuratorGuardTestBase.sol";
 import {SafeTxHelper} from "test/guards/SafeTxHelper.sol";
 
-/// @title G9a-1 on the module path (real Safe v1.5.0): the same `executeBefore` re-dispatch forges a
-///        path-1 `TransactionChecked` through a Safe whose fallback handler is the guard.
+/// @title G9a-1 on the module path (real Safe v1.5.0): the same `executeBefore` re-dispatch would forge a
+///        path-1 `TransactionChecked` through a Safe whose fallback handler is the guard; refused since the
+///        round-13 follow-up, which the test pins.
 contract G9a_ForwardedExecuteBeforeModuleTest is SafeTxHelper {
     CuratorGuard internal guard;
     MockProtocol internal protocol;

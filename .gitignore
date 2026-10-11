@@ -21,3 +21,5 @@ cache_forge_precancun/
 # tooling logs
 tsc.log
 dryrun.log
+# The access-matrix generator's output (copied into test/guards/ by hand; inside Foundry's test glob otherwise)
+test/guards/matrix/out/

@@ -63,6 +63,13 @@ jobs:
         env:
           FOUNDRY_PROFILE: osaka
 
+      # The recovery matrix at the timelock's one-day floor (the default run covers the 48 h deploy default): every
+      # recovery path's chain time as a closed form at the live delay (review G16f-3).
+      - name: Recovery matrix at the one-day floor
+        run: forge test --match-contract G16f_
+        env:
+          G16F_MIN_DELAY: "86400"
+
       # The guard must refuse to deploy on a pre-Cancun EVM (constructor EIP-1153 probe): this profile
       # compiles for Shanghai and deploys the Cancun creation code the default build above produced.
       - name: Pre-Cancun deployment refusal

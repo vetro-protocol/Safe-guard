@@ -99,7 +99,10 @@ contract G13f_GuardianSwarmTest is G9cBase {
         _execute(address(g), _lift, NONE, "lift");
         // Only after the admin removes the LAST key (another minDelay) and its cooldown passes does the
         // lift hold: the recovery is ceil(K / batch-size) rounds plus every re-lock race, not a constant.
-        _adminCall(abi.encodeCall(g.setDeploymentGuardian, (_keys[_k - 1], false)), "remove-last"); // warps MIN_DELAY > cooldown
+        _adminCall(abi.encodeCall(g.setDeploymentGuardian, (_keys[_k - 1], false)), "remove-last"); // warps MIN_DELAY
+        // The cooldown's edge is inclusive: on a one-day timelock the removal lands in the re-lock's last held
+        // second, so the lift needs one more block (review G16f-1; measured at a day and at 48 h).
+        if (block.timestamp <= _reLock + 1 days) vm.warp(_reLock + 1 days + 1);
         assertGt(block.timestamp, _reLock + 1 days); // the re-lock's cooldown has passed
         _execute(address(g), _lift, NONE, "lift"); // the same Ready operation, now unobstructed
         assertEq(uint8(g.mode(address(curatorSafe))), uint8(CuratorGuardPolicy.Mode.Enforced));
