@@ -662,15 +662,15 @@ contract G14b_RailSemanticsTest is G9cBase {
             } else ++_other;
         }
         vm.stopPrank();
+        console2.log("D1 after-hook in a window, as the Safe (the forgery's cost)", _hookCost);
+        console2.log("D1 probe into the real Safe v1.4.1, warm", _probeCost);
+        console2.log("D1 lowest gas limit at which the rail answered Unauthorized", _minUnauthorized);
+        console2.log("D1 highest gas limit that died empty", _maxEmpty);
         assertEq(_successes, 0, "no gas limit gets the wrapped after-hook through");
         assertEq(_other, 0, "only Unauthorized or out of gas");
         assertEq(_reports(vm.getRecordedLogs()), 0, "no report at any gas limit");
         assertLt(_maxEmpty, _minUnauthorized, "monotone: starved below, refused above");
         assertGt(_hookCost, _probeCost, "the forgery costs more than the probe");
-        console2.log("D1 after-hook in a window, as the Safe (the forgery's cost)", _hookCost);
-        console2.log("D1 probe into the real Safe v1.4.1, warm", _probeCost);
-        console2.log("D1 lowest gas limit at which the rail answered Unauthorized", _minUnauthorized);
-        console2.log("D1 highest gas limit that died empty", _maxEmpty);
     }
 
     /// @dev Starvation sweep of the forwarded acceptance through a pending-admin Safe whose handler is the
@@ -707,14 +707,14 @@ contract G14b_RailSemanticsTest is G9cBase {
             assertEq(g.defaultAdmin(), address(tl), "admin never moves");
         }
         vm.stopPrank();
-        assertEq(_successes, 0);
-        assertEq(_other, 0, "only Unauthorized or out of gas");
-        assertLt(_maxEmpty, _minUnauthorized);
-        assertGt(_acceptCost, _probeCost);
         console2.log("D2 genuine acceptance by the Safe (the hand-over's cost)", _acceptCost);
         console2.log("D2 probe into the pending Safe v1.4.1, warm", _probeCost);
         console2.log("D2 lowest gas limit at which the rail answered Unauthorized", _minUnauthorized);
         console2.log("D2 highest gas limit that died empty", _maxEmpty);
+        assertEq(_successes, 0);
+        assertEq(_other, 0, "only Unauthorized or out of gas");
+        assertLt(_maxEmpty, _minUnauthorized);
+        assertGt(_acceptCost, _probeCost);
     }
 
     /// @dev The probe's cost against the timelock (what every wrapped admin call now pays) and a 40-call
