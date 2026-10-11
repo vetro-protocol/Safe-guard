@@ -240,14 +240,14 @@ contract G16e_ChainCompilerTest is G9cBase {
                 if (_gas < _minUnauthorized) _minUnauthorized = _gas;
             } else ++_other;
         }
-        assertEq(_successes, 0, "no gas limit gets the forwarded wrapped after-hook through from cold state");
-        assertEq(_other, 0, "only Unauthorized or out of gas");
-        assertEq(_reports(vm.getRecordedLogs()), 0, "no report at any gas limit");
-        assertLt(_maxEmpty, _minUnauthorized, "monotone: starved below, refused above");
         console2.log("T1 probe into the real Safe v1.4.1, COLD (account, singleton, slot)", _probeCold);
         console2.log("T1 probe into the real Safe v1.4.1, warm", _probeWarm);
         console2.log("T1 cold: lowest gas limit at which the rail answered Unauthorized", _minUnauthorized);
         console2.log("T1 cold: highest gas limit that died empty", _maxEmpty);
+        assertEq(_successes, 0, "no gas limit gets the forwarded wrapped after-hook through from cold state");
+        assertEq(_other, 0, "only Unauthorized or out of gas");
+        assertEq(_reports(vm.getRecordedLogs()), 0, "no report at any gas limit");
+        assertLt(_maxEmpty, _minUnauthorized, "monotone: starved below, refused above");
     }
 
     /// @dev g14b's D2 from cold state: the forwarded acceptance through a pending-admin Safe whose handler is

@@ -347,6 +347,50 @@ async function main() {
   if (Number(await guard.mode(SAFE)) !== 1) throw Error("BUG: the lift did not land after the cooldown");
   if (fs.existsSync(stateFile)) throw Error("BUG: state file left behind after a complete execution");
   if (fs.existsSync(`${stateFile}.manifest.json`)) throw Error("BUG: manifest left behind after a complete execution");
+  // --- a hostile proposer value in the queue (review G17b-1; pinned in the drill at review G18g-6's request) ---
+  // One scheduled operation whose executeBefore deadline is the largest uint64 must take neither the queue print,
+  // the dry run nor `verify --op` down: the task prints the raw number and the veto can still decode and cancel it.
+  console.log("--- hostile deadline in the queue: the prints survive, the veto cancels ---");
+  const hostile = guard.interface.encodeFunctionData("executeBefore", [
+    (1n << 64n) - 1n,
+    guard.interface.encodeFunctionData("lockdown", [SAFE]),
+  ]);
+  const hostileSalt = hre.ethers.id("drill-hostile-deadline");
+  await (
+    await timelock.connect(await impersonate(PROPOSER)).getFunction("schedule")(
+      d.address,
+      0,
+      hostile,
+      hre.ethers.ZeroHash,
+      hostileSalt,
+      minDelay,
+    )
+  ).wait();
+  const hostileId: string = await timelock.hashOperation(d.address, 0, hostile, hre.ethers.ZeroHash, hostileSalt);
+  const printed: string[] = [];
+  const log = console.log;
+  console.log = (...a: unknown[]) => {
+    printed.push(a.map(String).join(" "));
+    log(...a);
+  };
+  try {
+    await hre.run("curator-guard-sync", {
+      allowUnconstrainedNav: true,
+      guard: d.address,
+      policy: POLICY_RUN,
+      dryRun: true,
+    });
+    await hre.run("curator-guard-verify", { guard: d.address, policy: POLICY_RUN, op: hostileId });
+  } finally {
+    console.log = log;
+  }
+  if (!printed.some((l) => l.includes("not a representable date")))
+    throw Error("BUG: the queue print did not name the hostile deadline as such (review G17b-1)");
+  const canceller = await impersonate(Addresses.ethereum.Vetro.curatorGuardCancellers[0]);
+  await (await timelock.connect(canceller).getFunction("cancel")(hostileId)).wait();
+  if ((await timelock.getTimestamp(hostileId)) !== 0n)
+    throw Error("BUG: the veto could not cancel the hostile operation");
+  console.log("hostile deadline printed as the raw number and cancelled by the veto");
   console.log("incident drill complete: mode", await guard.mode(SAFE));
   process.exitCode = 0;
 }

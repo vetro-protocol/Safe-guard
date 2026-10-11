@@ -1,7 +1,7 @@
 import chalk from "chalk";
 import { DeployFunction } from "hardhat-deploy/types";
 import { HardhatRuntimeEnvironment } from "hardhat/types";
-import { getAddress } from "ethers";
+import { getAddress, keccak256 } from "ethers";
 import type { Contract, EventLog, Log } from "ethers";
 import Addresses from "../../../helpers/address";
 
@@ -20,6 +20,15 @@ const ADMIN_DELAY = BigInt(process.env.CURATOR_GUARD_ADMIN_DELAY || 3 * 24 * 360
 // Reuse an existing timelock (e.g. for a replacement guard) instead of deploying one per alias.
 const EXISTING_TIMELOCK = process.env.CURATOR_GUARD_TIMELOCK;
 const ZERO = "0x0000000000000000000000000000000000000000";
+// The reviewed runtimes, metadata stripped, as `test/guards/G12a_BuildPin.t.sol` pins them (keccak256 of the runtime
+// without its CBOR tail; 23,240 and 8,195 bytes). The deploy sends whatever the local `node_modules` and solc compiled
+// to, and CI's parity step compares hardhat with foundry, never with the pin: this is the one step that must send the
+// reviewed bytes, so it checks them itself (review G18g-2). A re-pin is a contract change with a review: move these
+// two values together with the test's.
+const REVIEWED_RUNTIME_KECCAK: Record<string, string> = {
+  [CONTRACT]: "0xc8e0a9082376e985eec95d4185d178c1a667832b0990852bef052ca40d8d70a6",
+  [TIMELOCK_CONTRACT]: "0xb7790f427d7dfc79e8c3b417a283f7baf39f498403f5a33cdd68e40aab8528aa",
+};
 // Mirrors `CuratorGuardTimelock.MIN_DELAY_FLOOR / MIN_DELAY_CAP` and `CuratorGuardPolicy.MAX_ADMIN_DELAY`
 // (the floor is one day since the round-13 follow-up, G13f-3; keep the three in sync with the contracts).
 const MIN_DELAY_FLOOR = 86_400n;
@@ -110,6 +119,25 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
       `${msg}.${override ? ` (${override}=1 to override${rehearsalOnly ? ", on a rehearsal only" : ""})` : ""}`,
     );
   };
+  // --- the build ---------------------------------------------------------------------------------
+  // Before any preflight: the artifacts about to be deployed must be the reviewed build (a rehearsal of a changed
+  // build warns, as every refusal does on a fork; a real network refuses, with no override: re-pin with a review).
+  for (const [name, expected] of Object.entries(REVIEWED_RUNTIME_KECCAK)) {
+    const stripped = stripMetadata((await hre.artifacts.readArtifact(name)).deployedBytecode);
+    const actual = keccak256(`0x${stripped}`);
+    if (actual !== expected)
+      refuse(
+        `${name}: the compiled artifact's stripped runtime (${stripped.length / 2} bytes) hashes to ${actual}, not the reviewed ` +
+          `${expected}: this is not the audited build; re-pin it with a review (test/guards/G12a_BuildPin.t.sol and ` +
+          `REVIEWED_RUNTIME_KECCAK in this script) before deploying`,
+      );
+    else
+      console.log(
+        chalk.green(
+          `${name}: the artifact is the reviewed build (${actual.slice(0, 10)}…, ${stripped.length / 2} bytes)`,
+        ),
+      );
+  }
   const active = OVERRIDES.filter((v) => process.env[v] === "1");
   if (active.length) {
     const realEffect = active.filter((v) => !REHEARSAL_ONLY.includes(v));

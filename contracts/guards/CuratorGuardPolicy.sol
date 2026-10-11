@@ -414,7 +414,8 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     ///         and replayed after it. When the window expires the Safe reads as `Lockdown`. A council
     ///         window relaxes the owner-signed path only, within the council's limits; a module
     ///         (no owner signature) stays under the policy and the module allowlist. An admin window
-    ///         is inert on both paths, but for the module allowlist and the guard as a call target.
+    ///         is inert on both paths, but for the module allowlist and the guard as the top-level call
+    ///         target (batch entries are not decoded in it).
     function bypass(address safe_, uint64 duration_) external {
         _nonZero(safe_);
         bool _admin = _checkAdminOrCouncilFor(safe_);

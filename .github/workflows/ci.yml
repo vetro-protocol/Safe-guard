@@ -51,8 +51,13 @@ jobs:
 
       # Same solc settings as the deployed bytecode (10 runs, cancun). The fork suites (*.e2e.ethereum, G10d_Fork,
       # G11b_Policy, G9a_CanonicalProxyHashes) need the ETHEREUM_FORK_NODE_URL secret (archive RPC) at the pinned block.
+      # Without traces: forge 1.5.1 (the pinned toolchain) hands a call that reverts with no data an ABI-encoded
+      # "call to non-contract address <the EOA the previous call was pranked as>" string whenever traces are
+      # recorded (-vvv and above); fifteen tests that classify empty reverts (the access matrix's value call, the
+      # two starvation sweeps) fail under `forge test -vvv` and pass without it (review G17c-1). The failures,
+      # if any, are re-run alone with traces for the report, and the step stays red (review G18g-3).
       - name: Run tests
-        run: forge test -vvv
+        run: forge test || { forge test --rerun -vvv; exit 1; }
         env:
           ETHEREUM_FORK_NODE_URL: ${{ secrets.ETHEREUM_FORK_NODE_URL }}
 

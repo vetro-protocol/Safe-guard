@@ -34,9 +34,10 @@ import {CuratorGuardPolicy} from "./CuratorGuardPolicy.sol";
 ///             guardian's `setModuleAllowed(false)` is a complete switch for that key, inside windows
 ///             too).
 ///          4. Effective `Mode.Bypass` (an unexpired window). An ADMIN window checks nothing further
-///             on either path, except that the guard itself is never a call target
-///             (`GuardCallNotAllowed`, true in every mode), and does not check gas refunds (a window
-///             allows any transfer anyway). A COUNCIL window relaxes the owner-signed path only: it
+///             on either path, except that the guard itself is never the TOP-LEVEL call target
+///             (`GuardCallNotAllowed`; batch entries and delegatecalled code are not decoded in an admin
+///             window, so an entry can reach the post-hook and a report inside one is not authoritative,
+///             docs section 4 step 5), and does not check gas refunds (a window allows any transfer anyway). A COUNCIL window relaxes the owner-signed path only: it
 ///             refuses what would weaken the Safe, that is any self-call outside the council's
 ///             allowlist (which holds only owner management with a threshold of at least 2 and new
 ///             owners without code, `disableModule`, `setFallbackHandler(0)` and the empty rejection
