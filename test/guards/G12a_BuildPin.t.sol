@@ -31,6 +31,19 @@ contract G12a_BuildPin is Test {
         );
     }
 
+    /// The settlement-deadline helper (`contracts/helpers/SettlementDeadline.sol`) is deployed only at the
+    /// owner's decision, but its runtime is pinned here too so the audit prompt can name one hash for it and a
+    /// dependency bump cannot move it unnoticed (review G16g-3).
+    function test_settlement_deadline_helper_runtime_is_the_reviewed_build() public view {
+        bytes memory _code = vm.getDeployedCode("SettlementDeadline.sol:SettlementDeadline");
+        assertEq(_code.length, 177, "SettlementDeadline runtime size moved");
+        assertEq(
+            keccak256(_stripMetadata(_code)),
+            0x15af8250614030304774190ed0be0d8c81749013f26a5157cf600a390d5396fd,
+            "SettlementDeadline runtime (metadata stripped) is not the reviewed build"
+        );
+    }
+
     function test_timelock_runtime_is_the_reviewed_build() public view {
         bytes memory _code = vm.getDeployedCode("CuratorGuardTimelock.sol:CuratorGuardTimelock");
         assertEq(_code.length, TIMELOCK_RUNTIME_BYTES, "CuratorGuardTimelock runtime size moved");

@@ -441,9 +441,9 @@ contract CuratorGuard is CuratorGuardPolicy, ISafeTransactionGuard, ISafeModuleG
     function _afterExecution(address safe_, uint8 path_, bytes32 txHash_, bool success_) internal {
         // Both after-hooks are exactly `4 + 64` bytes. `FallbackManager` appends the caller's 20 bytes to
         // what it forwards: a forwarded call of that exact length carries them in the low bytes of
-        // `success`, which the ABI decoder has already refused as a dirty `bool`. The only way to reach
-        // this frame at the canonical length with the Safe as caller is `executeBefore`'s delegatecall to
-        // self, which refuses a forwarded caller before it re-dispatches (`CuratorGuardPolicy`, G9a-1).
+        // `success`, which the ABI decoder has already refused as a dirty `bool`. The one way a forwarded
+        // call could reach this frame at the canonical length, `executeBefore`'s delegatecall to self,
+        // refuses a forwarded caller before it re-dispatches (`CuratorGuardPolicy`, G9a-1).
         if (msg.data.length != 68) revert ForwardedHookCall();
         bytes32 _key = _stateKey(safe_, path_);
         bytes32 _state = _tload(_key);

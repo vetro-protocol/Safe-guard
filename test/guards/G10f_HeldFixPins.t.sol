@@ -144,11 +144,36 @@ contract CuratorGuardG10fHeldFixPinsTest is CuratorGuardTestBase {
         assertEq(guard.defaultAdmin(), address(_dao));
     }
 
-    /*//////////////////////////////////////////////////////////////
-                                  G9c-1
-    //////////////////////////////////////////////////////////////*/
-
-    /*//////////////////////////////////////////////////////////////
-                                  G9b-2
-    //////////////////////////////////////////////////////////////*/
+    /// @dev Round 14 (g14d): the rail is the FIRST statement of `_acceptDefaultAdminTransfer`, ahead of the
+    ///      hand-over predicate and the 30-day deadline, as the NatSpec and the follow-up commit say: a forwarded
+    ///      pending-admin Safe sees `Unauthorized` even when it is guarded or late (`AdminIsGuarded` /
+    ///      `DeadlinePassed` otherwise). Kills the order variant of the round-10 mutation set (H-AC3 / g14d M-AC2),
+    ///      which the generated matrix cannot reach (no caller class is both forwarded and pending).
+    function test_pin_G9c3_the_rail_is_the_first_statement_of_the_acceptance() public {
+        ISafe _dao = _newSafe("dao-owner-late");
+        _setHandler(_dao, address(guard));
+        vm.prank(vetro);
+        guard.beginDefaultAdminTransfer(address(_dao));
+        // Admin-written state on the pending admin AFTER the begin: the predicate alone would now refuse it.
+        vm.prank(vetro);
+        guard.setRequiredFallbackHandler(address(_dao), address(0), true);
+        (, uint48 _schedule) = guard.pendingDefaultAdmin();
+        vm.warp(uint256(_schedule) + 1);
+        bytes memory _accept = abi.encodeCall(guard.acceptDefaultAdminTransfer, ());
+        vm.prank(attacker);
+        (bool _ok, bytes memory _ret) = address(_dao).call(_accept);
+        assertFalse(_ok, "forwarded acceptance of a guarded pending admin refused");
+        assertEq(bytes4(_ret), CuratorGuardPolicy.Unauthorized.selector, "the rail, before the hand-over predicate");
+        // Past the 30-day acceptance window: still the rail, not the deadline.
+        vm.warp(uint256(_schedule) + 30 days + 1);
+        vm.prank(attacker);
+        (_ok, _ret) = address(_dao).call(_accept);
+        assertFalse(_ok, "forwarded late acceptance refused");
+        assertEq(bytes4(_ret), CuratorGuardPolicy.Unauthorized.selector, "the rail, before the deadline");
+        // Control: once the handler is gone the Safe itself meets the predicate (the state the admin wrote).
+        _setHandler(_dao, address(0));
+        vm.prank(address(_dao));
+        vm.expectRevert(abi.encodeWithSelector(CuratorGuardPolicy.AdminIsGuarded.selector, address(_dao)));
+        guard.acceptDefaultAdminTransfer();
+    }
 }

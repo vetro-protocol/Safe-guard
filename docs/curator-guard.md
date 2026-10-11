@@ -64,14 +64,17 @@ enter, without taking over day-to-day signing.
 
 Non-goals (and why):
 
-- Valuing positions or judging NAV honesty. Lagoon's guardrails + Vetro's `maxLossBps` /
-  `reportLoss` in `LagoonBase` handle valuation risk; the guard only scopes execution.
+- Valuing positions or judging NAV honesty. That is Lagoon's guardrails and Vetro's `maxLossBps` /
+  `reportLoss` in `LagoonBase` (§8; neither is live today: guardrails are deactivated on the five
+  vaults and `maxLossBps == 0`, §1, §6); the guard only scopes execution.
 - Replacing the curator's Safe with a Vetro-owned Safe plus a Zodiac Roles module. Possible, but
   it changes who signs; see §3.
 - Expressing arbitrary parameter conditions (nested structs, dynamic arrays, cross-parameter
-  logic). The rule model covers static head words only, which is what custody-relevant
-  parameters (`spender`, `receiver`, `onBehalfOf`, `to`, amounts) are. Anything richer belongs in
-  Zodiac Roles v2 or a purpose-built checker, not in this guard.
+  logic). The rule model compares static head words, which is what custody-relevant parameters
+  (`spender`, `receiver`, `onBehalfOf`, `to`, amounts) are, and binds a dynamic payload only as a
+  whole, by the hash of the calldata tail (`"tail": true`, §5; one reviewed payload or a set of
+  them), never field by field. Anything richer belongs in Zodiac Roles v2 or a purpose-built
+  checker, not in this guard.
 
 ## 3. Options considered
 
@@ -151,7 +154,13 @@ Roles (OpenZeppelin `AccessControlDefaultAdminRules`; the v2 role split is recor
   `TooManyValues` until the batch empties it, review G10c-6). And no
   role is honoured for a caller that answers as a Safe with THIS guard in its fallback-handler slot
   (`Unauthorized`; the timelock has the same rail for its proposers and its veto, `ForwardedCall`):
-  such a Safe forwards anyone's call here with itself as the caller, so its role would be public. The admin
+  such a Safe forwards anyone's call here with itself as the caller, so its role would be public. The probe
+  (the caller's own `getStorageAt`, every remaining gas forwarded) fails OPEN when it runs out of gas, but
+  whoever starves it keeps at most 1/64 of the frame's gas for what follows, so a forged report or a
+  forwarded acceptance would need the probe's own cost to exceed about 64 times the inner call's: measured,
+  a window of gas limits appears only once the probe costs about 300k gas with every read warm, or 560k
+  cold, against 1.7k and 5.7k today; no repricing of `SLOAD`, `STATICCALL` or the Safe's dispatcher comes
+  within two orders of magnitude of it (review G16e). The admin
   itself is **never constrained** by the guard: all hooks return early for `msg.sender ==
   defaultAdmin()`, so installing the guard on the admin by mistake cannot deadlock the system. `owner()`
   is kept as a view and returns the admin. A few input rails run before the role check, so a stranger
@@ -383,7 +392,7 @@ Post-execution (`checkAfterExecution` / `checkAfterModuleExecution`), one transi
   `executeBefore` refuses a caller whose fallback handler is this guard (`Unauthorized`) before it
   delegatecalls anything, since the wrapped after-hook would otherwise run at its canonical length
   with the Safe as caller and, inside a window, report any hash (review G9a-1, applied after round
-  13; the handler requirement keeps a guarded Safe out of that state in the first place);
+  13; the handler requirement refuses policy traffic from a Safe in that state, §7.3);
 
 - read and clear the slot **first**, so nothing can leak into a later Safe transaction of the same
   EVM transaction whatever happens next;
@@ -478,7 +487,7 @@ parameter decides where value ends up, and is it pinned?*
 | `ERC4626.withdraw(assets, receiver, owner)` / `redeem(shares, receiver, owner)` | `EqualToSafe` on words 1 and 2. |
 | Aave v3 `supply(asset, amount, onBehalfOf, ref)` / `withdraw(asset, amount, to)` | `EqualToSafe` on word 2; `OneOf` on word 0 if only some assets are allowed. |
 | Morpho Blue `supply(marketParams(5 words), assets, shares, onBehalf, data)` | static struct is inlined: `onBehalf` is word 7, `EqualToSafe`; market pinned with `EqualTo` on words 0–4. |
-| Lagoon `settleDeposit(uint256)` / `settleRedeem(uint256)` / `updateNewTotalAssets(uint256)` | a static band on word 0 of `updateNewTotalAssets` (`GreaterThanOrEqual` + `LessThanOrEqual` around the settled NAV; band the two settles of that vault with the SAME bounds: a settle repeats whatever mark is pending, `WrongNewTotalAssets` otherwise, and once `securityCouncil` sits outside the Safe (§8) a mark that role places meets no guardrail and, without the band on the settles, no guard either; the lint demands the repetition, review G11b-2) refuses unit mistakes and caps a single mark, and it is the one NAV control that needs no curator signature. It does not bound a malicious quorum (marks chain inside one block: a ±5 % band still costs about 0.25 % of NAV per cycle) and it must be re-synced with every funding step, or honest settlement stops at the ceiling (and at every exit, where the NAV falls below the floor, and on a public vault at every outside deposit or redemption larger than the distance to the nearer bound, half the band: each re-sync is one timelock round; the sync task prints a band that moves in one direction, keeps its relative width and contains the vault's live `totalAssets()` as "shifted" and asks for `--confirm-loosening` only when the band widens or moves away from the live NAV, review G12c; one outsider holding that much alternates a deposit and a redeem so that every re-sync lands into the next stall, at no cost to it, six stalls in three cycles measured, review G13e: never sync a band on a public vault before whitelist mode, §8; note that `totalAssets()` is the curator's last settled mark, so a band that follows it is a ratchet bounded by the band's width per sync, and the file's reviewer, not the flag, judges each move). The validator demands a band or an explicit `"unconstrained": true`; a band is a band only where the NAV sits inside it: the sync task refuses a band's first sync on a vault whose live `totalAssets()` lies outside it or is smaller than the band's width (`[1, 2^256-2]` lints valid, passes the contract and caps nothing) unless `--allow-unconstrained-nav` is given knowingly, and the validator warns offline when the ceiling exceeds 100 times the floor (review G13a-1). A settlement the signers confirmed and nobody executed is an option anyone exercises (§6): allowlist the stateless `SettlementDeadline.assertBefore(uint256)` helper (`contracts/helpers/SettlementDeadline.sol`, deployed at funding; a policy entry with no rules) as a plain call and put it first in every settlement batch, so a batch nobody executed before its deadline reverts for every executor (GS013) and its nonce stays free (review G13e-1). NAV honesty remains a Lagoon-role question (§8): guardrails bound `updateNewTotalAssets` only once `securityCouncil` has activated them with real bounds, which is not the case on the live vaults. |
+| Lagoon `settleDeposit(uint256)` / `settleRedeem(uint256)` / `updateNewTotalAssets(uint256)` | a static band on word 0 of `updateNewTotalAssets` (`GreaterThanOrEqual` + `LessThanOrEqual` around the settled NAV; band the two settles of that vault with the SAME bounds: a settle repeats whatever mark is pending, `WrongNewTotalAssets` otherwise, and once `securityCouncil` sits outside the Safe (§8) a mark that role places meets no guardrail and, without the band on the settles, no guard either; the lint demands the repetition, review G11b-2) refuses unit mistakes and caps a single mark, and it is the one NAV control that needs no curator signature. It does not bound a malicious quorum (marks chain inside one block: a ±5 % band still costs about 0.25 % of NAV per cycle) and it must be re-synced with every funding step, or honest settlement stops at the ceiling (and at every exit, where the NAV falls below the floor, and on a public vault at every outside deposit or redemption larger than the distance to the nearer bound, half the band: each re-sync is one timelock round; the sync task prints a band that moves in one direction, keeps its relative width and contains the vault's live `totalAssets()` as "shifted" and asks for `--confirm-loosening` only when the band widens or moves away from the live NAV, review G12c; one outsider holding that much alternates a deposit and a redeem so that every re-sync lands into the next stall, at no cost to it, six stalls in three cycles measured, review G13e: never sync a band on a public vault before whitelist mode, §8; note that `totalAssets()` is the curator's last settled mark, so a band that follows it moves by at most the band's width plus whatever the settlements in between moved: a funding step or an exit moves it by the flow itself (+4,668,738 % at the first funding of the USDC vault from dust, printed as the band-move line, review G15a); the file's reviewer, not the flag, judges each move). The validator demands a band or an explicit `"unconstrained": true`; a band is a band only where the NAV sits inside it: the sync task refuses a band's first sync on a vault whose live `totalAssets()` lies outside it or is smaller than the band's width (`[1, 2^256-2]` lints valid, passes the contract and caps nothing) unless `--allow-unconstrained-nav` is given knowingly, and the validator warns offline when the ceiling exceeds 100 times the floor (review G13a-1). On a vault that holds nothing there is no settled NAV to judge a band against and the honest first mark (0) is one no band admits, so the sync refuses a banded or fixed mark on an empty vault until its first settlement (keep the entry `unconstrained` there: the gate admits that; the three live BTC vaults are empty), and a fixed mark (`EqualTo` / `OneOf` on word 0) is judged by its lowest and highest member against the live NAV on every sync, since a set grows by a plain widening the loosening gate never sees (review G16c-2). The band-move line prints the band's edges relative to the live NAV and says when the NAV sits at an edge: a band that keeps the NAV at its floor ratchets by its full width per sync while the ceiling's move alone reads as a modest follow (review G16c-3); and a first band wider than ±10 % is admitted with its price printed, since under ±x a colluding quorum moves about x² of NAV per settlement cycle (26.8 % measured at ±50 %, the gate's edge, against 0.25 % at ±5 %, review G16c). Never type a band for the NAV a flow is EXPECTED to bring: the gate refuses it (the live NAV is outside it) and `--allow-unconstrained-nav` admits it, after which the honest mark is refused and the lowest mark the band admits prices the flow: a band typed for a 50,000 USDC funding of the 1 USDC vault settled that deposit at a 47,500 USDC mark, leaving the deposit worth 25,642 USDC and the vault's one pre-existing share worth 24,359 USDC, measured in review G16c-4; the flag is for the unconstrained case, a band is always synced around the SETTLED NAV and moved after the flow. A settlement the signers confirmed and nobody executed is an option anyone exercises (§6): allowlist the stateless `SettlementDeadline.assertBefore(uint256)` helper (`contracts/helpers/SettlementDeadline.sol`, deployed at funding; a policy entry with no rules) as a plain call and put it first in every settlement batch, so a batch nobody executed before its deadline reverts for every executor (GS013) and its nonce stays free (review G13e-1); the sync refuses that entry unless the code at its target is this repository's `SettlementDeadline` build (metadata excluded, as the guard's own identity check): a look-alike that dispatches the selector and never reverts, a catch-all fallback or a proxy synced with at most a yellow line and bound nothing, measured in review G16c-1 (`"$allowSensitive": true` admits a reviewed foreign helper). NAV honesty remains a Lagoon-role question (§8): guardrails bound `updateNewTotalAssets` only once `securityCouncil` has activated them with real bounds, which is not the case on the live vaults. |
 | Payable calls (`WETH.deposit()`) | `allowValue: true`; plain ETH sends need `nativeTransfers`. |
 | Swaps (routers, aggregators, CowSwap) | Not expressible safely with static words alone (recipient + min-out + path all matter). Prefer a one-shot approval per swap, or Zodiac Roles. Never allowlist `SignMessageLib` delegatecalls: an EIP-1271-signed order can sell the Safe's balance. |
 
@@ -589,7 +598,7 @@ Blocked (all covered by tests in `test/guards/`):
   `execTransaction` of the same Safe. A failed approved execution gives the approval back.
 - Registering any delegatecall target other than a canonical `MultiSendCallOnly` build, and using
   one whose code hash was forbidden after registration.
-- Widening the policy from a guardian key or a stranger; deadlocking the owner Safe.
+- Widening the policy from a guardian key or a stranger.
 - Changing the Safe's guard, module guard, modules head, owner list, owner count, threshold,
   fallback handler or singleton (even to one that lies in its own views) during a policy
   transaction through any path (configuration snapshot).
@@ -606,7 +615,9 @@ Blocked (all covered by tests in `test/guards/`):
   installed on that path, a replacement before adoption and a retired guard after the swap included
   (`GuardNotInstalled`).
 - Using a role through a role-holding Safe's fallback forwarding (the council Safe, a guardian Safe, a
-  proposer or veto Safe whose handler is the guard or the timelock).
+  proposer or veto Safe whose handler is the guard or the timelock), and completing a pending admin
+  hand-over through a pending-admin Safe's forwarding (the acceptance is not a role entry and carries
+  the same refusal, review G9a-3 / G9c-3, applied after round 13).
 - A module a guardian removed, in every mode (admin and council windows included).
 - An approved batch that is truncated or not canonically encoded, or that addresses the guard; an
   approved delegatecall whose target code changed since the approval; an approval addressed to an
@@ -641,6 +652,18 @@ Residual (document, monitor, mitigate outside the guard):
   widens those (a forbidden canonical hash is the one narrowing the new council undoes itself,
   `setUnwrapperCodehash(h, true)`, §7.7), so chain the full re-assertion of the policy file behind the
   rotation (§7.5) or settlement stays frozen for one more `minDelay` after the lift (review G10c-3).
+- **A governance Safe can deadlock itself.** The account the hooks exempt is the admin, in production
+  the timelock, which is not a Safe (v1's "the owner Safe cannot deadlock itself" rested on that
+  exemption and does not carry over). A proposer, veto or council Safe that executes `setGuard(guard)`
+  on itself is an unconfigured, `Lockdown` Safe from that block: it can neither schedule, cancel nor
+  act, and `setGuard(0)` is an admin approval only a proposer can schedule. The contracts do not
+  refuse the install (it is that Safe's own transaction, before any hook runs); the sync task refuses
+  a `policy.safe` that holds a timelock or council role, the deploy script wants two proposers, and
+  §7.6 step 5 is the recovery: a second proposer schedules the approval of `setGuard(0)` (one
+  `minDelay`), or a council window on the stuck Safe lets it schedule its own. With a sole proposer
+  and no council it is permanent; custody stays guarded and settlement continues
+  (`G9c_ProposerRecovery`, V2-46). Price: that Safe's own quorum, by mistake or by a hostile
+  majority; `ChangedGuard` on every governance Safe pages (§7.7).
 - **The veto Safe is the one trusted veto, and it proposes nothing.** A canceller can cancel its
   own removal. A canceller that could also propose would therefore be, once compromised, an unvetoed
   takeover: it schedules what it likes, nobody can cancel, and after one `minDelay` the council is
@@ -662,7 +685,14 @@ Residual (document, monitor, mitigate outside the guard):
   veto's window on EVERY later operation to that floor, which is why the floor is a day and not an
   hour (`MIN_DELAY_FLOOR = 1 days`, applied after round 13, review G13f-3); and a flood of bare operations that never expire (the timelock caps
   nothing), which the veto clears in one batched cancel and the sync names as a burst above 20
-  pending (review G13f-1). The lockdown
+  pending (review G13f-1). The floor now equals the admin delay's floor (`MIN_ADMIN_DELAY`, a day):
+  a proposer that lowers both (two vetoable operations; OpenZeppelin applies the shorter admin delay
+  only after the difference has passed) makes an UNCHAINED cancel of a hostile hand-over Ready in the
+  same second the acceptance opens, where the old floors left the cancel a 23-hour margin; the BARE cancel
+  CHAINED behind the hostile begin (§7.5) wins at any admin delay when it is scheduled within the admin
+  delay of the hostile `CallScheduled`, chained or not (review G16b-1; a wrapped one is waited out, and a
+  re-begin chained behind the cancel needs a cancel of its own, review G16a-1 / G16a-2), and the sync's governance summary
+  prints both delays and warns when the admin delay is not strictly above (review G14g-2). The lockdown
   cooldown protects against STALE honest operations, not against a hostile proposer: a widening, a
   role grant or an approval routed through a freshly granted council all execute during the cooldown,
   so the cancel inside `minDelay` is the control, and bots page the veto Safe on EVERY `CallScheduled`
@@ -688,7 +718,15 @@ Residual (document, monitor, mitigate outside the guard):
   `curatorGuardProposers` before mainnet (`helpers/address.ts`). The same governance Safe is
   `governor()` of the five `Lagoon_Vetro_*` strategies and upgrades them directly (UUPS,
   `onlyGovernor`, no timelock): an unguarded power over the pool capital that funds the vaults,
-  outside this guard's scope and worth the same delay-and-veto discipline (review G13b-4).
+  outside this guard's scope and worth the same delay-and-veto discipline (review G13b-4). Priced
+  the same way, that lever is the cheaper one: the two shared keys already ARE the curator quorum
+  (2-of-4), so one more governance signature marks the NAV with the Safe and, in the same block,
+  upgrades the strategy that holds the depositors' claim, with no delay and no veto anywhere, where
+  the proposer lane gives the veto `minDelay`. The deploy preflight intersects the signer sets of
+  the proposers, the council and the canceller with the curator Safe's and never the governor's, so
+  a dedicated proposer Safe satisfies it and leaves that price unchanged: move the strategies'
+  `governor()` off the shared keys (or behind a timelock, §8 "Strategy upgrade") together with the
+  proposer, not after it (review G15f-3).
 - **NAV marking.** The curator Safe holds `valuationManager` and `securityCouncil`, and Lagoon's
   guardrails are deactivated on the live vaults, so a policy-allowed `updateNewTotalAssets` +
   `settleDeposit` / `settleRedeem` can mark NAV to any value. The guard does not police NAV (§2).
@@ -767,7 +805,14 @@ Residual (document, monitor, mitigate outside the guard):
 - **Vetro's freeze power.** Any guardian can freeze the Safe (lockdown), which also halts Lagoon
   settlements and therefore Vesper-side redemptions until the council or the admin lifts it
   (`enforce`). This is the intended control, but the curator and depositors should know it exists
-  and that lifting it is a fast-lane action, not a timelocked one.
+  and that lifting it is a fast-lane action, not a timelocked one, while a council is seated; the
+  admin's lift lands `minDelay` after the proposer Safe scheduled it (the one-day cooldown ends inside
+  the delay for any lockdown placed at or before the schedule) and up to `minDelay` plus the cooldown
+  after a RE-LOCK placed just before it is Ready ("Queued admin operations and lockdowns" below;
+  measured in review G16b-2). The same freeze, from outside: every custody asset's issuer can pause its token or blacklist
+  the Safe (USDC, USDT, cbBTC; WBTC pauses; hemiBTC has an owner), and USDC and cbBTC are upgradeable
+  under the allowlisted `approve` selector; none of them can pull from the Safe. Frozen custody, never
+  moved custody, and nothing in the guard sees it.
 - **Guard liveness.** A guard bug that reverts every transaction bricks the Safe, including
   `setGuard(0)`. Recovery exists and is tested: the approval path is evaluated before any parsing
   (council for owner management and venue calls, admin for `setGuard` / handler / module changes)
@@ -827,12 +872,16 @@ Residual (document, monitor, mitigate outside the guard):
   once ready, and was scheduled before whatever incident follows. The one-day `LockdownCooldown`
   (§4) stops a queued lift, window or approval from being executed atomically with a transaction the
   signers already hold; what nobody cancels during that day becomes executable again. A compromised
-  guardian key can extend the pause by re-locking (ONE lockdown inside a chained lift's last day is
-  enough: the cooldown then outlives the lift's deadline), until the key is removed: the council does
+  guardian key can extend the pause by re-locking (ONE lockdown in a chained lift's last day, from
+  `deadline - 1 day` on with that second included, is enough: the cooldown then outlives the lift's
+  deadline; one second earlier the lift still lands in the deadline's own second), until the key is removed: the council does
   that at once in one batch with the lift (`[setGuardian(safe, key, false), enforce(safe)]`, about 80k
   gas through a 2-of-2 Safe) and is never held back; without a council the bound is `minDelay` plus
-  a day, and a lift is only safe to queue together with the removal of every key that could re-lock,
-  ahead of it in the same cycle. That bound holds only once EVERY re-locking key is gone:
+  a day and one more block (the cooldown's edge is inclusive: a re-lock in the removal's own second
+  holds the lift through `lockedAt + 1 day`; at the one-day floor even a single lockdown holds a lift
+  scheduled in its block for the lift's own Ready second, so the admin's lift there is a day and a
+  second, review G16f-1), and a lift is only safe to queue together with the removal of every key
+  that could re-lock, ahead of it in the same cycle. That bound holds only once EVERY re-locking key is gone:
   `GUARDIAN_ROLE` is deployment-wide, uncapped (per-Safe guardians stop at 32) and not enumerable on
   chain, so list it from the guard's `RoleGranted` / `RoleRevoked` logs since its creation block (the
   governance summary does, and refuses an incomplete stream), remove every member in one
@@ -929,8 +978,8 @@ Safes; canceller = `Vetro.curatorGuardCancellers`, exactly one Safe, the trusted
 anyone; no deployer admin: the role set is final at creation, nothing to renounce; never the council,
 which the script refuses in either list; `minDelay` = `CURATOR_GUARD_TIMELOCK_DELAY`, 48 h by
 default, within the contract's [1 d, 30 d]) and `CuratorGuard` with the timelock as admin
-(admin-transfer delay `CURATOR_GUARD_ADMIN_DELAY`, 3 days by default, must exceed the timelock
-delay) and `Vetro.curatorGuardCouncil` as council. Every topology, principal, overlap and delay check
+(admin-transfer delay `CURATOR_GUARD_ADMIN_DELAY`, 3 days by default, must sit at least a day above
+the timelock delay, review G16b-3) and `Vetro.curatorGuardCouncil` as council. Every topology, principal, overlap and delay check
 runs BEFORE the first transaction; the timelock audit and the council-role check run after the
 deploys and fail the run. The script **refuses** an empty council on a real network
 (`CURATOR_GUARD_ALLOW_NO_COUNCIL=1` to override: without a council every lift of a lockdown is a 48 h
@@ -952,8 +1001,9 @@ a refusal; a failed owner read aborts the check instead of passing it). It also 
 than two proposer Safes (`CURATOR_GUARD_ALLOW_SINGLE_PROPOSER=1` to override): every admin operation
 is scheduled by a proposer, so a sole proposer that is guarded by mistake or loses its quorum leaves
 the guard unremovable, unwidenable and its admin role untransferable (§7.6 step 5); a timelock delay
-under one hour for a fresh timelock (no override: the contract refuses it; the usual symptom of hours
-typed as seconds) or above 30 days, and a reused timelock whose live delay differs from the configured
+under one day for a fresh timelock (no override: the contract refuses it since the round-13 follow-up, G13f-3;
+the usual symptom of hours typed as seconds; a testnet guard needs the same one-day timelock, since the floor
+is the contract's: rehearsals warp the chain instead, review G16g-3) or above 30 days, and a reused timelock whose live delay differs from the configured
 one (`CURATOR_GUARD_ALLOW_SHORT_DELAY=1`); and it runs only against chain 1 or a rehearsal. The
 overrides are read from the environment, and so from `.env`, on every run: `KEY_OVERLAP`,
 `MULTIPLE_CANCELLERS` and `WEAK_GOVERNANCE` downgrade on rehearsals only, `NO_COUNCIL`,
@@ -992,7 +1042,11 @@ Transaction Builder (review G11f).
 #    --allow-unconstrained-nav to each command below, knowingly (review G11a-2). The same gate refuses
 #    a band's FIRST sync when the vault's live totalAssets() sits outside it or the band is wider than
 #    +-50 % of it (a band on paper, review G13a-1); a band already on chain moves under the loosening
-#    gate (§7.2 below: anchored and no wider is a shift).
+#    gate (§7.2 below: anchored and no wider is a shift). A band or a fixed mark on a vault that holds
+#    nothing is refused until its first settlement (keep it unconstrained there), a fixed EqualTo / OneOf
+#    mark is judged by its lowest and highest member on every sync (review G16c-2), and a
+#    settlement-deadline entry whose target is not the repository's SettlementDeadline build is refused
+#    (review G16c-1).
 npx hardhat curator-guard-sync --network ethereum --guard <CuratorGuard> \
   --policy policies/curator-guard/vetro-lagoon.ethereum.json --dry-run    # the diff, the queue, the simulation, the ids
 npx hardhat curator-guard-sync --network ethereum --guard <CuratorGuard> \
@@ -1015,9 +1069,14 @@ state), `--confirm-revocations` when the diff narrows anything (a deleted line i
 `--confirm-loosening` when an already allowed function loses a rule, widens a bound or gains
 `allowValue` (the task prints the old and the new rules side by side and names the loosening; a NAV
 band moved to follow the settled NAV, the re-sync of §5, is printed as "shifted" and needs no flag
-when it moves in one direction, keeps its relative width and contains the vault's live
+when it moves in one direction, keeps its relative width (the file's edges are integers, so two raw
+units of width are forgiven besides one part in a million: an exit to a dust NAV is a shift too, review G15a-2) and contains the vault's live
 `totalAssets()`; a widened band, a dropped bound or a band moved away from the live NAV is a
-loosening like any other, review G12c). A
+loosening like any other, review G12c). A first band is judged by the gate again at `--execute`, against the NAV of
+that moment: a flow settled on the vault during the delay moves the NAV out of the queued band, the execute is refused
+("does not contain") and `--allow-unconstrained-nav` then lands a band the honest mark no longer fits, one more
+timelock round (measured, review G16c-5): settle nothing on a vault between the schedule and the execution of its
+first band, or cancel and sync again. A
 lift of a lockdown is scheduled as its OWN operation, chained behind the rest with `predecessor`:
 the guard holds the admin's lift back for one day after any lockdown (`LOCKDOWN_COOLDOWN`), so a
 batch that bundled it with the removal of a key that keeps re-locking could never land; the lift's
@@ -1031,8 +1090,10 @@ Every scheduled call is wrapped in `executeBefore(deadline, …)` (`--deadline-d
 `minDelay` by default), so a batch nobody executed in time is dead. Before anything is scheduled every
 call is simulated as the admin (dead on arrival is refused, a cooldown is reported with its end) and
 the batch's gas is estimated (refused above 12 M, warned above 8 M: one transaction, capped by
-EIP-7825 at 16,777,216 gas; measured: the shipped policy's initial sync is 4.2 M as one batch of 40
-wrapped calls, a target filled to 32 selectors x 16 rules is 25.7 M in one `allowFunctions` and must be
+EIP-7825 at 16,777,216 gas; measured: the shipped policy's initial sync is 4.4 M as one batch of 40
+wrapped calls (4,393,513 on a fork of block 26,163,301, review G15a); one transaction holds about 179 rule-less
+wrapped `allowFunction` entries or about 77 two-rule band entries and the gate refuses the 127th / 55th, the wrapper's
+probe being 1 % of a batch at the cap (an Osaka anvil's own estimate, review G16e); a target filled to 32 selectors x 16 rules is 25.7 M in one `allowFunctions` and must be
 split over syncs, review G11c-1). The cap is the chain's, not the rehearsal's: a mainnet node (reth 2.7.0, measured
 2026-10-09) refuses `eth_estimateGas` above it ("gas required exceeds: 16777216") while `eth_call` still runs a
 30 M call to completion; hardhat's in-process network (2.28.6, `osaka` by default) refuses to mine a transaction
@@ -1044,9 +1105,9 @@ file (`--execute` re-derives every id from the stored payloads, so a tampered fi
 operation the chain does not hold; `--execute --op <id>` rebuilds an operation from the timelock's
 own `CallScheduled` / `CallSalt` logs instead, for a second operator or a lost file, `schedule()`-made
 one-call operations included; it executes only an operation whose every call the current diff wants,
-so a hand-scheduled approval of §7.5 or §7.6 is decoded but NOT executed (land it with the timelock's
-own `execute` / `executeBatch` once it is Ready, until the task runs such operations: review G9e-1,
-held); it never touches the state file, and needs `--allow-unlock` for any lift
+so a hand-scheduled approval of §7.5 or §7.6 is decoded but NOT executed: the task answers "is not a policy sync (a one-off)" and names the timelock's
+own `execute` / `executeBatch` to land it once it is Ready, until the task runs such operations (review G9e-1,
+held; before review G15a-3 it answered "cancel it", the advice meant for an abandoned sync operation); it never touches the state file, and needs `--allow-unlock` for any lift
 since the preparation time is unknown there); `--execute`
 refuses past the deadline, skips (loudly, with the cancel calldata) an operation that contains a
 call the current diff no longer wants (one call per function, so a fast-lane change to one function
@@ -1062,8 +1123,9 @@ time by that block and leaves the deadline, fixed at preparation, where it was, 
 the chain's Ready, not the file's. An `executeBatch` the chain dropped AFTER the task removed the file and
 the manifest (every operation read as done on the reorged block) leaves the policy unapplied and the
 operation Ready with no file: the plain run lists it with its id and decoded calls, and
-`--execute --op <id>` lands it from the logs (`--allow-unlock` as well whenever the batch lifts a lockdown:
-the initial sync and every post-incident sync do). Mainnet timestamps are slot-aligned (12 s; one missed
+`--execute --op <id>` lands it from the logs (`--allow-unlock` as well whenever the batch lifts a lockdown
+or a Bypass of a CONFIGURED Safe, as every post-incident sync does; the first sync's `enforce` is the go-live
+enable of a fresh Safe and needs no flag, review G14f-5). Mainnet timestamps are slot-aligned (12 s; one missed
 slot in 600 measured), so a deadline or expiry second is hit by a block with probability 1/12 and a
 one-block reorg moves a receipt by one slot. Rehearse reorgs with `evm_snapshot` / `evm_revert`: anvil
 1.5.1's `anvil_reorg` drops the transactions and rewinds balances but leaves the storage of locally
@@ -1260,7 +1322,8 @@ points at another guard. If the guard was installed before the policy sync execu
   guardian) voids all of them, `lockdownAndRevoke(safe)` does that and freezes the Safe. Approvals are
   refused while the Safe is in `Bypass`.
 - **Never on the council lane.** These are venue calls the contract cannot tell from a harmless
-  one, and each changes who controls a vault or its code. On a vault: `updateSafe`,
+  one, and each changes who controls a vault or its code (the lint refuses them in a policy file without
+  `"$allowSensitive": true` and `curator-guard-verify` names them in a decoded one-off, review G15a-4). On a vault: `updateSafe`,
   `transferOwnership`, `renounceOwnership`, `updateSuperOperator`, `updateValuationManager`,
   `updateSecurityCouncil`, `updateWhitelistManager`, `updateFeeReceiver`, `updateRates`,
   `switchAccessMode`, `resetHighWaterMark`, and `updateTotalAssetsLifespan` / `setSyncMode` (they open
@@ -1297,9 +1360,10 @@ points at another guard. If the guard was installed before the policy sync execu
   `ChangedMasterCopy`, `ChangedGuard` and `ChangedModuleGuard`.
 - **Fork dry run** of the whole tooling on the production topology: `FORK_NODE_URL=<rpc> npx hardhat
   run scripts/curator-guard-fork-dryrun.ts --network hardhat` deploys the timelock + guard, schedules
-  the policy (a copy of the committed file pinned to that fresh guard: the task refuses a pin that
-  differs from `--guard` on every network, and the committed file carries the production pin from
-  §7.2 step 0 on) through the timelock as the impersonated proposer, refuses an early execute, warps past
+  the policy (a copy of the committed file pinned to that fresh guard, written to a per-run directory under
+  the system's temp directory so two rehearsals on one host never share a file name, review G16g-3; the
+  task refuses a pin that differs from `--guard` on every network, and the committed file carries the
+  production pin from §7.2 step 0 on) through the timelock as the impersonated proposer, refuses an early execute, warps past
   `minDelay`, executes, re-syncs (expects no drift), models the signers' handler removal + install,
   dry-runs representative curator calls (non-zero exit code on an unexpected allow), and ends with
   an incident drill (a stand-in council locks the Safe down, the lift is scheduled as its own chained
@@ -1391,17 +1455,59 @@ points at another guard. If the guard was installed before the policy sync execu
   the old timelock do not carry over. A successor timelock brings its QUEUE with it: an operation
   scheduled on it before it is the admin matures with no power and becomes executable by anyone in
   the block of the acceptance (an `approveTransaction(setGuard(0))` scheduled months earlier removes
-  the guard with no delay anyone could use). Prefer a FRESH `CuratorGuardTimelock` as successor;
+  the guard with no delay anyone could use). Prefer a FRESH `CuratorGuardTimelock` as successor (the deploy
+  script has no timelock-only path: `CURATOR_GUARD_ALIAS=CuratorGuard_v2 npx hardhat deploy --network ethereum
+  --tags CuratorGuard` deploys an audited `CuratorGuard_v2Timelock` with the configured roles and an empty queue,
+  next to an unused `CuratorGuard_v2` that is never installed, 7.6 M gas in all; a timelock deployed by hand is
+  audited by hand, review G15a-5). Two tooling limits of a hand-over: `curator-guard-verify --op` and the sync's queue
+  print read the guard's CURRENT admin's logs, so the successor's queue (its scheduled acceptance, anything it
+  brought) is decoded by hand until the acceptance lands; and the sync's log scans of the GUARD (council,
+  guardians, standing approvals, forbidden hashes, revocations) start at the earliest deployment record of the
+  admin or the guard, so a hand-deployed successor without a record needs `--timelock-block <the guard's
+  creation block>` on every run, or the governance summary omits every grant and approval older than the
+  successor and the council canary refuses the run on mainnet (review G15a-1);
   otherwise read its `CallScheduled` / `Cancelled` / `CallExecuted` logs since creation and have its
   canceller cancel everything pending before the hand-over begins, and again before acceptance. Keep
   `defaultAdminDelay` above the timelock's `minDelay`: raise the guard's admin delay BEFORE raising
   `minDelay` to or above it, or a hand-over that slipped past the veto is accepted before the
   scheduled cancel is ready. Answer a hostile `beginDefaultAdminTransfer` with a
-  `cancelDefaultAdminTransfer` CHAINED behind it (`predecessor` = the hostile operation id): anyone
-  executes it in the block the begin lands, whenever the attacker lands it, so it wins at any admin
-  delay, while an unchained cancel executed before the begin is a no-op and the next one is a
-  `minDelay` behind; a scheduled `changeDefaultAdminDelay(1 day)` is in effect two days after it
-  lands and makes exactly that unchained cancel a day late (review G10c-2).
+  `cancelDefaultAdminTransfer` CHAINED behind it (`predecessor` = the hostile operation id), scheduled
+  within `defaultAdminDelay` of the hostile `CallScheduled`: a cancel is Ready `minDelay` after ITS OWN
+  `CallScheduled`, so against an attacker that lands the begin the second it is Ready, a cancel scheduled
+  r after the hostile one keeps `defaultAdminDelay` minus r, chained or not (chaining lets it be
+  scheduled while the begin is still pending and executed in the block the begin lands; `minDelay`
+  cancels out): three days at the deploy defaults, one block at r = `defaultAdminDelay`, the attacker's
+  seat one second later; an unchained cancel executed before the begin is a no-op (review G16b-1); a scheduled `changeDefaultAdminDelay(1 day)` is in effect two days after it
+  lands and makes exactly that unchained cancel a day late at the 48 h default (review G10c-2). Its
+  rollback (`rollbackDefaultAdminDelay`, an admin operation) is a queue round too: scheduled UNCHAINED
+  in the block the change lands, it is Ready in the very second the shorter delay takes effect at the
+  48 h default (`defaultAdminDelay` minus `MIN_ADMIN_DELAY` is 2 d, equal to `minDelay`; from the next
+  second it is a no-op and the one-day delay stays until a `changeDefaultAdminDelay(3 days)` lands and
+  waits three more days), and keeps a day only at the one-day floor: chain the rollback behind the
+  hostile change (`predecessor` = its id) like the cancel, or veto the change inside its own
+  `minDelay` (review G16f-2). With
+  both floors at a day since the round-13 follow-up, `updateDelay(1 days)` next to
+  `changeDefaultAdminDelay(1 days)` makes the two delays EQUAL, which no contract refuses (the deploy
+  script's `adminDelay > minDelay` rule is checked at deployment only): a cancel scheduled when the begin lands then keeps
+  the Ready second alone (OpenZeppelin accepts strictly after the schedule): on mainnet one whole block,
+  since every constant is a multiple of the 12-second slot and block timestamps are slot-aligned, so the
+  edge second is a block of its own unless that slot is missed (about one slot in 500); the next second is
+  the builder's order inside one block. Every Ready begin the attacker holds in reserve re-opens the
+  window and needs a cancel of its own (a cancel executed while nothing is pending is spent for nothing),
+  so the veto's one batched cancel of the attacker's queue, at any time before the attacker lands it, is
+  the cheaper answer (review G16b-1); the sync's governance summary warns when the live
+  delays are not strictly ordered (review G14c-3). Chain the cancel, and chain it BARE: a hostile begin
+  carries no deadline and its proposer chooses when to land it, so a chained cancel wrapped in
+  `executeBefore` (the shape of every sync call) is waited out and dies `DeadlinePassed` in the block the
+  begin finally lands, after which the honest side is back to the unchained cancel, a day behind the
+  acceptance at the defaults and the one-second race at the floors (review G16a-1). Nor leave the pair to
+  the attacker's timing: once both are Ready, land the begin and the chained cancel yourself in one
+  transaction (two `execute` calls from any account, through a `MultiSendCallOnly` batch or a helper
+  contract: the pair reverts as one if the cancel fails), after reading the queue's predecessors, because
+  a proposer can chain a RE-BEGIN behind your cancel, which fires in the same block and leaves the
+  hand-over pending with nothing behind it: chain a cancel behind the LAST hostile operation within the
+  admin delay of seeing it, and evict the proposer; its queue outlives it, so the last rung still needs
+  its cancel (review G16a-2).
 - **Council / proposer / guardian rotation**: `grantRole` / `revokeRole` of `COUNCIL_ROLE` are
   timelocked admin operations; a council NEVER gets a timelock role (`CANCELLER_ROLE` or
   `PROPOSER_ROLE`: it could veto or schedule its own removal, and the sync task refuses to run while
@@ -1422,7 +1528,10 @@ points at another guard. If the guard was installed before the policy sync execu
   never grants that admin role to anyone else nor a gated role to itself, clamps `getMinDelay()` to
   [1 d, 30 d] and refuses an `updateDelay` outside that range, an operation delay other than the live
   `getMinDelay()` and calldata for a target without code when they are PROPOSED, so a value typed in the wrong unit or
-  an address typed wrong fails at `schedule`, not after the delay; a proposer is never granted the
+  an address typed wrong fails at `schedule`, not after the delay, and an EXECUTED `updateDelay`, hostile
+  or the governance's own, refuses every proposal signed at the old delay (`DelayOutOfRange` above the
+  new one, `TimelockInsufficientDelay` below it): re-run `curator-guard-verify --manifest` right before
+  the proposer Safe executes, and budget one signing round per delay change (review G16b-5); a proposer is never granted the
   veto and the veto never the proposer role,
   so a rotation of the veto Safe is `[grantRole(CANCELLER_ROLE, new), revokeRole(CANCELLER_ROLE,
   old)]` in one batch, which the old veto can cancel: its consent is part of the design; a full
@@ -1585,16 +1694,23 @@ on `false` the response is ONE council batch `[setUnwrapperCodehash(h, true),
 setDeploymentGuardian(key, false)]`, and a pending registration needs no rescheduling after it),
 `GuardianUpdated` (per Safe), `RoleGranted` / `RoleRevoked` (council and deployment-wide guardians, and
 the admin role itself at a hand-over's acceptance),
-`DefaultAdminTransferScheduled` / `DefaultAdminTransferCanceled` / `DefaultAdminDelayChangeScheduled` /
+`DefaultAdminTransferScheduled` / `DefaultAdminTransferCanceled` / `DefaultAdminDelayChangeScheduled`
+(compare its `newDelay` with the timelock's `getMinDelay()` the moment it is scheduled, not when it
+takes effect at `effectSchedule`: the sync's governance summary reads the live `defaultAdminDelay()`
+and warns only once the change is in force, review G14c-3 and G15g) /
 `DefaultAdminDelayChangeCanceled` / `RoleAdminChanged`, on the timelock `CallScheduled` / `CallSalt` /
-`CallExecuted` / `Cancelled` / `MinDelayChange` (it reports the RAW argument: the effective delay is
-`getMinDelay()`, clamped to [1 d, 30 d]) / `RoleGranted` (a new proposer or canceller; page the
-canceller on EVERY `CallScheduled` whose id is not in the operator's own state file or manifest (both
-live on the operator's machine, where a compromised operator writes the hostile id: the canceller's
+`CallExecuted` / `Cancelled` / `MinDelayChange` (page on every one: the veto's window on every later
+operation just moved; since the round-13 follow-up a scheduled `updateDelay` outside [1 d, 30 d] is
+refused when proposed, so after construction the argument it reports IS the effective `getMinDelay()`,
+review G13f-3) / `RoleGranted` (a new proposer or canceller; page the
+canceller on EVERY `CallScheduled` (the operator's own view may mark the ids of its state file or
+manifest as expected, but both live on the operator's machine, where a compromised operator writes the hostile id: the canceller's
 monitor decodes every `CallScheduled` itself, `curator-guard-verify --op`, on its own machine and RPC,
 and never reads those files as a filter; review G12a-2), page it as well on a BURST of
 `CallScheduled` from one proposer in a short window, known ids or not (a flood of operations that
-never expire is itself the incident; the veto clears it in one MultiSend, review G13f-1), and
+never expire is itself the incident; the veto clears it in one MultiSend; the sync task names a queue
+above 20 pending as a burst and prints at most 50, so a monitor should page at a handful an hour
+from one proposer rather than wait for twenty, review G13f-1), and
 name the timelock's self-calls, foreign targets, `grantRole` / `revokeRole` / `updateDelay` /
 `beginDefaultAdminTransfer` / `changeDefaultAdminDelay` / `approveTransaction` / `bypass` /
 `setRequiredFallbackHandler` / `setModuleAllowed` and every widening as the loudest: an approval of
@@ -1604,8 +1720,10 @@ compromised proposer schedules (`curator-guard-verify --op` decodes such an oper
 `[ROLE / INCIDENT-SENSITIVE]`; reviews G10c-2 and G10e-3); queued role grants and widenings are not
 held back by the cooldown, so after a lockdown review and cancel them too, and after removing a
 proposer cancel its whole queue), on the
-Safe `ChangedFallbackHandler` (also on every council, proposer, veto and guardian Safe: a handler
-that is the guard or the timelock would make that Safe's role public, §6),
+Safe `ChangedFallbackHandler` (also on every council, proposer, veto and guardian Safe, and on a
+pending admin from the block `DefaultAdminTransferScheduled` names it: a handler
+that is the guard or the timelock would make that Safe's role public, §6, and on the pending admin it
+turns the acceptance into a stranger's call the guard refuses `Unauthorized`, review G9a-3 and G15g),
 `RoleRevoked` (a proposer or the veto losing its role), on the
 Safe `ChangedGuard` and `ChangedModuleGuard` (on the curator Safe, and on every proposer, veto and
 council Safe: a guarded proposer cannot schedule anything and a guarded veto cannot cancel, §7.6
@@ -1643,7 +1761,19 @@ compromised-signer PAGE; a replay that decodes a Safe signature-check revert (`G
 `GS022` / `GS025` / `GS026`, raised before the guard runs) needed NO key and is a stranger or a
 mis-signed attempt, which anyone can send to the Safe at about 39k gas each to flood this exact rule
 (measured, review G13d): rate-limit or WARN those by `tx.from` / reason so a real guard-selector PAGE
-is not buried, and never read a `GS0xx` page as a live signer compromise. Lists rebuilt from `eth_getLogs` (the governance summary's
+is not buried, and never read a `GS0xx` page as a live signer compromise. The guard-selector rule
+holds for an `execTransaction` (selector `0x6a761202`) only: a status-0 call to the Safe with any
+OTHER calldata never reached `checkNSignatures`, it is a stranger's call through the Safe's fallback
+handler, and since the round-13 follow-up the guard refuses it with the same `Unauthorized` (a hook
+wrapped in `executeBefore`, review G9a-1) or with `ForwardedHookCall`: no key is implied, it is the
+WARN that says the Safe's handler slot holds the guard (§7.8), and a monitor that keys on "guard
+selector" alone pages a compromised signer on a keyless stranger (measured, review G15g). A `GS013` is
+the guard PASSING (a valid quorum) and the inner call refusing: replay the inner call from the Safe to
+name it (`SettlementExpired` from the deadline helper of §5, Lagoon's `WrongNewTotalAssets`) and page
+it only when `tx.from` is neither an owner nor the known relayer (§6, review G13e). On a PROPOSER
+Safe a `GS013` whose inner call is the timelock's `DelayOutOfRange` or `TargetHasNoCode` is a proposer
+probing what the proposal-time rails refuse (a sub-day `updateDelay`, review G13f-3): it leaves no
+`CallScheduled` to page on, so page the veto on the receipt (the refusal itself is the signal). Lists rebuilt from `eth_getLogs` (the governance summary's
 council, guardians and standing approvals, the timelock's queue) are only as complete as the
 provider's answers: a provider that silently truncates or drops logs makes them optimistic, so use an
 archive RPC that answers completely and treat "council: none" or "no operation pending" from a public
@@ -1665,7 +1795,13 @@ allowance; one WITH the report but without `SettleRedeem` is a venue implementat
 the allowance (reported `Policy`, the whole allowance in one allowlisted call, review G10d-1); and an
 `Approval` to a spender that is not a vault, or one with no report beside it, is a window, a stray
 approval or the permit path. `lockdown` and page on each; none of them is visible in the guard's or
-the vaults' events.
+the vaults' events. On the Safe's own `ApproveHash` book and in the Transaction Service: page on a
+curator transaction fully confirmed (a quorum of owners' approvals, on chain or in the Service) and
+unexecuted for more than an hour, and on a settlement (`SettleDeposit` / `SettleRedeem` /
+`NewTotalAssetsUpdated` beside the report) landed by a `tx.from` that is neither an owner nor the
+known relayer: a confirmed batch is an option anyone exercises at a moment of their choosing (§6,
+review G13e); the deadline helper's `SettlementExpired` inside a `GS013` is that option expiring as
+designed, not a policy refusal.
 
 **Reconstructing a Safe's policy from views**: `targets(safe)` → `selectors(safe, target)` (left-aligned
 `bytes32` words) → `functionPermission(safe, target, selector)` → `allowedValues(safe, target, selector,
@@ -1696,7 +1832,7 @@ the function's current generation); `isNativeTransferAllowed(safe, target)` per 
 | `SafeNotSupported` | the Safe's proxy or singleton code is not a build the guard pins | ask Vetro (§7.6 step 6): approvals and windows still work |
 | `ModuleNotHooked` | a module is linked on the Safe that the guard does not hook | council approval of `disableModule` (v1.5.0: or admin approval of `setModuleGuard(guard)`), §7.6 step 7 |
 | `GuardNotInstalled` | a hook reached a guard that is not in the Safe's slot for that path (a half-finished v1.5.0 swap) | finish the swap (§7.6 step 8) |
-| `ForwardedHookCall` (also `Unauthorized` from `executeBefore` and from the hand-over acceptance) | the Safe's fallback handler is the guard itself: no approval is spent while it is (anyone could otherwise drive the hooks through the Safe, directly or wrapped in `executeBefore`, and complete a pending hand-over on its behalf; review G9a-1 and G9a-3, applied after round 13) | a council window, `setFallbackHandler(0)` inside it, `enforce`, then re-issue the approvals the window voided |
+| `ForwardedHookCall` (also `Unauthorized` from `executeBefore` and from the hand-over acceptance) | the Safe's fallback handler is the guard itself: no approval is spent while it is (anyone could otherwise drive the hooks through the Safe, directly or wrapped in `executeBefore`, and complete a pending hand-over on its behalf; review G9a-1 and G9a-3, applied after round 13) | on the guarded Safe: a council window, `setFallbackHandler(0)` inside it, `enforce`, then re-issue the approvals the window voided. On a role-holding or pending-admin Safe this guard does not guard (the council, a deployment-wide guardian and a pending admin never are, by the grant and transfer rails; a per-Safe guardian seat has no such rail, so a guarded Safe seated there takes the recipe above): that Safe's own `setFallbackHandler(0)` transaction and nothing else; never a window or `enforce` on a pending admin, since a live window and the `Enforced` mode it leaves refuse the acceptance (`AdminIsGuarded`) until `lockdown(newAdmin)` restores the mode (review G14b-1) |
 | `LockdownCooldown` (admin operations only) | the admin tried to enforce, open a window or approve within a day of a lockdown of that Safe | wait out the day, or the council acts now; cancel queued operations that should not survive the incident |
 | `SafeConfigUnreadable` with an unusually low gas limit | a configuration read starved of gas (it gets 63/64 of what is left) is reported as unreadable rather than as out of gas | re-estimate / raise the gas limit; an `eth_call` of the Safe's `getOwners()` succeeding tells the two apart |
 | `NestedExecution` / `MissingSnapshot` / `SafeConfigChanged` / `ApprovedExecutionFailed` | a nested same-Safe transaction, a role action inside the curator's transaction, a configuration write during a policy transaction, a failed approved execution (a module's, or the signers' when the transaction carries `safeTxGas != 0`; the approval is kept) | structural: split the transaction, fix the payload and retry, or ask Vetro |
@@ -2193,7 +2329,7 @@ Allowed:
   `totalAssets()` is not zero is refused unless `--allow-unconstrained-nav` is given knowingly (the
   live vaults hold about 1 USDC of dust, so the first mainnet sync needs the flag or a band; a band's
   first sync is checked against the same `totalAssets()`, inside the band and no wider than ±50 % of
-  it, so a band that only looks like one is refused the same way, review G13a-1). The
+  it, so a band that only looks like one is refused the same way, review G13a-1; on an empty vault, where that number is zero, a band or a fixed mark is refused until the first settlement, and a fixed `EqualTo` / `OneOf` mark is judged by its lowest and highest member on every sync, review G16c-2). The
   file ships without a `guard` pin and is therefore not deployable as shipped: pin the address the
   deploy script prints right after deployment (§7.2).
 - Required fallback handler `0x0`, enforced (see §7.3); the Safe's narrow-only guardians as listed
@@ -2203,7 +2339,8 @@ Allowed:
 Caveats: `updateNewTotalAssets` is unbounded until §8's guardrail step is done; `settleDeposit` also
 settles pending redeems, so the two settle entries are one custody exit (narrow both or the target,
 review G11b-1); a NAV band, when one is written, goes on the mark and on both settles (review
-G11b-2); `expireTotalAssets` must be added if `totalAssetsLifespan` is ever raised above zero (§7.5).
+G11b-2); the settlement-deadline entry's target must be the repository's `SettlementDeadline` build (the sync
+compares the runtime, review G16c-1); `expireTotalAssets` must be added if `totalAssetsLifespan` is ever raised above zero (§7.5).
 
 Deliberately not allowed (use `approveTransaction` case by case; the council approves owner
 management and venue one-offs within 7 days, the admin everything else):
@@ -2222,9 +2359,10 @@ management and venue one-offs within 7 days, the admin everything else):
 
 ## 10. Test coverage
 
-`forge test` (75 test files plus nine shared helpers under `test/guards/`; seven are fork suites
-against the live Safe: the four `*.e2e.ethereum.t.sol` files need `ETHEREUM_FORK_NODE_URL` and
-`G9a_CanonicalProxyHashes`, `G10d_Fork` and `G11b_Policy` skip without it; one more file, contract
+`forge test` (97 test files plus ten shared helpers under `test/guards/` at the round-15 close; nine are
+fork suites against the live Safe and vaults: the five `*.e2e.ethereum.t.sol` files need `ETHEREUM_FORK_NODE_URL`
+and `G9a_CanonicalProxyHashes`, `G10d_Fork`, `G11b_Policy` and `G13b_CrossSystem` skip without it; one
+more file, contract
 and test under `FOUNDRY_PROFILE=precancun forge test`, which needs a Shanghai EVM and a prior
 `forge build`; in this repository the default profile IS the guard profile and `FOUNDRY_PROFILE=guards`
 is kept as an alias; CI pins a pristine fork block through `.github/actions/fork-blocks` and runs
@@ -2236,6 +2374,24 @@ is kept as an alias; CI pins a pristine fork block through `.github/actions/fork
   `node_modules` compiles to, so a bump of `@openzeppelin/contracts` (a Dependabot merge, `npm update`)
   would move the deployed bytecode with every check green: the pin fails the suite instead, and is
   re-pinned only together with the review of the change that moved it (review G12a-1).
+- Symbolic proofs, outside this repository and outside `forge test` (halmos `check_` suites with z3): round
+  12's `G12b_Symbolic` / `G12b_Witness` (an admitted `Enforced` transaction is never a configuration write, an
+  approval is spent once by its exact payload on its path, nobody but the admin widens, time only narrows,
+  `OneOf` sets never leak into a re-allow, the v1.5.0 module path refuses what the owner path refuses, the dry
+  run is the live hook) and round 15's `G15b_Sym*` on the production guard and a one-day timelock (no forwarded
+  caller reaches `executeBefore`'s delegatecall or completes an acceptance for any deadline, payload and time;
+  a forwarding Safe with any calldata changes nothing; no scheduled `updateDelay` outside [1 day, 30 days] is
+  proposed, stored or read; the timelock's role rails at the floor, complete). Each proof ranges over a finite
+  address domain and the calldata lengths its driver names, and every symbolic model was replayed concretely.
+  They live with the review material (`review-scratch/g12b/`, `review-scratch/g15b/notes/`, each with its
+  drivers, settings and verdict lines; the review-material manifest lists them), not in this tree (review
+  G15b-1).
+- `G12e_Matrix*.t.sol` (generated by `test/guards/matrix/gen_matrix.py`): every external and public function of
+  the three contracts called as every caller class in every mode and window state, each cell compared with the
+  expectation the documentation decides (or, where it does not, with the code: those cells are tagged `U` in
+  the generator and pin behaviour, not design). Regenerate with `python3 test/guards/matrix/gen_matrix.py`,
+  copy `test/guards/matrix/out/G12e_*.sol` over the committed suites and delete `out/`: it is inside Foundry's
+  test glob and git-ignored, and left in place it runs the matrix twice (review G12e, G14d-2).
 - `G13b_CrossSystem.t.sol` (fork): a Lagoon-side key outside the Safe and the guard turns a
   guard-admitted claim into a denial (a reverting external sanctions list stored in the live USDC
   vault's `hopper.storage.Whitelistable` slot makes `claimSharesOnBehalf` revert whole, then succeed
@@ -2244,8 +2400,68 @@ is kept as an alias; CI pins a pristine fork block through `.github/actions/fork
 - `G13f_Liveness.t.sol`: on g9c's production topology, a proposer floods the timelock with 64
   operations that never expire and are still Ready ten years later; a swarm of 40 deployment-wide
   guardians outlives an eviction that misses one (the admin's lift reverts `LockdownCooldown` until
-  the last is removed); `updateDelay(1 hours)` makes every later operation Ready an hour after
-  scheduling (review G13f-1, G13f-2, G13f-3).
+  the last is removed); `updateDelay(1 hours)` is refused when proposed (`DelayOutOfRange`, `GS013` through
+  the proposer's Safe) and the one-day floor keeps the veto a day on every later operation (review G13f-1,
+  G13f-2, G13f-3, applied after round 13).
+- `G14g_HeldChain2.t.sol`: the chain of held items re-run with the follow-up known: at the floors (the
+  timelock's and the admin delay's, both one day, reached by a proposer while the veto sleeps) an UNCHAINED
+  honest cancel of a hostile hand-over is a one-second race the awake attacker wins, the CHAINED cancel of
+  §7.5 wins at any delay and the eviction lands in one one-day round, and a hostile council's guardian swarm
+  costs nothing against a seated council (review G14g-2, G14g-3).
+- `G14b_RailSemantics.t.sol` / `G14b_DocsRecipe.t.sol`: the two forwarded-caller rails of the follow-up on
+  real Safe v1.4.1 and v1.5.0 builds: every legitimate caller of `executeBefore` and of the hand-over
+  acceptance is served (the timelock, a council or guardian Safe with a real handler, an EOA or Safe pending
+  admin, a successor timelock at the one-day floor, a council batch, a nested wrapper), every forwarded one is
+  refused on every route with no report and no nonce moved, the probe's imposters refuse only themselves, two
+  gas sweeps of 5,379 limits find no limit at which the probe fails and the wrapped call still runs, and the
+  §7.8 repair of a pending-admin Safe is its own `setFallbackHandler(0)` (review G14b).
+- `G14c_Clocks.t.sol`: a real timelock lowered to the one-day floor from its own queue next to a guard whose
+  admin delay is lowered to its floor: both reached, the unchained cancel of a hostile hand-over keeps the
+  Ready second alone and the next second is the builder's order either way, the chained cancel wins, and the
+  cooldown is covered by the delay for any lockdown placed before the schedule (review G14c-3).
+- `G16f_RecoveryMatrix.t.sol` (on `G16f_Base.sol`, g9c's fixture reading the timelock delay from
+  `G16F_MIN_DELAY`, default two days): every recovery path's chain time asserted as a closed form at the live
+  delay D, with C the one-day cooldown and A the three-day admin delay: a single lockdown's admin lift
+  max(D, C + 1 s); a re-locking key D + C + 1 s behind its chained removal; a council lift in the same block; a
+  deployment-wide swarm 2D + C + 1 s without a successor council and D with one seated in the batch; a flood
+  Ready after D and outliving its proposer's eviction; a hand-over D + max(D', A + 1 s) for a successor at D';
+  the one-knob `changeDefaultAdminDelay(1 day)` and its unchained rollback window, (A - 1 d) - D + 1 s, one
+  second at the 48 h default; a guardian's revoke loop and a deployment guardian's unwrapper ban undone in D;
+  an admin window re-opened D + C + 1 s after a guardian's lockdown; a council window's epoch bump re-issued
+  in D; a veto plus one locker permanent without a council and nothing against a seated one.
+  `G16F_MIN_DELAY=86400 forge test --match-contract G16f_` runs it at the floor (review G16f).
+- `G16a_Insider.t.sol`: the insider who read the follow-up, on g9c's topology: a wrapped chained cancel is waited
+  out by a bare hostile begin and a bare one survives a 60-day wait, a re-begin chained behind the honest cancel
+  re-arms the ladder and the cancel behind the last rung wins, the only scheduled operation the rails refuse is
+  one aimed at a forwarding Safe (a corpse), and a deployment-wide guardian cannot stall a hand-over (review
+  G16a).
+- `G16b_TimeAttack.t.sol` / `G16b_ModulePathEdges.t.sol`: the hand-over reaction law (a cancel scheduled r after
+  the hostile scheduling wins iff r is at most the admin delay, chained or not), the inverted delay pair in one
+  batch, the decrease wait of a lowered admin delay, a stock of Ready begins, the admin's lift duration at and
+  after the cooldown, in-flight proposals across an executed `updateDelay`, and the module path's window and
+  approval edges on a real v1.5.0 Safe (review G16b).
+- `G16c_PolicyEconomics.e2e.ethereum.t.sol` (fork, with `G16c_Helpers.sol`): the price of a band the gate admits
+  (26.8 % of NAV per colluding cycle at ±50 %, 25 bp at ±5 %), a look-alike deadline helper re-opening the
+  stale-batch option and the real one killing it, an empty vault's band forcing the first mark to its floor and
+  then admitting −99 %, and the flag's escape ahead of a flow costing half a first deposit (review G16c).
+- `G15c_CancelGas.t.sol`: the marginal gas of a veto Safe's `cancel` (about 6,607) and the number of cancels one
+  transaction holds under the EIP-7825 cap (about 2,600), the figures §6 and §7.7 quote (review G15c-5).
+- `G16e_ChainCompiler.t.sol`: the two rails from cold state (two more starvation sweeps, nothing lands) and under a
+  repriced probe (a Safe-shaped forwarder whose `getStorageAt` burns a chosen amount: the fail-open window of
+  §6 appears only past about 300k gas warm / 560k cold and its lower edge is the hook's, not the probe's), the
+  EIP-7825 boundary of a wrapped batch (179 rule-less or 77 banded entries, the 12 M gate at 127 / 55, the probe
+  1 %), `simulateAndRevert` and nested frames at the two entries (nothing persists; the inner deadline bubbles
+  verbatim and the operation stays Ready), the open executor's gas (a starved execute leaves the operation Ready
+  and nothing applied; the wrapper moves the first landing limit by 4,268); byte-identical gas under cancun,
+  prague and osaka. `G16e_Cap.s.sol` schedules the boundary batches on a dev node for the node's own estimate
+  (review G16e).
+- `G15d_ProbeGas.t.sol` / `G15d_ProxyHashes.t.sol` / `G15d_HeldPins.t.sol`: the killers of the six mutants the
+  warm unit suite could not see (review G15d): the forwarding probes refuse a council Safe whose handler is the
+  guard from COLD state (`vm.cool`) on its genuine and its direct route and serve it after the repair, the
+  timelock's probe answers only to a Safe-shaped 96-byte answer, the live-delay rail schedules at the clamped
+  delay with a planted raw slot; a proxy deployed from each canonical factory's `proxyCreationCode()` (three
+  vectors under `test/guards/vectors/`) hashes into the seeded set, offline; and the report of a no-op
+  `setNativeTransferAllowed` is pinned as current (to flip with the held G9b-2 if ever applied).
 
 - `CuratorGuard.t.sol`: real Safe v1.4.1 proxy with a curator EOA signer; genuine
   `execTransaction(setGuard)` install; ERC-165 ids and every storage-slot constant pinned to the
@@ -2457,8 +2673,9 @@ is kept as an alias; CI pins a pristine fork block through `.github/actions/fork
   requires, the zero-address rail of `setDeploymentGuardian`, `addAllowedValues` needing a `OneOf`
   rule on that word, a re-allow clearing the set of a moved `OneOf` rule, `targets` pruning, an
   approved single call into canonical code staying unparsed, a role grant never reading the council
-  term, and six timelock fall-through arms). `G10f_HeldFixPins` is kept with the held round-9 code
-  changes, outside this repository, and pins each of them.
+  term, and six timelock fall-through arms). `G10f_HeldFixPins` pins the two round-9 rails applied
+  after round 13 (G9a-1, G9a-3 / G9c-3; three tests); the pins of the round-9 items that stay held
+  (G9c-1, G9b-2) stay with the review material outside this repository.
 - The other round-10 suites, all green on the shipped code: `G10a_*` (a reference model of the mode,
   window, cooldown, approval and hand-over machine driven in lockstep with the guard through real Safe
   v1.4.1 / v1.5.0 transactions: 14 invariant functions over four handlers, two Safes on one guard, the
@@ -2468,14 +2685,14 @@ is kept as an alias; CI pins a pristine fork block through `.github/actions/fork
   canonical Safe builds; the ABI edge cases), `G10c_*` (the governance game: id squatting, hostile
   proposer and council, windows; the three `G10c_IdSquat` tests pin the G10c-1 rail: a longer
   delay is refused and a squat at the honest delay is the honest operation; `G10e_Monitoring`'s
-  forged-report test flips with
-  G9a-1 and the `G10a_Findings` G10a-1 and G10a-2 tests with those items, review G11d-3), `G10d_*`
+  forged-report test flipped with G9a-1 after round 13; the `G10a_Findings` G10a-1 and G10a-2 tests flip
+  with those items, review G11d-3), `G10d_*`
   (the second adversary: hostile venue, hostile vault
   implementation on the live Safe, compromised council and proposer), `G10e_Monitoring` (event
   adjacency, uniqueness and ordering) and `G10g_*` (the `OneOf` gas and `_storeApproval` write-count
   measurements behind two NatSpec claims).
 - Round 11 additions, all green on the shipped code: `G9a_*` and `G9c_*` (the round-9 Safe-integration and
-  governance PoCs adopted on g11d's request: the forwarded `executeBefore` forgery and `simulateAndRevert`
+  governance PoCs adopted on g11d's request: the forwarded `executeBefore` forgery, refused since the round-13 follow-up, and `simulateAndRevert`
   as the Safe, the canonical proxy hashes, the hand-over at the slowest successor delay, the council stall's
   eviction, the rotation residue, the veto-only deadlock, the guarded-proposer recovery of 7.6 step 5),
   `G11b_Policy` (the shipped policy shape on the live Safe: the one custody exit, the settles repeating a
@@ -3377,8 +3594,9 @@ suites and 583 tests without an RPC (580 pass, the three non-e2e fork suites ski
 tests with an archive RPC at the pinned block, the pre-Cancun test; the lint corpus (112 cases plus
 the shipped policy); the fork rehearsal exit 0.
 
-HELD for the owner's decision, each with a proof-of-concept test and a measured diff in the review
-material kept outside this repository, none applied here: `_refuseForwarded()` first in
+HELD for the owner's decision at that date (G9a-1, G9a-3 / G9c-3 and the delay floor landed after round
+13: see "Round 13 follow-up" below), each with a proof-of-concept test and a measured diff in the review
+material kept outside this repository, none applied at that date: `_refuseForwarded()` first in
 `executeBefore` (G9a-1, +8 bytes: a stranger forges a `Bypass` report through a Safe whose fallback
 handler is the guard; §4, §6, §7.3 and §7.8 name the exception) and the same rail in
 `_acceptDefaultAdminTransfer` (G9a-3 / G9c-3, +8 bytes); the hand-over predicate on admin-written
@@ -3474,15 +3692,130 @@ instead of one hour (+4 bytes): the constructor, the proposal-time rail on a sch
 read-time clamp all move, so a compromised proposer can no longer shrink the veto's window on every later
 operation to an hour; the live default delay (48 h) and the admin delay (3 d, strictly above it by the deploy
 script's rule) are unchanged. Sizes: guard 23,240 bytes (352 under the gate), timelock 8,195 bytes; the build
-pin (`G12a_BuildPin`) carries the new stripped hashes (sha256 `2ef656ec…` / `90bb0171…`). With the code: the
+pin (`G12a_BuildPin`) asserts the new stripped keccak hashes (`c8e0a908…` / `b7790f42…`; sha256 `2ef656ec…` /
+`90bb0171…` in its comment). With the code: the
 access-matrix generator's expectations for the two rails and the floor and the six regenerated `G12e_*`
 suites (the timelock surface gained a `schedule(updateDelay(1 day))` cell), the round-9 proof-of-concept
 suites flipped into pins of the refusal (`G9a_ForwardedExecuteBefore*`, `G9c_Handover`, `G10e_Monitoring`,
 `G11g_Evidence`), the held-fix pins for the two rails (`G10f_HeldFixPins`, three tests), and every test that
 built or scheduled a one-hour timelock moved to a day (`CuratorGuardRound6`, `CuratorGuardRound8Timelock`,
 `CuratorGuardV2`, `G10a_TimelockInvariants`, `G10d_Proposer`, `G10f_Pins`, `G11c_TimeBoundaries`,
-`G13f_Liveness`, `G13g_HeldChain`). Still held: G9c-1, G9b-2, G10a-1, G10a-2 (leave), G10d-1 (at funding),
-G11b-6 with G13g-2 (apply together, keep a `totalAssets()` component), G13f-2b, and the deployment of the
-settlement-deadline helper. Suite after the change: 120 suites, 2,257 tests pass without an RPC (four fork
+`G13f_Liveness`, `G13g_HeldChain`). Still held: G9e-1 (the sync task executing hand-scheduled approvals behind
+`--confirm-sensitive`; §7.2 and §7.5 still route those through a hand-built `execute`) and G9f-10 (a fuzz seed in
+CI), both "apply" in every round and not in this commit; G9c-1, G9b-2, G10a-1, G10a-2 (leave), with their G10f-2
+pins outside the repository; G10d-1 (at funding); G11b-6 with G13g-2 (apply together, keep a `totalAssets()`
+component); G13f-2b; and the deployment of the settlement-deadline helper.
+Suite after the change: 120 suites, 2,257 tests pass without an RPC (four fork
 suites skip), 31 fork tests at a settled head and at the CI pin, the deep invariants 32/32, the corpus 121,
-the fork drill complete, the Osaka profile identical.
+the fork drill complete, the Osaka profile identical. (The first verification run after the change
+failed one test, `G10d_Proposer`'s residual of the one-hour lever, flipped before the commit; the second run
+is the committed tree's, review G14e-8.)
+
+#### Round 14 (2026-10-10): the follow-up commit under the microscope
+
+Seven lenses on commit `4892722` (the diff and the bytecode, the rails' semantics, the floor and every clock, the
+tests of the change, comments and docs, tooling and CI, the adversary of the change). No Critical, High or Medium;
+the three contracts are unchanged (guard 23,240 bytes, timelock 8,195 bytes; two NatSpec precisions proven
+zero-byte, review G14e-5). Every byte of the delta is accounted for (two 8-byte jump sequences into
+`_refuseForwarded`, four widened constants, relocated tags and data offsets; hardhat equals foundry after the
+metadata tail; the timelock's creation code also moved by one byte, which the runtime pin does not cover, review
+G14a). The rails serve every legitimate caller and refuse every forwarded one on every route, under two gas sweeps
+of 5,379 limits each (review G14b); every mutant of the two rails and the floor is killed, one order variant of
+the acceptance rail now pinned (review G14d-1); the floor moves its three sites together and every strict ordering
+survives, with one new equality: the timelock's floor, the admin delay's floor and the lockdown cooldown are all a
+day, so at the floors an UNCHAINED cancel of a hostile hand-over is a one-second race while the CHAINED cancel of
+§7.5 wins at any delay (review G14c-3, G14g-2). Lows and Infos, all applied in this tree (0 bytes of guard code):
+the deploy script's floor mirror and message with §7.1 and the §10 line (G14a-1, also G14c-1, G14f-1, G14g-1); the
+§7.8 repair column for a role-holding or pending-admin Safe (G14b-1); `verify --manifest` prints the time by which
+the proposer must execute (G14c-2); the governance summary prints both live delays and warns when they are not
+strictly ordered, with §6 and §7.5 (G14c-3); stale sentences in §4, §7.8, §10, §13.2 and the README, the held list
+corrected to include G9e-1 and G9f-10 (G14e-2, G14e-3); the generator's D14 text (G14e-4; the documentation table's line citations stay those of 830824e, as its header says); the flipped
+suites' titles (G14e-7); `.gitignore` for the generator's `out/` and the regeneration command (G14d-2);
+`--execute --op` counts `enforce` as a lift only on a configured Safe, with §7.2 (G14f-5); the first verification
+run's failure named (G14e-8). Adopted suites: `G14b_RailSemantics` (19 tests), `G14b_DocsRecipe` (1),
+`G14c_Clocks` (5), `G14g_HeldChain2` (3) and one test in `G10f_HeldFixPins`. Suite: 124 suites, 2,286 tests pass
+without an RPC (four fork suites skip), 31 fork tests at a settled head and at the CI pin, the pre-Cancun test,
+the corpus 121, the fork drill complete, the Osaka profile identical. Held, with the round's second opinions:
+G9e-1 and G9f-10 apply (seven of seven, still held by the owner); G9c-1, G9b-2, G10a-1 and G10a-2 leave (seven
+of seven); G10d-1 at funding; G11b-6 with G13g-2 and a `totalAssets()` component (seven of seven); G13f-2b leave
+until measured (six of seven); the settlement-deadline helper at a public vault's funding. Residual, outside this
+repository: the audited commit is not on the remote, the default branch stays on the broken dependency set, and
+the repository's workflow has never run with the fork secret set, so no run of it has ever passed (review g15e).
+
+#### Round 15 (2026-10-10): cross-cutting analysis of the whole tree
+
+Seven lenses on the tree of round 14, each cutting across the contracts, the tooling, the policy, the tests,
+the docs and the runbook at once. No Critical, High or Medium; the three contracts are unchanged (guard 23,240
+bytes, timelock 8,195 bytes). The lifecycle ran end to end on a fork through the deploy script, the three
+tasks and the runbook's commands as written, with genuine Safe transactions on the live curator and
+governance Safes: every contract step did what the runbook says (G15a). Every property round 12 proved holds
+on the final code, and the two rails and the floor are now proofs on the production guard and a one-day
+timelock: no forwarded caller reaches `executeBefore`'s delegatecall or completes an acceptance for any
+deadline, payload and time; no scheduled `updateDelay` outside [1 day, 30 days] is proposed, stored or read;
+the timelock's role rails complete at the floor, which round 12's engine artefact had prevented (G15b). The
+change-impact matrix of the 45 changes applied since 830824e (1,081 cells) found six conflicts, none in the
+contracts: the held tooling diffs had rotted against the applied tree and were rebased (G15c-1, G15c-2, still
+held), the signer-side verify paths silenced the band gate's warnings (G15c-3), and the settlement-deadline
+helper's designed `GS013` had no class in §7.7 (G15c-4). 702 mutants of the final code: every mutant of the
+rails and the floor killed by the unit suite; six genuine gaps of the warm unit suite (the probes' forwarded
+gas, the timelock probe's shape, the live-delay clamp, the v1.3.0 proxy hash offline, the held G9b-2's
+observability) now have killers in the tree (G15d). The audit package reproduces to the byte from a fresh
+clone, and is not ready to send for reasons outside the tree: the commit is unpublished, the repository has
+never held the fork secret so no CI run has ever passed, and the prompt's sentence on the held items was
+false as worded (G15e: a corrected prompt and a review-material manifest in the review material). The threat
+model re-derived from the code agrees with §6 on every custody and freeze path; §2's rule-model sentence was
+stale, §6 listed v1's self-deadlock as blocked, and the two shared keys are priced against the proposer lane
+where the undelayed strategy upgrade is the cheaper lever (G15f). Monitoring: §7.7's classify rule had not
+caught up with the rails, a proposer probing the floor left no scheduled operation to page on, the G13e pages
+lived only in §6, and the two-delay print armed two days late (G15g). Applied, 0 bytes of guard code: the
+tooling (the log-scan anchor after a hand-over, the band exemption's slack and rounding, one-off operations
+named, sixteen Lagoon and proxy-admin signatures in the sensitive list, the verify paths' warnings, the
+`--allow-pending` list cap, the `NAV_FAMILY` exemption scope, the pending admin delay compared), the docs
+(§2, §5, §6, §7.2, §7.5, §7.7, §10, this entry), the README, and the adopted suites `G15c_CancelGas`,
+`G15d_ProbeGas`, `G15d_ProxyHashes`, `G15d_HeldPins`. Suite: 129 suites, 2,293 tests pass without an RPC, 31
+fork tests at a settled head and at the CI pin, precancun, the corpus 121, the drill, the Osaka profile
+identical. Still held, unchanged: G9e-1 (now as the rebased G15c-2), G9f-10, G9c-1, G9b-2, G10a-1, G10a-2,
+G10d-1, G11b-6 with G13g-2 (now as the rebased G15c-1), G13f-2b, the settlement-deadline deployment.
+
+#### Round 16 (2026-10-10/11): adversarial, with the follow-up known; the last of the three final rounds
+
+Seven adversaries who had read everything, the follow-up included. No Critical, High or Medium; the three
+contracts are unchanged. One Low is a contract hardening left to the owner: the forwarded-caller probe compares
+the raw 32-byte handler word with the guard's address while the EVM masks the forwarded call target to 160
+bits, so a role-holding Safe's own quorum could plant a dirty-high-bits handler word by a storage-writing
+delegatecall and hand its role to any stranger (never a forged report, never custody; the tooling already
+masks and flags such a handler); masking the word costs 9 bytes in each contract, proven and reproduced
+(G16d-1). Everything else applied is zero bytes. The insider who read the follow-up found that the chained
+cancel of a hostile hand-over wins only when scheduled bare and behind the last hostile rung (G16a); the time
+attacker measured the general law (a cancel scheduled within the admin delay of the hostile scheduling wins,
+chained or not), the admin's no-council lift at the delay plus the signing round, and a deploy rule that
+accepted a one-second margin in silence (G16b); the economic adversary found that a look-alike deadline helper
+synced without a word, that the band gate had two escapes (an empty vault, a fixed-mark set) and that the
+band-move print could read as the opposite of what happened, and priced a ±50 % band at 26.8 % of NAV per
+colluding cycle (G16c); the multi-guard lens confirmed the rails across instances (G16d); the chain lens
+bounded the rails' one gas dependency (a repricing would have to make the probe 64 times dearer than the hook)
+and measured the transaction cap at 179 wrapped entries on an Osaka node (G16e); the liveness lens re-ran every
+recovery at the floor, found none slower except by the cooldown's inclusive edge, measured the one-knob
+rollback window at the deploy defaults, and left a delay-parameterised recovery matrix now run at the floor in
+CI (G16f); the reviewer's adversary found the rebased hand-scheduled-approvals diff rotted again, measured the
+guardian cap at +181 bytes, and filed six unanimous zero-byte items that had fallen between the lists, four of
+which are now in the tree (G16g). Applied: the tooling (the helper's runtime checked against the repository's
+artifact, the band gate on empty vaults and fixed-mark sets, the band print around the live NAV with its
+per-cycle price, the wrapped-cancel and dead-seat tags, the pending admin delay and a one-day margin in the
+ordering checks, the drill's per-run temp directory), the docs (§5, §6, §7.1, §7.2, §7.5, §7.7, §10, this
+entry), the README, the CI step for the recovery matrix at the floor, and the adopted suites `G14g_HeldChain2`,
+`G16a_Insider`, `G16b_TimeAttack`, `G16b_ModulePathEdges`, `G16c_PolicyEconomics.e2e`, `G16e_ChainCompiler`,
+`G16f_RecoveryMatrix`. Suite: 134 suites, 2,332 tests pass without an RPC, 38 fork tests at a settled head and
+at the CI pin, precancun, the corpus 121, the drill, the Osaka profile identical. Still held: G9e-1 (as the
+round-16 rebase), G9f-10, G9c-1, G9b-2, G10a-1, G10a-2, G10d-1, G11b-6 with G13g-2 (as the round-15 rebase),
+G13f-2b (+181 bytes, measured), G16d-1 (+9 bytes each, recommended), the settlement-deadline deployment, the
+symbolic suites' adoption.
+
+#### After the three final rounds (2026-10-11)
+
+Rounds 14, 15 and 16, 21 reports, all "install as shipped": the follow-up commit is exactly the three
+statements it claims, proven on the production contracts, killed under mutation, consistent across every
+part of the tree, and attacked from seven more angles without a path to custody or to a frozen governance.
+The cheapest path to custody is unchanged since round 5: two curator keys through the NAV mark, today the same
+two keys that sit on both Safes. What is left is the owner's: the held list above, the package (publish the
+commit, set the fork secret, make the default branch equal, one green run), and the governance moves of §8.

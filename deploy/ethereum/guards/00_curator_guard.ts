@@ -13,16 +13,24 @@ const ALIAS = process.env.CURATOR_GUARD_ALIAS || CONTRACT;
 const TIMELOCK_ALIAS = `${ALIAS}Timelock`;
 // Widenings sit in public for this long before they can be executed (seconds). 48 h default.
 const TIMELOCK_DELAY = BigInt(process.env.CURATOR_GUARD_TIMELOCK_DELAY || 48 * 3600);
-// Delay of the guard's own two-step admin transfer (`AccessControlDefaultAdminRules`). Must exceed the
-// timelock delay so a scheduled `cancelDefaultAdminTransfer` can land in time: 3 days default.
+// Delay of the guard's own two-step admin transfer (`AccessControlDefaultAdminRules`). Must sit at least a
+// day above the timelock delay (`ADMIN_DELAY_MARGIN`) so a `cancelDefaultAdminTransfer` scheduled when a
+// hostile begin lands keeps a signing round before the acceptance opens: 3 days default.
 const ADMIN_DELAY = BigInt(process.env.CURATOR_GUARD_ADMIN_DELAY || 3 * 24 * 3600);
 // Reuse an existing timelock (e.g. for a replacement guard) instead of deploying one per alias.
 const EXISTING_TIMELOCK = process.env.CURATOR_GUARD_TIMELOCK;
 const ZERO = "0x0000000000000000000000000000000000000000";
-// Mirrors `CuratorGuardTimelock.MIN_DELAY_FLOOR / MIN_DELAY_CAP` and `CuratorGuardPolicy.MAX_ADMIN_DELAY`.
-const MIN_DELAY_FLOOR = 3600n;
+// Mirrors `CuratorGuardTimelock.MIN_DELAY_FLOOR / MIN_DELAY_CAP` and `CuratorGuardPolicy.MAX_ADMIN_DELAY`
+// (the floor is one day since the round-13 follow-up, G13f-3; keep the three in sync with the contracts).
+const MIN_DELAY_FLOOR = 86_400n;
 const MIN_DELAY_CAP = 30n * 24n * 3600n;
 const MAX_ADMIN_DELAY = 30n * 24n * 3600n;
+// How far the admin delay must sit above the timelock delay. The ordering exists so that a
+// `cancelDefaultAdminTransfer` scheduled when a hostile begin lands is Ready (minDelay later) before the
+// acceptance opens (adminDelay later): the honest side keeps adminDelay - minDelay, which must hold a
+// proposer Safe's signing round; "above by one second" satisfies the strict rule and keeps nothing
+// (review G16b-3). The defaults keep a day.
+const ADMIN_DELAY_MARGIN = 86_400n;
 const OVERRIDES = [
   "CURATOR_GUARD_ALLOW_KEY_OVERLAP",
   "CURATOR_GUARD_ALLOW_NO_COUNCIL",
@@ -170,7 +178,7 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
   // A fresh timelock cannot be constructed below the floor (`DelayOutOfRange`); no override.
   if (TIMELOCK_DELAY < MIN_DELAY_FLOOR && !EXISTING_TIMELOCK) {
     throw Error(
-      `CURATOR_GUARD_TIMELOCK_DELAY is ${TIMELOCK_DELAY}s (${human(TIMELOCK_DELAY)}): the contract refuses less than an hour (the value is in seconds; 48 h = 172800)`,
+      `CURATOR_GUARD_TIMELOCK_DELAY is ${TIMELOCK_DELAY}s (${human(TIMELOCK_DELAY)}): the contract refuses less than a day (the value is in seconds; 48 h = 172800)`,
     );
   }
   if (TIMELOCK_DELAY > MIN_DELAY_CAP)
@@ -179,9 +187,10 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
     );
   if (ADMIN_DELAY > MAX_ADMIN_DELAY)
     throw Error(`CURATOR_GUARD_ADMIN_DELAY ${ADMIN_DELAY}s exceeds the contract cap of 30 days`);
-  if (ADMIN_DELAY <= TIMELOCK_DELAY) {
+  if (ADMIN_DELAY < TIMELOCK_DELAY + ADMIN_DELAY_MARGIN) {
     refuse(
-      `admin delay ${ADMIN_DELAY}s <= timelock delay ${TIMELOCK_DELAY}s: a scheduled cancelDefaultAdminTransfer could not land in time (set CURATOR_GUARD_ADMIN_DELAY above the timelock delay)`,
+      `admin delay ${ADMIN_DELAY}s is less than a day above the timelock delay ${TIMELOCK_DELAY}s: a cancelDefaultAdminTransfer scheduled when a hostile begin lands keeps ${ADMIN_DELAY > TIMELOCK_DELAY ? ADMIN_DELAY - TIMELOCK_DELAY : 0n}s before the acceptance opens, less than a signing round (set CURATOR_GUARD_ADMIN_DELAY at least a day above the timelock delay)`,
+      "CURATOR_GUARD_ALLOW_SHORT_DELAY",
     );
   }
   // The guard's constructor probes EIP-1153 (a guard on a pre-Cancun chain would brick the first Safe
@@ -344,9 +353,10 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
       "CURATOR_GUARD_ALLOW_SHORT_DELAY",
     );
   }
-  if (ADMIN_DELAY <= liveMinDelay)
+  if (ADMIN_DELAY < liveMinDelay + ADMIN_DELAY_MARGIN)
     refuse(
-      `admin delay ${ADMIN_DELAY}s <= live timelock delay ${liveMinDelay}s: a scheduled cancelDefaultAdminTransfer could not land in time`,
+      `admin delay ${ADMIN_DELAY}s is less than a day above the live timelock delay ${liveMinDelay}s: a cancelDefaultAdminTransfer scheduled when a hostile begin lands keeps ${ADMIN_DELAY > liveMinDelay ? ADMIN_DELAY - liveMinDelay : 0n}s before the acceptance opens`,
+      "CURATOR_GUARD_ALLOW_SHORT_DELAY",
     );
   await auditTimelock(hre, tl, timelockAddress, proposers, cancellers, council, forkLike);
 

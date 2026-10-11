@@ -74,6 +74,9 @@ const MAX_SELECTORS = 32;
 const MAX_GUARDIANS = 32;
 const TAIL_FLAG = 0x8000;
 const LOCKDOWN_COOLDOWN = 86_400n;
+// The deploy script's margin of the admin delay above the timelock delay: a cancel scheduled when a hostile
+// begin lands keeps `adminDelay - minDelay`, a proposer Safe's signing round at least (review G16b-3).
+const ADMIN_DELAY_MARGIN = 86_400n;
 // Joint caps on `OneOf` members (a v2 robustness item, enforced here rather than on-chain). Since
 // round 8 revocation abandons the sets in O(1) (generation-keyed), but `clearAllowedValues` and a
 // re-allow that drops a `OneOf` rule still iterate every member (≈ 4.3k gas each on committed
@@ -176,6 +179,24 @@ const SENSITIVE_LIST = [
   "execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)",
   "execTransactionFromModule(address,uint256,bytes,uint8)",
   "approveHash(bytes32)",
+  // Lagoon v0.6.0 role, code and custody levers (docs section 7.5 "Never on the council lane", 8): named in every
+  // decode and refused in a policy file without `"$allowSensitive": true` (review G15a-4).
+  "updateSafe(address)",
+  "lockUpdateSafe()",
+  "updateSecurityCouncil(address)",
+  "updateSuperOperator(address)",
+  "updateValuationManager(address)",
+  "updateWhitelistManager(address)",
+  "updateFeeReceiver(address)",
+  "updateRates((uint16,uint16,uint16,uint16,uint16))",
+  "switchAccessMode(uint8)",
+  "resetHighWaterMark()",
+  "updateTotalAssetsLifespan(uint128)",
+  "setSyncMode(uint8)",
+  "securityCouncilUpdateTotalAssets(uint256)",
+  "submitImplementation(address)",
+  "upgradeAndCall(address,address,bytes)",
+  "submitDelay(uint256)",
 ];
 // Functions whose payload EMBEDS further calls that run as the Safe with no selector check and no rule
 // (a venue's own batch / multicall / execute, ERC-1363 callbacks): allowing one voids every sibling
@@ -207,6 +228,7 @@ const OTHER_KNOWN = [
   "settleRedeem(uint256)",
   "claimSharesOnBehalf(address[])",
   "claimAssetsOnBehalf(address[])",
+  "assertBefore(uint256)", // contracts/helpers/SettlementDeadline.sol (docs section 5, review G13e-1)
   "initiateClosing()",
   "close(uint256)",
   "multiSend(bytes)",
@@ -215,6 +237,9 @@ const ALLOWANCE_SHAPED = new Map<string, number[]>(
   ALLOWANCE_LIST.map(([sig, words]) => [selectorOfSignature(sig), words]),
 );
 const SENSITIVE = new Set(SENSITIVE_LIST.map(selectorOfSignature));
+/// The settlement-deadline entry: a plain call with no rules whose only substance is the code behind its target
+/// (review G16c-1).
+const DEADLINE_SELECTOR = selectorOfSignature("assertBefore(uint256)");
 const SELF_DISPATCH = new Set(SELF_DISPATCH_LIST.map(selectorOfSignature));
 /// Well-known signatures by selector: a policy entry whose selector matches one of these under another
 /// name is a collision (ground in seconds) and is refused; the diff and the manifest always print the
@@ -232,6 +257,10 @@ const KNOWN_SIGNATURES = new Map<string, string>(
 const BAND_SHAPED = new Map<string, number>([[selectorOfSignature("updateNewTotalAssets(uint256)"), 0]]);
 // The settles of a NAV-shaped target: they repeat the pending mark, so a band on the mark must be repeated on them.
 const SETTLE_SIGNATURES = ["settleDeposit(uint256)", "settleRedeem(uint256)"];
+/// The mark and its settles: the only functions whose word-0 band follows the vault's live `totalAssets()` (the
+/// shift exemption of review G12c-1 reads the anchor for these alone; any other word-0 band moves under the
+/// loosening gate, review G15c).
+const NAV_FAMILY = new Set<string>([...BAND_SHAPED.keys(), ...SETTLE_SIGNATURES.map(selectorOfSignature)]);
 // Storage slots that reveal an upgradeable target (ERC-1967, the ZeppelinOS legacy slot used by USDC
 // and cbBTC, EIP-1822).
 const PROXY_SLOTS: [string, string][] = [
@@ -406,7 +435,7 @@ task("curator-guard-sync", "Reconcile a CuratorGuard policy for a Safe against a
   .addFlag("allowLargeBatch", "Schedule a batch estimated above 12M gas (split the policy change instead)")
   .addFlag(
     "allowUnconstrainedNav",
-    "Sync an unconstrained NAV-marking function on a vault that already holds assets (a colluding quorum can then mark the custody away)",
+    "Sync an unconstrained NAV-marking function, or a NAV band at its first sync that does not contain the vault's live totalAssets() or is wider than +-50 % of it, on a vault that already holds assets (a colluding quorum can then mark the custody away)",
   )
   .addFlag("viaTimelock", "Fork networks: rehearse schedule -> execute instead of impersonating the admin")
   .setAction(async (args: SyncArgs & { policy: string }, hre: HardhatRuntimeEnvironment) => {
@@ -438,7 +467,7 @@ task("curator-guard-sync", "Reconcile a CuratorGuard policy for a Safe against a
         if (queue.length > QUEUE_FLOOD_WARN)
           console.log(
             chalk.red(
-              `WARNING: ${queue.length} pending operations is a burst, not a backlog: a compromised proposer floods the queue with operations that never expire (review G13f-1); page the veto Safe, which cancels every abandoned id in ONE MultiSend transaction, and remove that proposer`,
+              `WARNING: ${queue.length} pending operations is a burst, not a backlog: a compromised proposer floods the queue with operations that never expire (review G13f-1); page the veto Safe, which cancels the abandoned ids in MultiSend batches (about 2,600 cancels fit under the 16.8 M transaction cap of EIP-7825, measured in review g15c; one batch for any flood seen so far), and remove that proposer`,
             ),
           );
       } else if (scan.degraded) {
@@ -519,7 +548,10 @@ task(
       hre: HardhatRuntimeEnvironment,
     ) => {
       if (!args.op === !args.manifest) throw Error("pass exactly one of --op <id> or --manifest <file>");
-      const { policy } = loadPolicy(args.policy);
+      // The signer's check prints what the lint would tell the operator: a band on paper (the 100x warning,
+      // review G13a-1), no guardian, a signed word. Dropped before (review G15c-3).
+      const { policy, warnings } = loadPolicy(args.policy);
+      for (const w of warnings) console.log(chalk.yellow(`warning: ${w}`));
       const ctx = await guardContext(hre, args.guard, policy, args.timelockBlock);
       if (!ctx.timelock) throw Error(`the guard admin ${ctx.admin} is not a TimelockController`);
       if (args.manifest) {
@@ -697,6 +729,7 @@ async function verifyManifest(
   let allMatch = true;
   let previousId = ZERO_HASH;
   const calldatas: string[] = [];
+  const now = BigInt((await hre.ethers.provider.getBlock("latest"))!.timestamp);
   for (const [i, op] of m.operations.entries()) {
     const calldata = String(op.scheduleBatchCalldata ?? "");
     if (!/^0x[0-9a-fA-F]+$/.test(calldata)) throw Error(`${file}: operation #${i} carries no scheduleBatch calldata`);
@@ -747,9 +780,11 @@ async function verifyManifest(
           `  already on the timelock (${scheduledAt === 1n ? "executed" : `ready at ${iso(scheduledAt)}`}): scheduling it again reverts`,
         ),
       );
+    let earliest: bigint | undefined;
     for (const [j, p] of payloads.entries()) {
       const guardTarget = lower(targets[j]) === lower(ctx.guard);
       const inner = unwrapExecuteBefore(ctx.guardIface, p);
+      if (inner && (earliest === undefined || inner.deadline < earliest)) earliest = inner.deadline;
       const stillWanted = guardTarget && values[j] === 0n && inner !== undefined && wanted.has(inner.data);
       allMatch &&= stillWanted;
       const [first, ...rest] = describeTimelockCall(ctx, targets[j], p).split("\n");
@@ -763,6 +798,21 @@ async function verifyManifest(
           (values[j] !== 0n ? chalk.red(`  value ${values[j]}`) : "") +
           rest.map((line) => `\n${line}`).join(""),
       );
+    }
+    // The signer is the one whose delay kills the operation: its `executeBefore` deadline was fixed when the
+    // operator prepared it, and it is Ready `minDelay` after THIS proposal executes, so a signature that lands
+    // later than `deadline - minDelay` schedules a dead operation (the sync prints the same time to the operator;
+    // on a one-day timelock a lift's deadline is three days after preparation, review G14c-2). Derived from the
+    // calldata, never from a manifest field.
+    if (earliest !== undefined) {
+      const scheduleBy = earliest - minDelay;
+      const line = `  executeBefore ${iso(earliest)}: the proposer Safe must execute this proposal before ${iso(scheduleBy)} (dead on arrival afterwards)`;
+      if (now >= scheduleBy) {
+        allMatch = false;
+        console.log(chalk.red(`${line}: that time has passed, do not sign; ask for a fresh proposal`));
+      } else if (scheduleBy - now < WINDOW_MARGIN) {
+        console.log(chalk.yellow(`${line}: less than ${WINDOW_MARGIN / 3600n} h left`));
+      } else console.log(chalk.blue(line));
     }
     previousId = opId;
     calldatas.push(calldata);
@@ -973,6 +1023,39 @@ async function governanceSummary(hre: HardhatRuntimeEnvironment, ctx: Ctx): Prom
   const lines: string[] = [`admin ${ctx.admin}${ctx.timelock ? " (TimelockController)" : ""}`];
   if (pendingAdmin !== ethers.ZeroAddress)
     lines.push(chalk.yellow(`PENDING ADMIN TRANSFER to ${pendingAdmin} (acceptable from ${iso(pendingSchedule)})`));
+  // The deploy script orders `defaultAdminDelay` strictly above `minDelay` at deployment only; both floors are a
+  // day (`MIN_DELAY_FLOOR`, `MIN_ADMIN_DELAY`), so a scheduled `updateDelay` or `changeDefaultAdminDelay` can equalise
+  // or invert them later, after which an UNCHAINED `cancelDefaultAdminTransfer` keeps the Ready second alone (a
+  // block in twelve) or lands late: say it on every run (docs section 7.5, review G14c-3).
+  if (ctx.timelock) {
+    const adminDelay: bigint = await g.defaultAdminDelay();
+    const minDelay: bigint = await ctx.timelock.getMinDelay();
+    // A scheduled `changeDefaultAdminDelay` is in force only from its effect time (OpenZeppelin waits the old delay
+    // before a shorter one applies): the live getter says nothing about it for up to five days, during which
+    // `rollbackDefaultAdminDelay` could still undo it, so the pending value is compared as well (review G15g-3).
+    const [pendingDelay, effectAt]: [bigint, bigint] = await g.pendingDefaultAdminDelay();
+    const text = `admin-transfer delay ${adminDelay}s, timelock delay ${minDelay}s`;
+    // A cancel scheduled when a hostile begin lands is Ready `minDelay` later and the acceptance opens `adminDelay`
+    // later: the honest side keeps the difference, a signing round at least, or chains a cancel within the admin
+    // delay of the hostile CallScheduled (review G16b-3; the deploy script keeps a day).
+    const order = (delay: bigint, label: string) =>
+      delay >= minDelay + ADMIN_DELAY_MARGIN
+        ? label
+        : chalk.yellow(
+            `WARNING: ${label}: ${delay > minDelay ? `only ${delay - minDelay}s apart` : "not strictly ordered"}, so a hand-over that ` +
+              `slips past the veto is accepted ${delay > minDelay ? `${delay - minDelay}s after` : delay === minDelay ? "in the block" : "before"} ` +
+              `a cancel scheduled when the begin lands is Ready; chain the cancel behind the begin (predecessor) within the admin ` +
+              `delay of the begin's CallScheduled, or schedule changeDefaultAdminDelay at least a day above the timelock delay`,
+          );
+    lines.push(order(adminDelay, text));
+    if (effectAt !== 0n)
+      lines.push(
+        order(
+          pendingDelay,
+          `PENDING admin-transfer delay ${pendingDelay}s in force from ${iso(effectAt)} (rollbackDefaultAdminDelay undoes it until then), timelock delay ${minDelay}s`,
+        ),
+      );
+  }
   const from = await creationBlock(hre, ctx);
   const holders = async (role: string): Promise<string[]> => {
     if (from === undefined) return [];
@@ -1220,6 +1303,24 @@ async function planDiff(
         ),
       );
     }
+    // The settlement-deadline entry (docs section 5, review G13e-1) is a plain call with no rules: nothing but the
+    // code behind the target makes it bind. A look-alike that dispatches the selector and never reverts, a contract
+    // with a catch-all fallback, a proxy or an address without code lints valid and synced with at most a yellow
+    // line, leaving the signers believing their confirmed batches expire (review G16c-1). The target's own runtime
+    // must be this repository's `SettlementDeadline` build (metadata tail excluded, as the guard's own identity
+    // check), unless the entry says `"$allowSensitive": true` for a reviewed foreign helper.
+    if (selector === DEADLINE_SELECTOR && f.$allowSensitive !== true) {
+      const helper = await hre.artifacts.readArtifact("SettlementDeadline");
+      const own = await ethers.provider.getCode(target);
+      if (own === "0x" || stripMetadata(own) !== stripMetadata(helper.deployedBytecode)) {
+        throw Error(
+          `${f.signature} on ${target}: the code at the target is not this repository's SettlementDeadline build ` +
+            `(contracts/helpers/SettlementDeadline.sol): a deadline entry binds nothing unless the stateless helper is what ` +
+            `answers it; deploy the repository's helper and pin its address, or set "$allowSensitive": true for a reviewed ` +
+            `foreign helper (review G16c-1)`,
+        );
+      }
+    }
     const k = key(target, selector);
     if (desired.has(k)) throw Error(`Duplicate function entry ${f.signature} (${selector}) on ${target}`);
     desired.set(k, { target, selector, allowValue: f.allowValue === true, rules: (f.rules ?? []).map(toRule), src: f });
@@ -1237,15 +1338,29 @@ async function planDiff(
     const bandWord = BAND_SHAPED.get(d.selector);
     if (bandWord === undefined) continue;
     let band: { lo: bigint; hi: bigint } | undefined;
+    let fixed = false; // an EqualTo / OneOf mark: judged by its lowest and highest member, on every sync
     if (!d.src.unconstrained) {
       const floor = d.rules.find((r) => r.wordIndex === bandWord && r.kind === 4);
       const ceil = d.rules.find((r) => r.wordIndex === bandWord && r.kind === 3);
-      if (!floor || !ceil) continue; // an EqualTo / OneOf mark is tight by construction
-      const [allowed, , rawRules] = await guard.functionPermission(safe, d.target, d.selector);
-      const has = (k: number) =>
-        rawRules.some((r: [bigint, bigint, string]) => Number(r[0]) === k && Number(r[1]) === bandWord);
-      if (allowed && has(3) && has(4)) continue;
-      band = { lo: BigInt(floor.value), hi: BigInt(ceil.value) };
+      const eq = d.rules.find((r) => r.wordIndex === bandWord && r.kind === 0);
+      const oneOf = (d.src.rules ?? []).find((r) => r.wordIndex === bandWord && r.kind === "OneOf" && !r.tail);
+      if (floor && ceil) {
+        const [allowed, , rawRules] = await guard.functionPermission(safe, d.target, d.selector);
+        const has = (k: number) =>
+          rawRules.some((r: [bigint, bigint, string]) => Number(r[0]) === k && Number(r[1]) === bandWord);
+        if (allowed && has(3) && has(4)) continue; // on chain already: it moves under the loosening gate
+        band = { lo: BigInt(floor.value), hi: BigInt(ceil.value) };
+      } else if (eq) {
+        band = { lo: BigInt(eq.value), hi: BigInt(eq.value) };
+        fixed = true;
+      } else if (oneOf) {
+        // A fixed-mark set read as "tight by construction" to this gate, so a far member ({the dust, 100,000 USDC}
+        // on a 1 USDC vault) synced with no flag and no word; a set grows by `addAllowedValues`, a plain widening
+        // the loosening gate never sees, so the set is judged on every sync (review G16c-2).
+        const words = (oneOf.values ?? []).map((v) => BigInt(ruleWord(oneOf, v)));
+        band = { lo: words.reduce((a, b) => (a < b ? a : b)), hi: words.reduce((a, b) => (a > b ? a : b)) };
+        fixed = true;
+      } else continue;
     }
     let assets = 0n;
     try {
@@ -1257,19 +1372,48 @@ async function planDiff(
     } catch {
       continue; // not an ERC-4626 vault: nothing to gate on
     }
-    if (assets === 0n) continue;
+    const what =
+      band === undefined
+        ? ""
+        : fixed
+          ? `a fixed mark set [${band.lo} .. ${band.hi}]`
+          : `a band [${band.lo}, ${band.hi}]`;
     let msg: string;
-    if (band === undefined) {
+    if (assets === 0n) {
+      // Nothing to mark away: an unconstrained mark passes. A band or a fixed mark on an empty vault has no settled
+      // NAV to be judged against, and the honest first mark on it (0: nothing under management) is one no band
+      // admits (the contract refuses a zero floor); this gate used to skip it, so a vacuous band ([0.01 BTC, 1 BTC]
+      // on the empty live BTC vaults) synced with no flag and no word and was never looked at again (review G16c-2).
+      if (band === undefined) continue;
+      msg = `${d.src.signature} on ${d.target} carries ${what} while the vault reports totalAssets() = 0: there is no settled NAV to band around yet and the honest first mark (0) is one no band admits; keep the entry unconstrained until the first settlement (an unconstrained mark on an empty vault passes this gate), then band around the settled NAV, or pass --allow-unconstrained-nav knowingly (review G16c-2)`;
+    } else if (band === undefined) {
       msg = `${d.src.signature} on ${d.target} is unconstrained while the vault reports totalAssets() = ${assets}: a colluding curator quorum can mark that custody away (docs section 8); put a NAV band on it, or pass --allow-unconstrained-nav`;
     } else {
       let shape: string;
       if (band.lo > assets || assets > band.hi) shape = "that does not contain";
       else if (band.hi - band.lo > assets) shape = "wider than +-50 % of";
-      else continue;
-      msg = `${d.src.signature} on ${d.target} carries a band [${band.lo}, ${band.hi}] ${shape} the vault's totalAssets() = ${assets}: a band only on paper caps nothing a colluding curator quorum marks away (docs sections 5 and 8); tighten it around the settled NAV, or pass --allow-unconstrained-nav knowingly (review G13a-1)`;
+      else {
+        // Admitted. A band is priced by its half-width: a colluding quorum moves about x^2 of NAV per settlement
+        // cycle under +-x (0.25 % at +-5 %, docs section 5; 26.8 % at +-50 %, this gate's edge, measured in review
+        // G16c), so a wide one is admitted with its price said out loud, whatever `quiet` says.
+        const half = assets - band.lo > band.hi - assets ? assets - band.lo : band.hi - assets;
+        const halfPct = Number((half * 10_000n) / assets) / 100;
+        if (!fixed && halfPct > 10)
+          console.log(
+            chalk.yellow(
+              `note: ${d.src.signature} on ${d.target}: the band [${band.lo}, ${band.hi}] is +-${halfPct} % of totalAssets() = ${assets}: ` +
+                `a colluding curator quorum can move about ${Math.round(halfPct * halfPct) / 100} % of NAV per settlement cycle under it ` +
+                `(0.25 % under the +-5 % band of docs section 5, review G16c-3)`,
+            ),
+          );
+        continue;
+      }
+      msg = `${d.src.signature} on ${d.target} carries ${what} ${shape} the vault's totalAssets() = ${assets}: a band only on paper caps nothing a colluding curator quorum marks away (docs sections 5 and 8); tighten it around the settled NAV, or pass --allow-unconstrained-nav knowingly (review G13a-1${fixed ? ", G16c-2" : ""})`;
     }
     if (!allowUnconstrainedNav) throw Error(msg);
-    say(chalk.red(`WARNING: ${msg}`));
+    // Printed whatever `quiet` says: `curator-guard-verify --op / --manifest` run the plan quietly with the entry
+    // admitted, and a signer must see what the operator's flag admitted (review G15c-3).
+    console.log(chalk.red(`WARNING: ${msg}`));
   }
 
   const onChainTargets: string[] = (await guard.targets(safe)).map((t: string) => ethers.getAddress(t));
@@ -1334,6 +1478,7 @@ async function planDiff(
         // follow the vault's live totalAssets() is the re-sync of docs section 5, not a loosening.
         let anchor: bigint | undefined;
         if (
+          NAV_FAMILY.has(d.selector) &&
           d.rules.some((r) => r.wordIndex === 0 && r.kind === 3) &&
           d.rules.some((r) => r.wordIndex === 0 && r.kind === 4)
         ) {
@@ -1360,16 +1505,34 @@ async function planDiff(
         if (shifted.length && anchor !== undefined) {
           const ceilBefore = rules.find((r) => r.wordIndex === 0 && r.kind === 3);
           const ceilAfter = d.rules.find((r) => r.wordIndex === 0 && r.kind === 3);
-          if (ceilBefore && ceilAfter) {
+          const floorAfter = d.rules.find((r) => r.wordIndex === 0 && r.kind === 4);
+          if (ceilBefore && ceilAfter && floorAfter) {
             const from = BigInt(ceilBefore.value);
             const to = BigInt(ceilAfter.value);
+            const lo = BigInt(floorAfter.value);
             const bps = from === 0n ? 0n : ((to - from) * 10_000n) / from;
+            // The ceiling's move alone read as "following the NAV" for a band that kept the NAV at its FLOOR: "+4.76 %"
+            // while the room above the NAV doubled, then "+9.99 %" from the new mark one sync later. The edges
+            // relative to the live NAV are what a reviewer needs, and a NAV sitting at an edge is said out loud
+            // (review G16c-3).
+            const below = ((anchor - lo) * 10_000n) / anchor;
+            const above = ((to - anchor) * 10_000n) / anchor;
             say(
               chalk.yellow(
-                `          band ceiling ${from} -> ${to} (${bps >= 0n ? "+" : ""}${Number(bps) / 100} %) to follow totalAssets() = ${anchor}: ` +
-                  `that number is the curator's last settled mark; the move is reviewed in the file, never confirmed by a flag`,
+                `          band now [-${Number(below) / 100} %, +${Number(above) / 100} %] around totalAssets() = ${anchor} ` +
+                  `(ceiling ${from} -> ${to}, ${bps >= 0n ? "+" : ""}${Number(bps) / 100} %): that number is the curator's last ` +
+                  `settled mark; the move is reviewed in the file, never confirmed by a flag`,
               ),
             );
+            const width = to - lo;
+            if (width > 0n && (anchor - lo <= width / 10n || to - anchor <= width / 10n))
+              say(
+                chalk.yellow(
+                  `          NOTE: the live NAV sits at the band's ${anchor - lo <= width / 10n ? "floor" : "ceiling"}: all of the ` +
+                    `band's room is on one side; a band that follows the NAV is centred on it, and one that keeps the NAV at an ` +
+                    `edge ratchets by its full width per sync (reviews G13g-8, G16c-3)`,
+                ),
+              );
           }
         }
         if (why.length) loosenings.push(`${label} on ${d.target}: ${why.join("; ")}`);
@@ -1625,10 +1788,18 @@ function loosensRules(
     const sameDirection =
       (ceilAfter >= ceilBefore && floorAfter >= floorBefore) || (ceilAfter <= ceilBefore && floorAfter <= floorBefore);
     // The width is compared relative to the band's centre (a +-5 % band around a larger NAV is wider in
-    // raw units and no looser), with one part in a million of slack for the file's rounding.
+    // raw units and no looser), with one part in a thousand of the band's own relative width as slack: a
+    // band typed in round numbers, or one computed by integer division at a six-decimal NAV, lands a few
+    // parts in a million to a few parts in ten thousand off the previous relative width, which a
+    // one-in-a-million slack read as a loosening on every honest re-sync (review G15g-4; a +-5 % band may
+    // grow to +-5.005 % unflagged, 0.005 % of NAV). The file's edges are integers (n * 95 / 100 and
+    // n * 105 / 100 both round), so the new width may also exceed the old by up to two raw units whatever
+    // the NAV: forgiven besides the slack, or a band following a NAV below about 2e7 raw units (an exit to
+    // dust) reads as a loosening (review G15a-2).
+    const widthAfter = ceilAfter - floorAfter > 2n ? ceilAfter - floorAfter - 2n : 0n;
     const notWider =
-      (ceilAfter - floorAfter) * (ceilBefore + floorBefore) * 1_000_000n <=
-      (ceilBefore - floorBefore) * (ceilAfter + floorAfter) * 1_000_001n;
+      widthAfter * (ceilBefore + floorBefore) * 1_000n <=
+      (ceilBefore - floorBefore) * (ceilAfter + floorAfter) * 1_001n;
     // Only a band that lands on the vault's live `totalAssets()` (the anchor the caller read) is a
     // re-sync; a band moved away from it is a loosening like any other.
     const anchored = anchor !== undefined && floorAfter <= anchor && anchor <= ceilAfter;
@@ -1836,7 +2007,12 @@ async function applyAsAdmin(
     }
   }
   if (pending.length) {
-    const list = pending.map((p) => `  ${p.opId}: ${p.description}\n    ${cancelHint(p.opId)}`).join("\n");
+    // Capped like the routine queue print (review G13f-1): a flood must not turn the refusal into a dump.
+    const list =
+      pending
+        .slice(0, QUEUE_PRINT_CAP)
+        .map((p) => `  ${p.opId}: ${p.description}\n    ${cancelHint(p.opId)}`)
+        .join("\n") + (pending.length > QUEUE_PRINT_CAP ? `\n  ... and ${pending.length - QUEUE_PRINT_CAP} more` : "");
     if (!args.allowPending) {
       throw Error(
         `${pending.length} operation(s) are still pending on the timelock:\n${list}\n` +
@@ -2095,7 +2271,12 @@ async function executeScheduled(
         predecessor: op.predecessor,
         deadline: deadline.toString(),
         payloads: op.calls.map((c) => c.data),
-        lifts: op.calls.some((c) => unwrapExecuteBefore(ctx.guardIface, c.data)?.data === enforceData),
+        // An `enforce` lifts a lockdown / Bypass only on a CONFIGURED Safe (the plan's predicate); on a fresh
+        // Safe it is the go-live enable, which needs no flag when the first sync is replayed by id after a
+        // reorg (review G14f-5).
+        lifts:
+          op.calls.some((c) => unwrapExecuteBefore(ctx.guardIface, c.data)?.data === enforceData) &&
+          (await safeIsConfigured(ctx.guardContract, safe)),
         kind: op.kind,
         block: op.block,
       });
@@ -2181,10 +2362,17 @@ async function executeScheduled(
     return;
   }
   if (!plan.calls.length) {
-    for (const op of pendingOps)
+    for (const op of pendingOps) {
+      // A hand-scheduled one-off (an approval, a role change, a window) is never a sync operation: this task
+      // does not execute it (review G9e-1, held) and must not advise cancelling it (review G15a-3).
       console.log(
-        chalk.yellow(`the policy is already in sync; operation ${op.opId} is still queued: ${cancelHint(op.opId)}`),
+        chalk.yellow(
+          isOneOff(ctx, op.payloads)
+            ? `operation ${op.opId} is not a policy sync (a one-off: see curator-guard-verify --op): this task does not execute it; once Ready, land it with the timelock's own execute / executeBatch, or ${cancelHint(op.opId)}`
+            : `the policy is already in sync; operation ${op.opId} is still queued: ${cancelHint(op.opId)}`,
+        ),
       );
+    }
     return;
   }
   // Every stored call must still be wanted. Extra calls in the current diff (a fast-lane change during
@@ -2195,6 +2383,18 @@ async function executeScheduled(
   for (const op of pendingOps) {
     const wanted = new Set(wrap(plan.calls, BigInt(op.deadline)));
     const stale = op.payloads.filter((p) => !wanted.has(p));
+    if (stale.length && isOneOff(ctx, op.payloads)) {
+      // A hand-scheduled one-off (an approval, a role change, a window, a hand-over step) is never a sync
+      // operation: this task does not execute it (review G9e-1, held) and must not advise cancelling it
+      // as a drifted sync (review G15a-3); `curator-guard-verify --op` gives it its own verdict.
+      console.log(
+        chalk.yellow(
+          `operation ${op.opId} is not a policy sync (a one-off: curator-guard-verify --op decodes it): this task does not ` +
+            `execute it; once Ready, land it with the timelock's own execute / executeBatch, or ${cancelHint(op.opId)}`,
+        ),
+      );
+      continue;
+    }
     if (stale.length) {
       // Superseded or drifted: never executed by this task, but still executable by ANYONE until its
       // deadline, so it is named loudly rather than failing the run (review R7C-04).
@@ -2329,6 +2529,14 @@ async function executeScheduled(
   );
 }
 
+/// A one-off operation: none of its wrapped calls is a policy mutator (the verify task's own test).
+function isOneOff(ctx: Ctx, payloads: string[]): boolean {
+  return payloads.every((p) => {
+    const inner = unwrapExecuteBefore(ctx.guardIface, p);
+    return inner === undefined || !SYNC_SELECTORS.has(inner.data.slice(0, 10));
+  });
+}
+
 function removeState(stateFile: string): void {
   for (const f of [stateFile, `${stateFile}.manifest.json`]) if (fs.existsSync(f)) fs.unlinkSync(f);
 }
@@ -2429,6 +2637,21 @@ async function pendingOperations(ctx: Ctx, scan: Scan): Promise<(ScanOp & { desc
   return out;
 }
 
+/// "Configured" as the contract's `AdminIsGuarded` predicate reads it and as `planDiff` decides whether an
+/// `enforce` is a lift: any policy state on the Safe, or a Bypass window.
+async function safeIsConfigured(guard: Contract, safe: string): Promise<boolean> {
+  const [, enforceOnChain] = await guard.requiredFallbackHandler(safe);
+  const mode = CHAIN_MODES[Number(await guard.mode(safe))];
+  return (
+    ((await guard.targets(safe)) as string[]).length > 0 ||
+    ((await guard.guardians(safe)) as string[]).length > 0 ||
+    enforceOnChain === true ||
+    mode === "Bypass" ||
+    ((await guard.modules(safe)) as string[]).length > 0 ||
+    ((await guard.multiSendUnwrappers(safe)) as string[]).length > 0
+  );
+}
+
 /// An operation rebuilt from the chain (no state file involved).
 async function rebuildOperation(ctx: Ctx, scan: Scan, id: string): Promise<ScanOp & { salt: string }> {
   if (!/^0x[0-9a-fA-F]{64}$/.test(id)) throw Error(`--op ${id} is not an operation id`);
@@ -2471,11 +2694,18 @@ async function creationBlock(hre: HardhatRuntimeEnvironment, ctx: Ctx): Promise<
     if (Number(explicit) > head) throw Error(`timelock block ${explicit} is after the chain head ${head}`);
     return Number(explicit);
   }
+  // The guard's own logs (council and guardian grants, approvals, forbidden hashes, revocations) start at
+  // the guard's creation, which only the FIRST admin timelock precedes: after a hand-over the successor's
+  // record starts later than every grant made before it, so the scan takes the earliest record it has
+  // (review G15a-1: "council: none" after a hand-over while hasRole said yes).
   const all = await hre.deployments.all();
+  let earliest: number | undefined;
   for (const who of [ctx.admin, ctx.guard]) {
     const d = Object.values(all).find((x) => lower(x.address) === lower(who));
-    if (d?.receipt?.blockNumber !== undefined) return Number(d.receipt.blockNumber);
+    const b = d?.receipt?.blockNumber;
+    if (b !== undefined && (earliest === undefined || Number(b) < earliest)) earliest = Number(b);
   }
+  if (earliest !== undefined) return earliest;
   if (ctx.forkLike) {
     const from = Math.max(0, (await hre.ethers.provider.getBlockNumber()) - 50_000);
     console.log(
@@ -3421,6 +3651,22 @@ function validatePolicy(p: unknown): string[] {
         if (hiW > loW * 100n)
           warnings.push(
             `${where}: the NAV band on word ${bandWord} spans [${loW}, ${hiW}], a ceiling more than 100 times the floor: it reads as a band and caps nothing (a NAV band sits around the settled NAV; the sync refuses its first sync unless the vault's live totalAssets() sits inside it and the band is no wider than +-50 % of it, or --allow-unconstrained-nav is given knowingly)`,
+          );
+      }
+      // A fixed mark set (EqualTo / OneOf on the NAV word) with one member far from another is the same band on
+      // paper in another shape; the sync judges the set's lowest and highest member against the live NAV on every
+      // sync (review G16c-2).
+      const fixedWords = (rules as PolicyRule[])
+        .filter((r) => r.wordIndex === bandWord && !r.tail && (r.kind === "EqualTo" || r.kind === "OneOf"))
+        .flatMap((r) =>
+          r.kind === "OneOf" ? (r.values ?? []).map((v) => BigInt(toWord(v))) : [BigInt(toWord(r.value!))],
+        );
+      if (fixedWords.length) {
+        const minW = fixedWords.reduce((a, b) => (a < b ? a : b));
+        const maxW = fixedWords.reduce((a, b) => (a > b ? a : b));
+        if (maxW > minW * 100n)
+          warnings.push(
+            `${where}: the fixed NAV mark set on word ${bandWord} spans [${minW}, ${maxW}], a member more than 100 times another: it reads as a fixed mark and caps nothing (the sync judges the set's lowest and highest member against the vault's live totalAssets() on every sync, review G16c-2)`,
           );
       }
     }

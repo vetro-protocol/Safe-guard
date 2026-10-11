@@ -9,8 +9,8 @@ import {ISafe} from "contracts/interfaces/safe/ISafe.sol";
 import {Operation} from "contracts/interfaces/safe/ISafeGuard.sol";
 import {CuratorGuardTestBase, MockProtocol} from "test/guards/CuratorGuardTestBase.sol";
 
-/// @title G9a-1 (round 9, Safe-integration lens): `executeBefore` re-dispatches a forwarded after-hook
-///        at its canonical length.
+/// @title G9a-1 (round 9, Safe-integration lens): `executeBefore` re-dispatched a forwarded after-hook
+///        at its canonical length; refused since the round-13 follow-up, which the tests pin.
 /// @dev   V2-89 closed forwarded hook calls (a Safe whose fallback handler is this guard forwards every
 ///        unknown selector to it with the Safe as `msg.sender` and the caller's 20 bytes appended) with
 ///        two checks: no approval is spent while the handler slot holds the guard, and an after-hook must
