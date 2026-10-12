@@ -10,7 +10,11 @@ for f in policies/curator-guard/lint-corpus/refuse-*.json; do
   # A refuse-* case is refused for ITS reason, not for a typo elsewhere in the file: when a
   # `<name>.reason` file sits next to it, that text must occur in the lint's output (review G9e-3).
   # An empty pattern would match anything, so an empty .reason file is a failure (review G11e-2).
-  elif [ -f "${f%.json}.reason" ] && [ -z "$(cat "${f%.json}.reason")" ]; then
+  # A refuse-* case without a .reason passes for ANY refusal (a JSON typo, a wrong key): every case names its
+  # reason, so a missing file is a failure too (review G21f; `refuse-x.json.reason` is a missing file).
+  elif [ ! -f "${f%.json}.reason" ]; then
+    echo "FAIL: ${f%.json}.reason is missing (the case would pass for any refusal)"; status=1
+  elif [ -z "$(cat "${f%.json}.reason")" ]; then
     echo "FAIL: ${f%.json}.reason is empty (it would match any refusal)"; status=1
   elif [ -f "${f%.json}.reason" ] && ! grep -qF -- "$(cat "${f%.json}.reason")" <<< "$out"; then
     echo "FAIL: $f was refused for another reason: $(echo "$out" | grep -m1 -E '^Error' || echo "$out" | tail -1)"; status=1

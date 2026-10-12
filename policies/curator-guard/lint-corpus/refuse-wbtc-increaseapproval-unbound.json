@@ -1,0 +1,20 @@
+{
+  "$comment": "review G21d corpus case",
+  "chainId": 1,
+  "safe": "0x1b534a8543212F5957168D83311A41E0Ea1cfe48",
+  "mode": "Enforced",
+  "requiredFallbackHandler": {
+    "handler": "0x0000000000000000000000000000000000000000",
+    "enforce": true
+  },
+  "guardians": [],
+  "multiSendUnwrappers": [],
+  "modules": [],
+  "nativeTransfers": [],
+  "functions": [
+    {
+      "target": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
+      "signature": "increaseApproval(address,uint256)"
+    }
+  ]
+}

@@ -2,6 +2,7 @@ import fs from "fs";
 import chalk from "chalk";
 import {
   AbiCoder,
+  Interface as EthersInterface,
   FunctionFragment,
   ParamType,
   getAddress,
@@ -34,7 +35,7 @@ import { SAFE_BATCH_TXS_FILE, executeBatchUsingSafe, saveForSafeBatchExecution }
 ///     for `LOCKDOWN_COOLDOWN` after any lockdown, and bundled with the rest it would take the whole
 ///     batch down with it. After `minDelay` anyone runs the same command with `--execute`. The salt
 ///     carries a counter, so a repeated diff schedules a NEW operation; the ones in flight are
-///     persisted per chain + guard (next to the Safe batch file) and `--execute` replays exactly them,
+///     persisted per chain + guard + Safe (next to the Safe batch file) and `--execute` replays exactly them,
 ///     re-deriving every operation id from the stored payloads (or rebuilding them from the timelock's
 ///     own `CallScheduled` logs with `--op`), refusing a drifted diff, a passed deadline or an
 ///     operation the proposer never scheduled. An operation named with `--op` may also carry calls
@@ -164,6 +165,29 @@ const ALLOWANCE_LIST: [string, number[]][] = [
   ["withdraw((address,address,address,address,uint256),uint256,uint256,address,address)", [8]], // Morpho Blue receiver
   ["withdrawCollateral((address,address,address,address,uint256),uint256,address,address)", [7]],
   ["borrow((address,address,address,address,uint256),uint256,uint256,address,address)", [8]],
+  // Review G21d-2: operator / credit grants in other names and the onBehalf / receiver words of the venues an operator
+  // adds first (Aave v3, Morpho Blue, Compound v3, the Uniswap periphery): each named word is where custody, or a
+  // standing right over it, goes.
+  ["setAuthorization(address,bool)", [0]], // Morpho Blue: an operator over every position of the Safe
+  ["allow(address,bool)", [0]], // Compound v3 (Comet): a manager over the Safe's balances
+  ["approveDelegation(address,uint256)", [0]], // Aave v3 debt tokens: borrowing on the Safe's collateral
+  ["repay(address,uint256,uint256,address)", [3]], // Aave v3 onBehalfOf: the Safe pays that account's debt
+  ["flashLoan(address,address[],uint256[],uint256[],address,bytes,uint16)", [0, 4]], // Aave v3: in debt mode the receiver keeps the funds, onBehalfOf owes them
+  ["repay((address,address,address,address,uint256),uint256,uint256,address,bytes)", [7]], // Morpho Blue onBehalf
+  ["supplyCollateral((address,address,address,address,uint256),uint256,address,bytes)", [6]], // Morpho Blue onBehalf
+  ["supplyTo(address,address,uint256)", [0]], // Compound v3 dst
+  ["withdrawTo(address,address,uint256)", [0]],
+  ["withdrawFrom(address,address,address,uint256)", [0, 1]],
+  ["transferAsset(address,address,uint256)", [0]],
+  ["transferAssetFrom(address,address,address,uint256)", [0, 1]],
+  ["depositETH(address,address,uint16)", [1]], // Aave WETH gateway onBehalfOf (a payable entry: the value follows the word)
+  ["sweepToken(address,uint256,address)", [2]], // Uniswap periphery recipient
+  ["unwrapWETH9(uint256,address)", [1]],
+  ["collect((uint256,address,uint128,uint128))", [1]], // Uniswap V3 positions: the fee recipient
+  ["mint((address,address,uint24,int24,int24,uint256,uint256,uint256,uint256,address,uint256))", [9]], // the position's recipient
+  // OpenZeppelin 1.x (WBTC): allowance-shaped like `increaseAllowance`, moved here from the self-dispatch list, where the
+  // marker admitted it with no spender rule at all (review G21d-3).
+  ["increaseApproval(address,uint256)", [0]],
 ];
 // Functions that change who controls a contract or what code it runs: never routine curator work.
 // Refused unless the entry carries `"$allowSensitive": true`.
@@ -241,7 +265,11 @@ const SELF_DISPATCH_LIST = [
   "batch(bytes[])",
   "approveAndCall(address,uint256,bytes)",
   "approveAndCall(address,uint256)", // ERC-1363 two-argument form: the spender's onApprovalReceived runs as the Safe
-  "increaseApproval(address,uint256)",
+  // Review G21d-1: the batch engines an operator meets first, each a command list with recipients inside its inputs.
+  "execute(bytes,bytes[])", // Uniswap Universal Router
+  "execute(bytes,bytes[],uint256)",
+  "multicall((address,bytes,uint256,bool,bytes32)[])", // Morpho Bundler3
+  "modifyLiquidities(bytes,uint256)", // Uniswap v4 positions
 ];
 // Other signatures the diff prints by name and that a look-alike may not shadow.
 const OTHER_KNOWN = [
@@ -278,7 +306,10 @@ const KNOWN_SIGNATURES = new Map<string, string>(
 // the one NAV control that needs no curator signature (docs/curator-guard.md sections 5 and 8).
 const BAND_SHAPED = new Map<string, number>([[selectorOfSignature("updateNewTotalAssets(uint256)"), 0]]);
 // The settles of a NAV-shaped target: they repeat the pending mark, so a band on the mark must be repeated on them.
-const SETTLE_SIGNATURES = ["settleDeposit(uint256)", "settleRedeem(uint256)"];
+// `close(uint256)` is the third settle: it repeats the pending mark the same way (`ERC7540Lib.updateTotalAssets`,
+// `WrongNewTotalAssets` otherwise) and then pulls `totalAssets` from the Safe, so a band on the mark is repeated on it
+// too (review G21d-4).
+const SETTLE_SIGNATURES = ["settleDeposit(uint256)", "settleRedeem(uint256)", "close(uint256)"];
 /// The mark and its settles: the only functions whose word-0 band follows the vault's live `totalAssets()` (the
 /// shift exemption of review G12c-1 reads the anchor for these alone; any other word-0 band moves under the
 /// loosening gate, review G15c).
@@ -333,6 +364,39 @@ const MIGRATION_NAMES = new Map<string, string>(MIGRATION_SIGNATURES.map((sig) =
 const HANDLER_REINSTALLING = new Set(
   ["migrateWithFallbackHandler()", "migrateL2WithFallbackHandler()"].map(selectorOfSignature),
 );
+// The Safe's own configuration calls, by signature: what an approved self-call decodes through (review G21c-1).
+const SAFE_SELF_CALL_SIGNATURES = [
+  "setGuard(address)",
+  "setModuleGuard(address)",
+  "setFallbackHandler(address)",
+  "enableModule(address)",
+  "disableModule(address,address)",
+  "addOwnerWithThreshold(address,uint256)",
+  "removeOwner(address,address,uint256)",
+  "swapOwner(address,address,address)",
+  "changeThreshold(uint256)",
+];
+/// Every signature the prints know, as one ABI: an approved payload's ARGUMENTS are decoded through it, so the veto
+/// reads `setGuard(0x…)` and `updateSafe(0x…)` with their addresses and a co-signed NAV with its mark, instead of a
+/// name next to a hex string (review G21c-1: a swap, a decommission and a hostile swap printed the same line).
+const APPROVED_PAYLOAD_INTERFACE = new EthersInterface(
+  [...new Set([...KNOWN_SIGNATURES.values(), ...MIGRATION_SIGNATURES, ...SAFE_SELF_CALL_SIGNATURES])].map(
+    (sig) => `function ${sig}`,
+  ),
+);
+/// `name(arg, …)` for a payload whose signature is known and whose encoding is canonical; `undefined` otherwise (the
+/// caller falls back to the name alone, which it then marks as undecoded).
+function describeArgs(data: string): string | undefined {
+  try {
+    const parsed = APPROVED_PAYLOAD_INTERFACE.parseTransaction({ data });
+    if (!parsed) return undefined;
+    const text = (v: unknown): string =>
+      typeof v === "bigint" ? v.toString() : Array.isArray(v) ? `[${v.map(text).join(", ")}]` : String(v);
+    return `${parsed.name}(${parsed.args.map(text).join(", ")})`;
+  } catch {
+    return undefined;
+  }
+}
 
 /// `tail`: the rule binds `keccak256(calldata[4 + 32 * wordIndex:])`, the whole tail from that word
 /// (`wordIndex` must be the FIRST dynamic parameter's head word, so every offset word is inside the hash)
@@ -480,7 +544,7 @@ task("curator-guard-sync", "Reconcile a CuratorGuard policy for a Safe against a
   .addFlag("allowUnlock", "Required to move an already configured Safe out of Lockdown / Bypass into Enforced")
   .addFlag(
     "confirmRevocations",
-    "Required when the diff revokes functions, values, unwrappers, modules, native transfers or guardians",
+    'Required when the diff revokes functions, values, unwrappers, modules, native transfers or guardians, or locks the Safe down ("mode": "Lockdown" on a Safe that is not locked)',
   )
   .addFlag(
     "confirmLoosening",
@@ -523,7 +587,15 @@ task("curator-guard-sync", "Reconcile a CuratorGuard policy for a Safe against a
           // A flood is itself the incident (review G13f-1): the timelock caps nothing, a bare operation never
           // expires, and every run pays one read per scanned id, so the print is capped and the burst named.
           for (const q of queue.slice(0, QUEUE_PRINT_CAP))
-            console.log(chalk.yellow(`  ${q.opId} (scheduled in block ${q.block}): ${q.description}`));
+            console.log(
+              chalk.yellow(
+                `  ${q.opId} (scheduled in block ${q.block}${
+                  q.rescheduled
+                    ? `, RE-SCHEDULED after a cancel, ${q.rescheduled} time(s): an earlier cancel of this id no longer holds`
+                    : ""
+                }): ${q.description}`,
+              ),
+            );
           if (queue.length > QUEUE_PRINT_CAP)
             console.log(
               chalk.yellow(
@@ -633,6 +705,9 @@ task(
         let syncShaped = 0;
         let nested = 0;
         let pendingNamed = 0;
+        const now = BigInt((await hre.ethers.provider.getBlock("latest"))!.timestamp);
+        let pendingCalls = 0;
+        const siblings = new Set<string>();
         for (const id of args.op!.split(",")) {
           const op = await rebuildOperation(ctx, scan, id.trim());
           const ts: bigint = await ctx.timelock.getTimestamp(op.opId);
@@ -643,7 +718,10 @@ task(
           console.log(
             chalk.blue(
               `operation ${op.opId}: ${ts === 0n ? "NOT scheduled" : ts === 1n ? "executed" : `ready at ${iso(ts)}`}, ` +
-                `predecessor ${op.predecessor}, scheduled in block ${op.block}`,
+                `predecessor ${op.predecessor}, scheduled in block ${op.block}` +
+                (op.rescheduled
+                  ? ` (RE-SCHEDULED after a cancel, ${op.rescheduled} time(s): an earlier cancel of this id no longer holds)`
+                  : ""),
             ),
           );
           for (const [i, c] of op.calls.entries()) {
@@ -652,12 +730,29 @@ task(
             // A value on the call is never what a sync schedules (the `--manifest` path checks it the same way; the guard's
             // `executeBefore` is not payable, so such an operation cannot even execute; review G17b-5).
             const stillWanted = guardTarget && c.value === 0n && inner !== undefined && wanted.has(inner.data);
+            // A target that is not --guard but whose calldata decodes through the guard's ABI is a sibling guard under
+            // this timelock (the replacement guard of section 7.5): its sync is judged against ITS file, by a run with
+            // --guard <sibling>, never read here as a one-off to cancel (review G21b-2).
+            const sibling =
+              !guardTarget && lower(c.target) !== lower(ctx.admin) && isGuardShapedCall(ctx.guardIface, c.data);
             if (!done) {
+              ++pendingCalls;
               allMatch &&= stillWanted;
               if (guardTarget && inner !== undefined && SYNC_SELECTORS.has(inner.data.slice(0, 10))) ++syncShaped;
               if (guardTarget && isNestedWrapper(ctx.guardIface, c.data)) ++nested;
+              if (sibling) siblings.add(getAddress(c.target));
             }
             const [first, ...rest] = describeTimelockCall(ctx, c.target, c.data).split("\n");
+            // A wrapper whose deadline is behind the clock, or behind the Ready time, can never execute: the timelock
+            // accepted it at proposal, the proposer signed it, and only the veto can clear it (review G21c-3).
+            const deadline =
+              done || inner === undefined
+                ? ""
+                : inner.deadline < now
+                  ? chalk.red("  [DEADLINE PASSED: it can never execute; cancel it from the canceller Safe]")
+                  : ts > 1n && inner.deadline < ts
+                    ? chalk.red("  [DEAD ON ARRIVAL: the executeBefore deadline precedes the Ready time; cancel it]")
+                    : "";
             console.log(
               `  [${i}] ${first}` +
                 (done
@@ -666,8 +761,11 @@ task(
                     ? stillWanted
                       ? chalk.green("  (in the current diff)")
                       : chalk.red("  (NOT in the current diff)")
-                    : chalk.red("  (NOT a guard call)")) +
+                    : sibling
+                      ? chalk.yellow("  (a SIBLING guard's call: not judged against this guard's file)")
+                      : chalk.red("  (NOT a guard call)")) +
                 (c.value !== 0n ? chalk.red(`  value ${c.value}`) : "") +
+                deadline +
                 rest.map((line) => `\n${line}`).join(""),
             );
           }
@@ -683,6 +781,18 @@ task(
             ),
           );
           return;
+        }
+        if (!allMatch && syncShaped === 0 && siblings.size && pendingCalls > 0 && nested === 0) {
+          if (siblingCallsOnly(ctx, args.op!, scan, siblings)) {
+            console.log(
+              chalk.yellow(
+                `every pending call named addresses ${[...siblings].join(", ")}: a guard under this timelock that is not --guard ` +
+                  `(the replacement guard of section 7.5, or a selector collision). Its policy sync is judged by a run with ` +
+                  `--guard <that address> and that guard's own policy file; never cancel it as abandoned on this verdict`,
+              ),
+            );
+            return;
+          }
         }
         if (!allMatch && syncShaped === 0) {
           // A wrapper inside a wrapper is no recipe's product (review G19c-2): the innermost call is decoded on its
@@ -847,6 +957,18 @@ async function verifyManifest(
     if (i > 0 && lower(predecessor) !== lower(previousId)) {
       allMatch = false;
       console.log(chalk.red(`  predecessor is not operation #${i - 1}: the chain of operations is not the manifest's`));
+    }
+    // The sync chains only its own lift behind its own body: a first operation that waits for ANOTHER operation
+    // (one this manifest does not contain, hostile or stale) can never execute before that one is Done, and a
+    // single-operation manifest has no later operation whose check would notice (review G21c-2).
+    if (i === 0 && lower(predecessor) !== ZERO_HASH) {
+      allMatch = false;
+      console.log(
+        chalk.red(
+          `  operation #0 is chained behind ${predecessor}, an operation this manifest does not contain: no sync does that ` +
+            "(it cannot execute until that operation is Done); ask for a fresh proposal",
+        ),
+      );
     }
     if (delay !== minDelay) {
       allMatch = false;
@@ -1037,6 +1159,12 @@ async function guardContext(
 ): Promise<Ctx> {
   const { ethers } = hre;
   if (!/^0x[0-9a-fA-F]{40}$/.test(guardAddress)) throw Error(`--guard must be an address, got ${guardAddress}`);
+  // A mixed-case address whose EIP-55 checksum does not match is a typo (ethers throws a bare TypeError on it;
+  // review G21b-6): say so, with the checksummed form of the same bytes.
+  if (!isAddress(guardAddress))
+    throw Error(
+      `--guard ${guardAddress}: the EIP-55 checksum does not match (did you mean ${getAddress(lower(guardAddress))}? paste the address from the deployment record)`,
+    );
   const guard = ethers.getAddress(guardAddress);
   const chainId = await hre.getChainId();
   const forkLike = await isRehearsal(hre);
@@ -1172,6 +1300,7 @@ async function governanceSummary(hre: HardhatRuntimeEnvironment, ctx: Ctx): Prom
           .curatorGuardCouncil
       : "";
   if (
+    from !== undefined &&
     bookCouncil &&
     !council.some((c) => lower(c) === lower(bookCouncil)) &&
     (await g.hasRole(councilRole, bookCouncil))
@@ -1179,6 +1308,13 @@ async function governanceSummary(hre: HardhatRuntimeEnvironment, ctx: Ctx): Prom
     throw Error(
       `log stream incomplete: ${bookCouncil} holds COUNCIL_ROLE but no RoleGranted log was found since block ${from}: ` +
         `the scan starts after the grant (pass the timelock's creation block) or the provider drops logs`,
+    );
+  // With no range at all (no deployment record, no --timelock-block) nothing was scanned: that is the diagnosis, not a
+  // dropped log stream (the text above blamed the provider "since block undefined"; review G21b-11).
+  if (from === undefined && bookCouncil && (await g.hasRole(councilRole, bookCouncil)))
+    throw Error(
+      `the creation block of the timelock ${ctx.admin} is unknown (no deployment record for this network): pass ` +
+        `--timelock-block <N> or set CURATOR_GUARD_TIMELOCK_BLOCK; nothing can be listed before that`,
     );
   const unknown = from === undefined ? "(unknown: no log range, pass --timelock-block)" : "none";
   lines.push(`council: ${council.length ? council.join(", ") : unknown}`);
@@ -1318,8 +1454,11 @@ async function planDiff(
   let revocations = 0;
   const loosenings: string[] = [];
   const push = (description: string, fn: string, params: unknown[], list: Call[] = calls) => {
+    // A `lockdown` (the file says "mode": "Lockdown" for a Safe that is not locked: a retired file reused as a template,
+    // or a typo) is the widest narrowing there is and went through with no flag (review G21b-7).
     if (
       NARROWING.has(fn) ||
+      fn === "lockdown" ||
       (/^set(MultiSendUnwrapper|ModuleAllowed|NativeTransferAllowed|Guardian)$/.test(fn) &&
         params[params.length - 1] === false)
     ) {
@@ -2237,9 +2376,21 @@ async function applyAsAdmin(
   const guardIface = ctx.guardIface;
   const wrap = (list: Call[], deadline: bigint) =>
     list.map((c) => guardIface.encodeFunctionData("executeBefore", [deadline, c.data]));
-  const stateFile = `${SAFE_BATCH_TXS_FILE}.timelock.${chainId}.${lower(guard)}.json`;
+  // Keyed by chain, guard AND Safe: a guard serves any number of Safes, and one file for two Safes carried the first
+  // Safe's in-flight operation into the second Safe's run (judged against the wrong diff and advised "cancel it"),
+  // locked the first Safe's --execute out ("belongs to ... Safe B") and overwrote its signer manifest (review G21b-1).
+  const stateFile = `${SAFE_BATCH_TXS_FILE}.timelock.${chainId}.${lower(guard)}.${lower(safe)}.json`;
+  const legacyStateFile = `${SAFE_BATCH_TXS_FILE}.timelock.${chainId}.${lower(guard)}.json`;
   const readScheduled = (): Scheduled | undefined => {
-    if (!fs.existsSync(stateFile)) return undefined;
+    if (!fs.existsSync(stateFile)) {
+      if (fs.existsSync(legacyStateFile))
+        console.log(
+          chalk.yellow(
+            `note: ${legacyStateFile} is a state file of the older, guard-keyed layout: rename it to ${stateFile} if its operations are this Safe's, or leave it to the Safe they belong to (its "safe" field says which)`,
+          ),
+        );
+      return undefined;
+    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
@@ -2272,6 +2423,7 @@ async function applyAsAdmin(
       cancelHint,
       signer,
       impersonate,
+      meta.policyText,
     );
     return;
   }
@@ -2304,7 +2456,9 @@ async function applyAsAdmin(
         `${pending.length} operation(s) are still pending on the timelock:\n${list}\n` +
           `cancel what is abandoned, or pass --allow-pending to schedule the NEW diff next to them (it re-includes every ` +
           `unapplied call of a pending sync operation and supersedes it: execute the new one, cancel the old one; an operation ` +
-          `of a SIBLING guard under this timelock, section 7.5, is not abandoned: schedule next to it and leave it to its own --execute)`,
+          `of a SIBLING guard under this timelock, section 7.5, or of ANOTHER SAFE under this guard, is not abandoned: schedule ` +
+          `next to it and leave it to its own --execute; a pending operation that is YOURS, scheduled by a run that crashed ` +
+          `before it wrote the state file, is landed after its delay with --execute --op <id>, never scheduled twice)`,
       );
     }
     console.log(chalk.yellow(`WARNING: scheduling next to ${pending.length} pending operation(s):\n${list}`));
@@ -2336,7 +2490,7 @@ async function applyAsAdmin(
   );
   if (gas > BATCH_GAS_REFUSE && !args.allowLargeBatch) {
     throw Error(
-      `the batch is estimated at ${gas} gas, above ${BATCH_GAS_REFUSE} (one transaction, EIP-7825 caps it at 16.7M): split the ` +
+      `the batch is estimated at ${gas} gas, above ${BATCH_GAS_REFUSE} (one transaction; EIP-7825 caps its execution gas at 16.7M, and after Glamsterdam the estimate includes state gas): split the ` +
         `policy change over several syncs, or pass --allow-large-batch`,
     );
   }
@@ -2536,6 +2690,7 @@ async function executeScheduled(
   cancelHint: (id: string) => string,
   signer: Signer | undefined,
   impersonate: (who: string) => Promise<Signer>,
+  policyText: string,
 ): Promise<void> {
   const { ethers } = hre;
   const timelock = ctx.timelock!;
@@ -2614,6 +2769,17 @@ async function executeScheduled(
         `${stateFile} belongs to chain ${stored.chainId} / timelock ${stored.timelock} / guard ${stored.guard} / Safe ${stored.safe}, not this run`,
       );
     }
+    // The file names the policy file it was prepared from: a stale clone, an older copy or an edit since scheduling
+    // otherwise reads as "the chain drifted" below, with the advice to cancel (review G21b-3).
+    const liveHash = ethers.keccak256(ethers.toUtf8Bytes(policyText));
+    if (stored.policyHash && lower(stored.policyHash) !== lower(liveHash))
+      console.log(
+        chalk.yellow(
+          `WARNING: ${stateFile} was prepared from a policy file with keccak ${stored.policyHash}; this run's file hashes to ` +
+            `${liveHash} (a stale or edited clone, or an edit since scheduling): a call reported below as "not what the current ` +
+            `diff wants" may be this file's doing, not the chain's; compare the two files before cancelling anything`,
+        ),
+      );
     ops = [];
     for (const op of stored.operations) {
       // The file is a convenience cache: the id is re-derived from its payloads, and an id the chain
@@ -2737,6 +2903,22 @@ async function executeScheduled(
       );
       continue;
     }
+    // A sync for ANOTHER Safe under this guard (named with --op, or carried by an older guard-keyed state file) is not
+    // drift and not abandoned: it belongs to that Safe's policy file and its own --execute (review G21b-1).
+    const otherSafes = new Set(
+      stale
+        .map((p) => syncCallSafe(ctx.guardIface, p))
+        .filter((s): s is string => s !== undefined && lower(s) !== lower(safe)),
+    );
+    if (stale.length && otherSafes.size && stale.every((p) => otherSafes.has(syncCallSafe(ctx.guardIface, p) ?? ""))) {
+      console.log(
+        chalk.yellow(
+          `operation ${op.opId} is a policy sync for another Safe under this guard (${[...otherSafes].join(", ")}), not for ` +
+            `${safe}: run --execute with that Safe's policy file; it is not abandoned`,
+        ),
+      );
+      continue;
+    }
     if (stale.length) {
       // Superseded or drifted: never executed by this task, but still executable by ANYONE until its
       // deadline, so it is named loudly rather than failing the run (review R7C-04).
@@ -2836,7 +3018,7 @@ async function executeScheduled(
       const gasNow = await ethers.provider.estimateGas({ from, to: admin, data });
       if (gasNow > BATCH_GAS_REFUSE && !args.allowLargeBatch)
         throw Error(
-          `operation ${op.opId} is estimated at ${gasNow} gas now, above ${BATCH_GAS_REFUSE} (EIP-7825 caps a transaction at 16.7M): ` +
+          `operation ${op.opId} is estimated at ${gasNow} gas now, above ${BATCH_GAS_REFUSE} (EIP-7825 caps a transaction's execution gas at 16.7M; after Glamsterdam the estimate includes state gas): ` +
             `cancel it and re-sync in smaller batches, or pass --allow-large-batch`,
         );
       if (gasNow > BATCH_GAS_WARN)
@@ -2939,6 +3121,9 @@ type ScanOp = {
   block: number;
   salt?: string;
   kind?: "single" | "batch";
+  /// Times the same id was scheduled again (the timelock refuses a pending or done id, so each repeat follows a
+  /// cancel): the veto's earlier cancel of this id no longer holds (review G21c-4).
+  rescheduled?: number;
 };
 type Scan = {
   from: number | undefined;
@@ -2991,13 +3176,19 @@ async function timelockScan(hre: HardhatRuntimeEnvironment, ctx: Ctx, tolerate: 
   }
   for (const l of logs) {
     const a = (l as EventLog).args;
-    const op = ops.get(a.id) ?? {
+    const op: ScanOp = ops.get(a.id) ?? {
       opId: a.id,
       calls: [],
       predecessor: a.predecessor,
       delay: a.delay,
       block: l.blockNumber,
     };
+    // A second first-call log of the same id is a re-schedule after a cancel: name the LAST schedule's block, and
+    // count the repeats (review G21c-4: the print named the first block, as if the cancelled one were still there).
+    if (Number(a.index) === 0 && l.blockNumber !== op.block) {
+      op.rescheduled = (op.rescheduled ?? 0) + 1;
+      op.block = l.blockNumber;
+    }
     op.calls[Number(a.index)] = { target: a.target, value: a.value, data: a.data };
     ops.set(a.id, op);
   }
@@ -3138,6 +3329,22 @@ async function scanLogs(
     } catch (e: unknown) {
       if (chunk <= 1_000) throw Error(`log scan failed for blocks ${a}-${b}: ${errorText(e)}`);
       chunk = Math.floor(chunk / 4);
+    }
+  }
+  // A provider that silently keeps only the FIRST logs of an answer passes every canary above (the grants they
+  // look for are the oldest logs) and reads a pending operation as "no operation pending" (review G21b-10): the
+  // blocks after the newest log the provider returned are asked for again on their own, and that answer must be
+  // empty. One extra request per filter that returned anything.
+  if (out.length) {
+    const newest = out.reduce((m, l) => (l.blockNumber > m ? l.blockNumber : m), from);
+    if (newest < head) {
+      const more = await contract.queryFilter(filter, newest + 1, head);
+      if (more.length)
+        throw Error(
+          `log stream incomplete: the provider answered blocks ${from}-${head} with nothing after block ${newest}, yet ` +
+            `blocks ${newest + 1}-${head} hold ${more.length} more log(s) of the same filter (the provider truncates answers): ` +
+            `no list rebuilt from it (the queue, the roles, the approvals) can be trusted; use an RPC that answers completely`,
+        );
     }
   }
   return out;
@@ -3293,6 +3500,25 @@ const SYNC_CALLS = new Set([
 const SENSITIVE_CALL =
   /^(grantRole|revokeRole|renounceRole|beginDefaultAdminTransfer|cancelDefaultAdminTransfer|acceptDefaultAdminTransfer|changeDefaultAdminDelay|rollbackDefaultAdminDelay|setDeploymentGuardian|setGuardian|setUnwrapperCodehash|bypass|enforce|lockdownAndRevoke|approveTransaction|revokeApproval|revokeAllApprovals)\b/;
 
+/// `true` when `data` decodes through the guard's ABI (a sibling guard's call when the target is not this guard).
+function isGuardShapedCall(iface: Interface, data: string): boolean {
+  try {
+    return iface.parseTransaction({ data }) !== null;
+  } catch {
+    return false;
+  }
+}
+
+/// `true` when every call of the operations named with --op addresses one of `siblings` (the verify verdict's test).
+function siblingCallsOnly(ctx: Ctx, opArg: string, scan: Scan, siblings: Set<string>): boolean {
+  for (const id of opArg.split(",")) {
+    const op = scan.ops.get(id.trim()) ?? scan.ops.get(lower(id.trim()));
+    if (!op) return false;
+    for (const c of op.calls) if (!siblings.has(getAddress(c.target))) return false;
+  }
+  return true;
+}
+
 /// The guard call inside an `executeBefore` wrapper, by name, or `undefined` for anything else.
 function innerGuardCall(iface: Interface, payload: string): { name: string; data: string } | undefined {
   const inner = unwrapExecuteBefore(iface, payload);
@@ -3309,6 +3535,18 @@ const isSyncCall = (iface: Interface, payload: string): boolean => {
   const name = innerGuardCall(iface, payload)?.name;
   return name !== undefined && SYNC_CALLS.has(name);
 };
+
+/// The Safe a wrapped sync call is for (its first argument), or `undefined` for anything that is not a sync call.
+function syncCallSafe(iface: Interface, payload: string): string | undefined {
+  const inner = unwrapExecuteBefore(iface, payload);
+  if (!inner) return undefined;
+  try {
+    const parsed = iface.parseTransaction({ data: inner.data });
+    return parsed && SYNC_CALLS.has(parsed.name) ? String(parsed.args[0]) : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /// A wrapper inside a wrapper (`executeBefore(d1, executeBefore(d2, call))`): the guard runs it (the delegatecall keeps
 /// the caller), the sync and every runbook recipe wrap exactly once, and the one-level decoders above see only the inner
@@ -3420,6 +3658,8 @@ function describeGuardCall(iface: Interface, data: string): string {
       String(parsed.args[2]),
       String(parsed.args[4]),
       BigInt(parsed.args[5]),
+      0,
+      BigInt(parsed.args[3]),
     );
     return `${text}\n      authorises ${authorised}`;
   } catch {
@@ -3457,10 +3697,27 @@ function unpackMultiSend(data: string): PackedEntry[] | undefined {
 
 /// One level of what an approval authorises: a Safe self-call by name, a plain call by selector, a
 /// delegatecall by library (a canonical `MultiSend` batch entry by entry, each entry described the same way).
-function describeApprovedPayload(safe: string, to: string, data: string, operation: bigint, depth = 0): string {
+function describeApprovedPayload(
+  safe: string,
+  to: string,
+  data: string,
+  operation: bigint,
+  depth = 0,
+  value = 0n,
+): string {
   const pad = "        " + "  ".repeat(depth);
   const sel = data.length >= 10 ? lower(data.slice(0, 10)) : "0x";
-  const name = data.length <= 2 ? "(empty calldata)" : (KNOWN_SIGNATURES.get(sel) ?? MIGRATION_NAMES.get(sel) ?? sel);
+  // The arguments are the custody (review G21c-1): a known signature is printed with them; a known name whose payload
+  // does not decode (a non-canonical encoding) is printed by name and said to be undecoded; a batch head stays a name.
+  const known = KNOWN_SIGNATURES.get(sel) ?? MIGRATION_NAMES.get(sel);
+  const decoded = sel === MULTISEND_SELECTOR ? undefined : describeArgs(data);
+  const name =
+    data.length <= 2
+      ? "(empty calldata)"
+      : sel === MULTISEND_SELECTOR
+        ? (known ?? sel)
+        : (decoded ?? (known ? `${known}  [ARGUMENTS NOT DECODED: non-canonical payload, read the hex]` : sel));
+  const amount = value !== 0n ? `value ${value} ` : "";
   if (operation === 1n) {
     const lib = CANONICAL_MULTISEND.get(lower(to)) ?? CANONICAL_MIGRATIONS.get(lower(to));
     const flags =
@@ -3481,11 +3738,13 @@ function describeApprovedPayload(safe: string, to: string, data: string, operati
       ),
     ].join("\n");
   }
-  // Review G17a-3: the guard refuses a codeless approval target only with calldata or on a delegatecall, so an
-  // approved transfer of value to the zero address (a paste error) is valid on-chain; say so wherever an approval is read.
-  if (isZeroAddress(to)) return `CALL ${to} ${name}  [ZERO TARGET: an approved burn of the value, review G17a-3]`;
-  if (lower(to) === lower(safe)) return `SELF-CALL ${name}  [SAFE CONFIGURATION]`;
-  return `CALL ${to} ${name}`;
+  // Review G17a-3: the guard refuses a zero approval target since the owner applied the rail after round 21 (before it, a
+  // codeless target was refused only with calldata or on a delegatecall, so an approved transfer of value to the zero
+  // address was valid on-chain); the print stays for an approval read from a guard built before the rail.
+  if (isZeroAddress(to))
+    return `CALL ${to} ${amount}${name}  [ZERO TARGET: an approved burn of the value, review G17a-3]`;
+  if (lower(to) === lower(safe)) return `SELF-CALL ${amount}${name}  [SAFE CONFIGURATION]`;
+  return `CALL ${to} ${amount}${name}`;
 }
 
 /// The PUSH solc emits for a 4-byte selector: leading zero bytes are dropped (`PUSH1`..`PUSH4`).
@@ -3737,6 +3996,23 @@ function headTypes(fragment: FunctionFragment): (string | undefined)[] {
     return [t.type];
   };
   return fragment.inputs.map(words).flat();
+}
+
+/// A dynamic tuple (or an array of tuples) with an `address` component at any depth: its head word is an offset, so a
+/// receiver inside it is reachable by no word rule and invisible to the unbound-address warning, which reads static head
+/// words only (`exactInput((bytes,address,uint256,uint256))` linted valid without a word; review G21d-1).
+function dynamicTupleWithAddress(t: ParamType): boolean {
+  const isDynamic = (p: ParamType): boolean =>
+    p.baseType === "string" ||
+    p.baseType === "bytes" ||
+    (p.isArray() && (p.arrayLength === -1 || isDynamic(p.arrayChildren!))) ||
+    (p.isTuple() && p.components!.some(isDynamic));
+  const hasAddress = (p: ParamType): boolean =>
+    p.baseType === "address" ||
+    (p.isArray() && hasAddress(p.arrayChildren!)) ||
+    (p.isTuple() && p.components!.some(hasAddress));
+  const tupleInside = (p: ParamType): boolean => p.isTuple() || (p.isArray() && tupleInside(p.arrayChildren!));
+  return isDynamic(t) && tupleInside(t) && hasAddress(t);
 }
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
@@ -4168,6 +4444,16 @@ function validatePolicy(p: unknown): string[] {
           `${where}: address word(s) ${unbound.join(", ")} carry no rule: if one is a spender, receiver, owner or operator, ` +
             `bind it (EqualToSafe / OneOf / EqualTo); a token or market address may stay unbound`,
         );
+      // Review G21d-1: a receiver inside a dynamic tuple is where the warning above never looks.
+      if (!(rules as PolicyRule[]).some((r) => r.tail)) {
+        fragment.inputs.forEach((t, i) => {
+          if (dynamicTupleWithAddress(t))
+            warnings.push(
+              `${where}: parameter ${i} (${t.type}) is a dynamic tuple carrying address field(s) that no word rule can reach ` +
+                `(its head word is an offset): bind the whole payload with a "tail": true rule, or expect any receiver`,
+            );
+        });
+      }
     }
     const bandWord = BAND_SHAPED.get(selector);
     // A settle's own word-0 band or set is read like the mark's (the settle executes whatever mark is pending, review
@@ -4184,6 +4470,17 @@ function validatePolicy(p: unknown): string[] {
       )
         ? 0
         : undefined;
+    // Review G21d-5: the flag and rules on the NAV word together: the sync keeps every rule it is given, while the
+    // settle-repetition check below skips an unconstrained mark, so the settles would stay free of the band they must
+    // repeat (review G11b-2) and the gate would read the entry as unconstrained. One or the other.
+    if (
+      bandWord !== undefined &&
+      fn.unconstrained &&
+      (rules as PolicyRule[]).some((r) => r.wordIndex === bandWord && !r.tail)
+    )
+      throw Error(
+        `${where}: "unconstrained": true next to rules on word ${bandWord}: the rules would sync while the settles stay free of the band they must repeat (review G11b-2); drop the flag or the rules`,
+      );
     if (bandWord !== undefined && !fn.unconstrained) {
       const kinds = (rules as PolicyRule[]).filter((r) => r.wordIndex === bandWord).map((r) => r.kind);
       if (!kinds.some((k) => UPPER_BOUND_KINDS.includes(k)) || !kinds.some((k) => LOWER_BOUND_KINDS.includes(k))) {
@@ -4231,7 +4528,11 @@ function validatePolicy(p: unknown): string[] {
           );
       }
     }
-    const valueWords = ALLOWANCE_SHAPED.get(selector);
+    // Review G21d-2: any `(address,bool)` function is an operator grant in some name (`setOperator`, `setApprovalForAll`,
+    // Morpho's `setAuthorization`, Compound v3's `allow`): the address word needs a rule whatever the table knows.
+    const valueWords =
+      ALLOWANCE_SHAPED.get(selector) ??
+      (types.length === 2 && types[0] === "address" && types[1] === "bool" ? [0] : undefined);
     // The escape hatch is read out loud where every reader of the file's warnings sees it (the lint, the sync and both
     // verify paths print them): an unconstrained allowance-shaped entry lets the Safe name ANY spender, receiver or
     // operator (review G17b-6; the hunk the round-17 merge dropped, review G18c-1).
@@ -4254,6 +4555,24 @@ function validatePolicy(p: unknown): string[] {
   // bounds nothing the settles cannot pay out. A banded mark needs the same band on both settles of its target
   // (review G11b-2); the settles of an unconstrained mark stay free, as shipped.
   const fns = p.functions as unknown as PolicyFunction[];
+  // Review G21d-2: a ceiling on approve's amount word (docs section 5, G10d-1) caps the STANDING allowance only while no
+  // additive sibling is allowed on the same token: `increaseAllowance` (USDC, cbBTC) and `increaseApproval` (WBTC) ADD
+  // to it on every call, so a per-call ceiling there bounds nothing cumulative (three calls at a 100,000 cap left
+  // 300,000 standing on the live USDC code).
+  const additive = new Set(
+    ["increaseAllowance(address,uint256)", "increaseApproval(address,uint256)"].map(selectorOfSignature),
+  );
+  for (const a of fns) {
+    if (a.unconstrained || selectorOf(a) !== selectorOfSignature("approve(address,uint256)")) continue;
+    if (!(a.rules ?? []).some((r) => r.wordIndex === 1 && !r.tail && r.kind === "LessThanOrEqual")) continue;
+    for (const b of fns) {
+      if (lower(b.target) !== lower(a.target) || !additive.has(selectorOf(b))) continue;
+      warnings.push(
+        `${b.signature} on ${b.target}: adds to the standing allowance on every call, so the cap on approve's amount word ` +
+          `bounds nothing cumulative; drop this entry (an approve overwrites) or accept a per-call cap only (review G21d-2)`,
+      );
+    }
+  }
   // Every word-0 rule of a function as the chain compares it (kind and value word(s)), in a canonical order. The
   // band-shape check above lets a constrained mark carry a floor + ceiling, an `EqualTo` (a fixed mark) or a
   // `OneOf` set on word 0: the settles must repeat whichever of these it carries, exactly (review P1b-1).

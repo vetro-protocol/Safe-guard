@@ -35,7 +35,7 @@ const getSafeSignerPrivateKey = (): string => {
 };
 
 // `from` must be a contract. Lazy-import `hre` — a top-level import here crashes config
-// load with HH9 once this module is reached via the `tasks/` → `helpers/debt-ratio` chain.
+// load with HH9 once this module is reached from `tasks/curator-guard.ts`, which hardhat.config.ts imports.
 const assertFromIsContract = async (from: string): Promise<void> => {
   const { default: hre } = await import("hardhat");
   const code = await hre.ethers.provider.getCode(from);
@@ -133,7 +133,7 @@ const proposeSafeTransaction = async (hre: HardhatRuntimeEnvironment, txs: Saved
 
   if (["hardhat", "localhost"].includes(hre.network.name) || (await isDevNode(hre))) {
     // Lazy-import — `account-helpers` pulls `hardhat` at top level which would HH9 the
-    // config-load path that reaches this module via the `update-debt-ratio` task.
+    // config-load path that reaches this module through `tasks/curator-guard.ts`.
     const { impersonateAccount } = await import("./account-helpers");
     for (const [safe, group] of groups) {
       const w = await impersonateAccount(safe);

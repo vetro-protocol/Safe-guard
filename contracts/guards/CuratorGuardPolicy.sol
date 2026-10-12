@@ -1060,7 +1060,9 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
         if (!$.modules.contains(module_)) revert ModuleNotAllowed(module_);
     }
 
-    /// @dev What an approval may address, checked when it is issued. Never this guard. Calldata sent to
+    /// @dev What an approval may address, checked when it is issued. Never this guard, never the zero
+    ///      address (an approved value to it would be a burn; the policy's native lane refuses it too,
+    ///      review G17a-3). Calldata sent to
     ///      an account without code "succeeds" and does nothing (so does a delegatecall): the one-off
     ///      would be spent, and reported as executed, for nothing. And an approved delegatecall runs
     ///      code in the Safe's context, so that code must be a deployed contract: an EIP-7702 delegated
@@ -1076,7 +1078,7 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
                 and(operation_, eq(byte(0, mload(0)), 0xef))
             )
         }
-        if (_bad || to_ == address(this)) revert InvalidTarget(to_);
+        if (_bad || to_ == address(this) || to_ == address(0)) revert InvalidTarget(to_);
     }
 
     /// @dev Council approvals: plain calls only, self-calls only from the council's allowlist.

@@ -1,4 +1,7 @@
 [profile.default]
+# forge >= 1.8 isolates every top-level call into its own transaction by default (review G21e: 65 of the
+# suites' tests assume one transaction per test and fail there); the pinned 1.5.1 reads the key the same way.
+isolate = false
 src = 'contracts'
 test = 'test/guards'
 script = 'test/guards'
