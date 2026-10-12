@@ -413,6 +413,11 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
   // a second, unconfigured guard and repoint the artifact away from the one the Safe installed).
   // A replacement guard (docs/curator-guard.md section 7.5) is a new, versioned alias.
   const guardArgs = [ADMIN_DELAY, timelockAddress, council];
+  // A lost or uncommitted guard record (review G22c-4): `skipIfAlreadyDeployed` sees no record and mints a second guard
+  // behind the same timelock, then repoints the record at it. Two cheap reads catch the common cases before any gas
+  // is spent: the curator Safe's guard slot (an installed guard), and the timelock's queue (a synced, not yet installed
+  // guard: every sync targets the guard). Both are read for this repository's build with this timelock as admin.
+  if (!(await deployments.getOrNull(ALIAS))) await refuseIfGuardExists(hre, timelockAddress, curatorSafe, forkLike);
   const result = await deployments.deploy(ALIAS, {
     contract: CONTRACT,
     from: deployer,
@@ -473,6 +478,56 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
   }
 };
 
+/// A guard of this build with `timelock` as its admin is already installed on the curator Safe, or is the target of an
+/// operation this timelock has scheduled: a deploy without its record would mint a second one (review G22c-4).
+async function refuseIfGuardExists(
+  hre: HardhatRuntimeEnvironment,
+  timelock: string,
+  curatorSafe: string,
+  forkLike: boolean,
+): Promise<void> {
+  const { ethers } = hre;
+  const artifact = await hre.artifacts.readArtifact(CONTRACT);
+  const expected = stripMetadata(artifact.deployedBytecode);
+  const isOurs = async (candidate: string): Promise<boolean> => {
+    if (!/^0x[0-9a-fA-F]{40}$/.test(candidate) || candidate === ZERO) return false;
+    if (stripMetadata(await ethers.provider.getCode(candidate)) !== expected) return false;
+    try {
+      const admin: string = await (await ethers.getContractAt(CONTRACT, candidate)).defaultAdmin();
+      return admin.toLowerCase() === timelock.toLowerCase();
+    } catch {
+      return false;
+    }
+  };
+  const found = new Set<string>();
+  const safe = await hre.ethers.getContractAt("ISafe", curatorSafe);
+  try {
+    const raw: string = await safe.getStorageAt(
+      "0x4a204f620c8c5ccdca3fd54d003badd85ba500436a431f0cbda4f558c93c34c8",
+      1,
+    );
+    const slot = ethers.getAddress("0x" + raw.slice(-40));
+    if (await isOurs(slot)) found.add(slot);
+  } catch {
+    /* not a Safe that answers getStorageAt: nothing installed to read */
+  }
+  const from = await creationBlock(hre, timelock);
+  if (from !== undefined) {
+    const tl = (await ethers.getContractAt(TIMELOCK_CONTRACT, timelock)) as unknown as Contract;
+    const targets = new Set<string>();
+    for (const l of await scanLogs(hre, tl, tl.filters.CallScheduled(), from))
+      targets.add(String((l as EventLog).args.target));
+    for (const t of targets) if (await isOurs(t)) found.add(ethers.getAddress(t));
+  }
+  if (!found.size) return;
+  const msg =
+    `${ALIAS} has no deployment record here, but ${[...found].join(", ")} is this build with ${timelock} as its admin ` +
+    `(installed on the curator Safe, or the target of a scheduled operation): a deploy now would mint a second guard and ` +
+    `repoint the record; restore deployments/<network>/${ALIAS}.json from the chain and commit it (CURATOR_GUARD_ALIAS=... for a replacement guard)`;
+  if (forkLike) console.log(chalk.yellow(`WARNING: ${msg}`));
+  else throw Error(msg);
+}
+
 /// Rebuilds the timelock's role set from its own `RoleGranted` / `RoleRevoked` logs (roles are not
 /// enumerable) and compares it with the expected topology: admin = the timelock only, executor = anyone
 /// only, proposers and cancellers exactly as configured, the council nowhere; and the queue empty.
@@ -524,10 +579,12 @@ async function auditTimelock(
         else problems.push(`${name}: missing holder ${m}`);
       }
     }
+    // One CallScheduled log per CALL of an operation: counted by log, a single 40-call sync read as "40 operation(s)"
+    // (review G22c-2). Count operation ids.
+    const ids = new Set<string>();
+    for (const l of await scanLogs(hre, tl, tl.filters.CallScheduled(), from)) ids.add(String((l as EventLog).args.id));
     let pending = 0;
-    for (const l of await scanLogs(hre, tl, tl.filters.CallScheduled(), from)) {
-      if (await tl.isOperationPending((l as EventLog).args.id)) ++pending;
-    }
+    for (const id of ids) if (await tl.isOperationPending(id)) ++pending;
     if (pending)
       problems.push(
         `${pending} operation(s) are pending in the queue (any target); review and cancel them before a guard goes behind this timelock`,
