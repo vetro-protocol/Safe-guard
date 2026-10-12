@@ -995,6 +995,8 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     ///      address to everyone: its hooks if it is guarded, its ROLE if it holds one (the council Safe,
     ///      a guardian Safe). True when `account_` answers `getStorageAt` like a Safe (v1.3.0+) and its
     ///      handler slot holds this guard; an EOA or a contract that is not a Safe (the timelock) is not.
+    ///      The slot's low 160 bits are compared, as the EVM masks a call target: a word with dirty high
+    ///      bits still forwards to this guard and is read as forwarding (review G16d-1).
     function _isHandlerOf(address account_) internal view returns (bool _yes) {
         bytes32 _slot = FALLBACK_HANDLER_STORAGE_SLOT;
         assembly ("memory-safe") {
@@ -1005,7 +1007,7 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
             mstore(add(_p, 0x04), _slot)
             mstore(add(_p, 0x24), 1)
             let _ok := staticcall(gas(), account_, _p, 0x44, _p, 0x60)
-            _yes := and(and(_ok, eq(returndatasize(), 0x60)), eq(mload(add(_p, 0x40)), address()))
+            _yes := and(and(_ok, eq(returndatasize(), 0x60)), eq(and(mload(add(_p, 0x40)), 0xffffffffffffffffffffffffffffffffffffffff), address()))
         }
     }
 

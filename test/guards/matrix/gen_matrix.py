@@ -9,7 +9,7 @@ and the NatSpec). Where the documentation does not decide a cell the expectation
 and the cell is tagged UNDECIDED, so the report can list it.
 
 Outputs (next to this script, under out/; copied into the review root's test/guards by the driver):
-  G12e_Matrix.t.sol            the guard matrix: 13 caller classes x 95 functions x 8 states
+  G12e_Matrix.t.sol            the guard matrix: 14 caller classes x 95 functions x 8 states (class 13 the dirty handler word, review G16d-1)
   G12e_MatrixHooks.t.sol       the hooks through real Safe transactions: 3 paths x 9 payloads x 8 states
   G12e_MatrixTimelock.t.sol    the timelock surface: 9 caller classes x 32 functions
   G12e_MatrixViaTimelock.t.sol every admin cell of state S3 executed through a real CuratorGuardTimelock
@@ -70,6 +70,10 @@ CLASSES = [
     dict(id=10, key="FWD_COUNCIL_SAFE", label="a council Safe whose fallback handler is the guard (a stranger calls the Safe, which forwards)", sender="stranger", target="address(councilSafe)", eff="address(councilSafe)", fwd=True, council=True, isSafe=True),
     dict(id=11, key="FWD_SAFE_A", label="Safe A with the guard as fallback handler, handler requirement OFF (a stranger calls the Safe)", sender="stranger", target="address(safeA)", eff="address(safeA)", fwd=True, isA=True, isSafe=True, handlerGuard=True),
     dict(id=12, key="FWD_SAFE_A_REQ", label="Safe A with the guard as fallback handler, handler requirement ON (the shipped shape)", sender="stranger", target="address(safeA)", eff="address(safeA)", fwd=True, isA=True, isSafe=True, handlerGuard=True, req=True),
+    # Review G16d-1 (applied after round 18): a handler word whose LOW 160 bits are the guard and whose high 96 bits are
+    # dirty still forwards (the EVM masks the call target); every read of the slot masks it the same way, so the class
+    # must answer exactly as class 12 does.
+    dict(id=13, key="FWD_SAFE_A_REQ_DIRTY", label="Safe A with a DIRTY handler word whose low 160 bits are the guard, handler requirement ON (a stranger calls the Safe; the word forwards, review G16d-1)", sender="stranger", target="address(safeA)", eff="address(safeA)", fwd=True, isA=True, isSafe=True, handlerGuard=True, req=True, dirty=True),
 ]
 
 STATES = [
@@ -280,7 +284,7 @@ def hook_kind(c):
         return "safeA"
     if c.get("key") == "FWD_SAFE_A":
         return "fwdA"
-    if c.get("key") == "FWD_SAFE_A_REQ":
+    if c.get("key") in ("FWD_SAFE_A_REQ", "FWD_SAFE_A_REQ_DIRTY"):
         return "fwdAreq"
     if c.get("key") == "FWD_COUNCIL_SAFE":
         return "fwdCouncil"
@@ -1247,7 +1251,9 @@ __TESTS__
 
 def class_setup(c):
     lines = []
-    if c.get("handlerGuard"):
+    if c.get("dirty"):
+        lines.append("        vm.store(address(safeA), FALLBACK_SLOT, bytes32((uint256(0xdead) << 160) | uint256(uint160(address(g)))));")
+    elif c.get("handlerGuard"):
         lines.append("        vm.store(address(safeA), FALLBACK_SLOT, bytes32(uint256(uint160(address(g)))));")
     if c.get("req"):
         lines.append("        vm.prank(g.defaultAdmin());")

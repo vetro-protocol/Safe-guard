@@ -21,13 +21,13 @@ const ADMIN_DELAY = BigInt(process.env.CURATOR_GUARD_ADMIN_DELAY || 3 * 24 * 360
 const EXISTING_TIMELOCK = process.env.CURATOR_GUARD_TIMELOCK;
 const ZERO = "0x0000000000000000000000000000000000000000";
 // The reviewed runtimes, metadata stripped, as `test/guards/G12a_BuildPin.t.sol` pins them (keccak256 of the runtime
-// without its CBOR tail; 23,240 and 8,195 bytes). The deploy sends whatever the local `node_modules` and solc compiled
+// without its CBOR tail; 23,249 and 8,204 bytes, the masked handler-word rails of review G16d-1). The deploy sends whatever the local `node_modules` and solc compiled
 // to, and CI's parity step compares hardhat with foundry, never with the pin: this is the one step that must send the
 // reviewed bytes, so it checks them itself (review G18g-2). A re-pin is a contract change with a review: move these
 // two values together with the test's.
 const REVIEWED_RUNTIME_KECCAK: Record<string, string> = {
-  [CONTRACT]: "0xc8e0a9082376e985eec95d4185d178c1a667832b0990852bef052ca40d8d70a6",
-  [TIMELOCK_CONTRACT]: "0xb7790f427d7dfc79e8c3b417a283f7baf39f498403f5a33cdd68e40aab8528aa",
+  [CONTRACT]: "0xa1cc015977cf2dec4903326ddeb960c91caf6e3a50edca0ede881986ffbbd7f1",
+  [TIMELOCK_CONTRACT]: "0x8a69e72c4ff2fbc0189b1ff3f6a7e74c239bcc3c3394a3fe158e952a02da786c",
 };
 // Mirrors `CuratorGuardTimelock.MIN_DELAY_FLOOR / MIN_DELAY_CAP` and `CuratorGuardPolicy.MAX_ADMIN_DELAY`
 // (the floor is one day since the round-13 follow-up, G13f-3; keep the three in sync with the contracts).
@@ -348,6 +348,18 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
   if (EXISTING_TIMELOCK) {
     timelockAddress = ethers.getAddress(EXISTING_TIMELOCK);
     console.log(chalk.blue(`reusing timelock ${timelockAddress} (CURATOR_GUARD_TIMELOCK)`));
+  } else if ((await deployments.getOrNull(ALIAS)) && !(await deployments.getOrNull(TIMELOCK_ALIAS))) {
+    // A guard record without its timelock record (a re-run after a lost or uncommitted record, review G20g-2): the
+    // recorded guard's admin IS its timelock. Deploying another here would be refused by the admin check below only
+    // after the deploy was paid for, and would leave the record naming an orphan that holds the proposer roles.
+    const recorded = (await deployments.get(ALIAS)).address;
+    timelockAddress = ethers.getAddress(await (await ethers.getContractAt(CONTRACT, recorded)).defaultAdmin());
+    console.log(
+      chalk.blue(
+        `${TIMELOCK_ALIAS} record missing: using the admin of the recorded ${ALIAS} ${recorded}, ${timelockAddress} ` +
+          `(CURATOR_GUARD_TIMELOCK overrides; restore the record from the chain and commit both)`,
+      ),
+    );
   } else {
     const timelock = await deployments.deploy(TIMELOCK_ALIAS, {
       contract: TIMELOCK_CONTRACT,

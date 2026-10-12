@@ -53,13 +53,18 @@ jobs:
       # G11b_Policy, G9a_CanonicalProxyHashes) need the ETHEREUM_FORK_NODE_URL secret (archive RPC) at the pinned block.
       # Without traces: forge 1.5.1 (the pinned toolchain) hands a call that reverts with no data an ABI-encoded
       # "call to non-contract address <the EOA the previous call was pranked as>" string whenever traces are
-      # recorded (-vvv and above); fifteen tests that classify empty reverts (the access matrix's value call, the
-      # two starvation sweeps) fail under `forge test -vvv` and pass without it (review G17c-1). The failures,
+      # recorded (-vvv and above); sixteen tests that classify empty reverts (the access matrix's value call in each
+      # of its fourteen caller classes, the two starvation sweeps) fail under `forge test -vvv` and pass without it
+      # (review G17c-1: fifteen before the dirty-word class of the round-18 follow-up, review G20e-2). The failures,
       # if any, are re-run alone with traces for the report, and the step stays red (review G18g-3).
       - name: Run tests
         run: forge test || { forge test --rerun -vvv; exit 1; }
         env:
           ETHEREUM_FORK_NODE_URL: ${{ secrets.ETHEREUM_FORK_NODE_URL }}
+          # One pinned fuzz seed on this step only (review G9f-10, pinned as review g17c advised): a fuzz or
+          # invariant failure here reproduces locally with `FOUNDRY_FUZZ_SEED=0x1 forge test`; the osaka step
+          # below draws a fresh seed on every run, so CI keeps exploring.
+          FOUNDRY_FUZZ_SEED: "0x1"
 
       # The same suites on the EVM mainnet runs today (Osaka): the bytecode is the default build's, only the
       # test EVM moves (review G13c). The fork suites are covered by the step above.

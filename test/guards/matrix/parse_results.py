@@ -123,7 +123,7 @@ und_list = []
 mis_list = []
 
 # ---- guard matrix
-out.append("## A. The guard: 13 caller classes x 95 functions x 8 states\n")
+out.append("## A. The guard: 14 caller classes x 95 functions x 8 states\n")
 for cid in sorted(classes):
     out.append("### Class %d: %s\n" % (cid, classes[cid]["label"]))
     out.append("| # | function | S0 | S1 | S2 | S3 | S4 | S5 | S6 | S7 | doc |")
@@ -176,7 +176,7 @@ for pid in sorted(paths):
     out.append("")
 
 # ---- timelock
-out.append("## C. The timelock: 9 caller classes x 31 functions\n")
+out.append("## C. The timelock: 9 caller classes x 32 functions\n")
 out.append("| # | function | " + " | ".join("C%d %s" % (c, tclasses[c]["key"]) for c in sorted(tclasses)) + " | doc |")
 out.append("|---|---|" + "---|" * len(tclasses) + "---|")
 for fid in sorted(tfunctions):

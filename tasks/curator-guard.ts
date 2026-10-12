@@ -37,12 +37,15 @@ import { SAFE_BATCH_TXS_FILE, executeBatchUsingSafe, saveForSafeBatchExecution }
 ///     persisted per chain + guard (next to the Safe batch file) and `--execute` replays exactly them,
 ///     re-deriving every operation id from the stored payloads (or rebuilding them from the timelock's
 ///     own `CallScheduled` logs with `--op`), refusing a drifted diff, a passed deadline or an
-///     operation the proposer never scheduled.
+///     operation the proposer never scheduled. An operation named with `--op` may also carry calls
+///     no sync produces (the hand-scheduled one-call approvals of docs section 7.5 / 7.6, a role
+///     change, a window): those run exactly as named, behind `--confirm-sensitive`, after every one
+///     is printed with its tag and the cancel calldata (review G9e-1).
 ///
 ///   npx hardhat curator-guard-sync --network ethereum \
 ///     --guard 0x... --policy policies/curator-guard/vetro-lagoon.ethereum.json \
 ///     [--dry-run] [--allow-unlock] [--confirm-revocations] [--confirm-loosening] [--proposer 0x...] \
-///     [--execute [--op 0x...]] [--via-timelock] [--deadline-days 14] [--unlock-deadline-days 1] \
+///     [--execute [--op 0x... [--confirm-sensitive]]] [--via-timelock] [--deadline-days 14] [--unlock-deadline-days 1] \
 ///     [--allow-pending] [--allow-large-batch] [--timelock-block N]
 ///
 ///   npx hardhat curator-guard-lint --policy <file>          # offline: shape, rules, caps
@@ -490,8 +493,12 @@ task("curator-guard-sync", "Reconcile a CuratorGuard policy for a Safe against a
   )
   .addFlag("allowLargeBatch", "Schedule a batch estimated above 12M gas (split the policy change instead)")
   .addFlag(
+    "confirmSensitive",
+    "With --execute --op: run an operation that carries calls no sync produces (an approval, a role change, a window, a deployment-wide setting) exactly as named, after decoding it with curator-guard-verify",
+  )
+  .addFlag(
     "allowUnconstrainedNav",
-    "Sync an unconstrained NAV-marking function, or a NAV band at its first sync that does not contain the vault's live totalAssets() or is wider than +-50 % of it, on a vault that already holds assets (a colluding quorum can then mark the custody away); it also admits a band or a fixed mark on a vault that holds nothing (refused otherwise until its first settlement, review G16c-2)",
+    "Sync an unconstrained NAV-marking function, or a NAV band at its first sync that does not contain the vault's live totalAssets() or is wider than +-50 % of it, on a vault that already holds assets or behind which a recorded Lagoon_Vetro_* strategy carries a debtRatio, a totalDebt or a tvl() (a colluding quorum can then mark the custody away; the strategy figures are printed, reviews G11b-6 and G13g-2); it also admits a band or a fixed mark on a vault that holds nothing (refused otherwise until its first settlement, review G16c-2)",
   )
   .addFlag("viaTimelock", "Fork networks: rehearse schedule -> execute instead of impersonating the admin")
   .setAction(async (args: SyncArgs & { policy: string }, hre: HardhatRuntimeEnvironment) =>
@@ -499,6 +506,8 @@ task("curator-guard-sync", "Reconcile a CuratorGuard policy for a Safe against a
       const { policy, policyText, warnings } = loadPolicy(args.policy);
       for (const w of warnings) console.log(chalk.yellow(`warning: ${w}`));
       const ctx = await guardContext(hre, args.guard, policy, args.timelockBlock);
+      if (args.confirmSensitive && !(args.execute && args.op))
+        throw Error("--confirm-sensitive applies to --execute --op <id> only (an operation the sync did not produce)");
       if (fs.existsSync(SAFE_BATCH_TXS_FILE)) {
         throw Error(`${SAFE_BATCH_TXS_FILE} exists: flush or delete the stale Safe batch before syncing`);
       }
@@ -622,6 +631,7 @@ task(
         const wanted = new Set(plan.calls.map((c) => c.data));
         let allMatch = true;
         let syncShaped = 0;
+        let nested = 0;
         let pendingNamed = 0;
         for (const id of args.op!.split(",")) {
           const op = await rebuildOperation(ctx, scan, id.trim());
@@ -645,6 +655,7 @@ task(
             if (!done) {
               allMatch &&= stillWanted;
               if (guardTarget && inner !== undefined && SYNC_SELECTORS.has(inner.data.slice(0, 10))) ++syncShaped;
+              if (guardTarget && isNestedWrapper(ctx.guardIface, c.data)) ++nested;
             }
             const [first, ...rest] = describeTimelockCall(ctx, c.target, c.data).split("\n");
             console.log(
@@ -674,10 +685,16 @@ task(
           return;
         }
         if (!allMatch && syncShaped === 0) {
+          // A wrapper inside a wrapper is no recipe's product (review G19c-2): the innermost call is decoded on its
+          // line above, and the verdict must not send the reader to a runbook recipe that does not exist (review G20c-3).
           console.log(
             chalk.yellow(
-              "no decoded call is a policy sync: this is a one-off operation (role / incident-sensitive); compare the decoded " +
-                "call with the runbook recipe it came from and with the manifest of whoever scheduled it, never with the policy file",
+              nested
+                ? `${nested} call(s) wrap a call in executeBefore twice: never what a sync or a runbook recipe produces (the ` +
+                    "innermost call is decoded above); curator-guard-sync --execute --op refuses it; unless whoever scheduled it " +
+                    "can say why, cancel it from the canceller Safe"
+                : "no decoded call is a policy sync: this is a one-off operation (role- or incident-sensitive, a hand-built narrowing, or a nested wrapper: read its tags); compare the decoded " +
+                    "call with the runbook recipe it came from and with the manifest of whoever scheduled it, never with the policy file",
             ),
           );
           return;
@@ -1332,9 +1349,14 @@ async function planDiff(
     ],
   ] as [string, string[]][]) {
     for (const a of list) {
-      if (lower(a) === lower(ctx.guard) || lower(a) === lower(ctx.admin) || lower(a) === lower(safe))
+      // The contract refuses the guard, the Safe and the zero address in every list (`InvalidTarget`); the admin it
+      // accepts, and this task refuses it on its own account, as it does for a target: the admin is never constrained
+      // and never a seat, module, lane or handler of the Safe it administers (review G20c-1).
+      if (lower(a) === lower(ctx.guard) || lower(a) === lower(safe))
+        throw Error(`policy.${listKey}: ${a} is the guard or the Safe itself (the contract refuses it: InvalidTarget)`);
+      if (lower(a) === lower(ctx.admin))
         throw Error(
-          `policy.${listKey}: ${a} is the guard, the guard admin or the Safe itself (the contract refuses it: InvalidTarget)`,
+          `policy.${listKey}: ${a} is the guard admin, never a guardian, module, native lane or handler of the Safe it administers (this task refuses it; the contract would accept it)`,
         );
     }
   }
@@ -1431,6 +1453,16 @@ async function planDiff(
   // reads as a bound in the diff (review G13a-1). A band already on chain moves under the loosening
   // gate instead (`loosensRules`: anchored on the live NAV and no wider is a shift, anything else a
   // loosening).
+  // The quantity that makes the gate bite is the Vesper custody BEHIND the vault (the `Lagoon_Vetro_*`
+  // strategies' pool accounting, `getStrategyConfig(strategy).debtRatio` / `.totalDebt`, written by governance
+  // and the keeper, and the strategies' `tvl()`), read from the address book's `Lagoon.strategy` entries since
+  // this repository carries no deployment records (reviews G11b-6 and G13g-2). The vault's own `totalAssets()`
+  // stays a second trigger (it is the curator's mark, but on a public vault custody can be an outsider's with
+  // no Vesper debt behind it, review g13e) and remains the number the band checks compare with (G13a-1).
+  // Read when the gate first needs them: a file with no NAV-shaped entry, a band already on chain (the shift path) or
+  // a target that is no vault never reads the book, so G19d-2's "book without entries" error fires only where the
+  // gate judges custody and never stops an unrelated sync (review G20c-2).
+  let strategyRecords: Map<string, string> | undefined;
   for (const d of desired.values()) {
     const bandWord = BAND_SHAPED.get(d.selector);
     if (bandWord === undefined) continue;
@@ -1474,6 +1506,28 @@ async function planDiff(
         `could not read totalAssets() of ${d.target} (${errorText(e)}): the NAV gate is not judged on a failed read; use an RPC that answers`,
       );
     }
+    // The Vesper custody BEHIND the vault (reviews G11b-6 and G13g-2): the recorded `Lagoon_Vetro_*` strategies that
+    // route to it, with the pool's accounting of them and what they hold. Printed with every refusal; a strategy
+    // with any of the three non-zero is custody the mark can move, whatever the vault's own `totalAssets()` says.
+    if (!strategyRecords) strategyRecords = await lagoonStrategyRecords(hre, ctx);
+    const routed = await strategiesRoutingTo(hre, strategyRecords, d.target);
+    const funded = routed.filter((r) => nonZero(r.debtRatio) || nonZero(r.totalDebt) || nonZero(r.tvl));
+    const describe = (r: StrategyFunding) =>
+      `${r.name} ${r.address} debtRatio ${figureText(r.debtRatio)} totalDebt ${figureText(r.totalDebt)} tvl ${figureText(r.tvl)}`;
+    const behind = funded.length
+      ? `, with Vesper custody behind it (${funded.map(describe).join("; ")})`
+      : routed.length
+        ? `, with no Vesper debt behind it (${routed.map(describe).join("; ")}: seed dust or third-party deposits)`
+        : ", with no Lagoon_Vetro_* strategy recorded for it (gated on totalAssets() alone)";
+    // Said on every sync, not only inside a refusal: a vault the address book does not cover (a new vault, a
+    // renamed key) is gated on the curator's own number alone, and an empty one passes in silence (review G19d-2).
+    if (!routed.length)
+      say(
+        chalk.yellow(
+          `note: ${d.src.signature} on ${d.target}: no recorded Lagoon_Vetro_* strategy routes to this vault (helpers/address.ts ` +
+            `Lagoon.strategy, or a deployment record): the NAV gate reads its totalAssets() alone here`,
+        ),
+      );
     const what =
       band === undefined
         ? ""
@@ -1481,15 +1535,15 @@ async function planDiff(
           ? `a fixed mark set [${band.lo} .. ${band.hi}]`
           : `a band [${band.lo}, ${band.hi}]`;
     let msg: string;
-    if (assets === 0n) {
+    if (assets === 0n && band === undefined && !funded.length) continue; // nothing to mark away, nothing behind it
+    if (assets === 0n && band !== undefined) {
       // Nothing to mark away: an unconstrained mark passes. A band or a fixed mark on an empty vault has no settled
       // NAV to be judged against, and the honest first mark on it (0: nothing under management) is one no band
       // admits (the contract refuses a zero floor); this gate used to skip it, so a vacuous band ([0.01 BTC, 1 BTC]
       // on the empty live BTC vaults) synced with no flag and no word and was never looked at again (review G16c-2).
-      if (band === undefined) continue;
-      msg = `${d.src.signature} on ${d.target} carries ${what} while the vault reports totalAssets() = 0: there is no settled NAV to band around yet and the honest first mark (0) is one no band admits; keep the entry unconstrained until the first settlement (an unconstrained mark on an empty vault passes this gate), then band around the settled NAV, or pass --allow-unconstrained-nav knowingly (review G16c-2)`;
+      msg = `${d.src.signature} on ${d.target} carries ${what} while the vault reports totalAssets() = 0${behind}: there is no settled NAV to band around yet and the honest first mark (0) is one no band admits; keep the entry unconstrained until the first settlement (an unconstrained mark on an empty vault with no Vesper debt behind it passes this gate), then band around the settled NAV, or pass --allow-unconstrained-nav knowingly (review G16c-2)`;
     } else if (band === undefined) {
-      msg = `${d.src.signature} on ${d.target} is unconstrained while the vault reports totalAssets() = ${assets}: a colluding curator quorum can mark that custody away (docs section 8); put a NAV band on it, or pass --allow-unconstrained-nav`;
+      msg = `${d.src.signature} on ${d.target} is unconstrained while the vault reports totalAssets() = ${assets}${behind}: a colluding curator quorum can mark that custody away (docs section 8); put a NAV band on it, or pass --allow-unconstrained-nav`;
     } else {
       let shape: string;
       if (band.lo > assets || assets > band.hi) shape = "that does not contain";
@@ -1521,7 +1575,7 @@ async function planDiff(
           );
         continue;
       }
-      msg = `${d.src.signature} on ${d.target} carries ${what} ${shape} the vault's totalAssets() = ${assets}: a band only on paper caps nothing a colluding curator quorum marks away (docs sections 5 and 8); tighten it around the settled NAV, or pass --allow-unconstrained-nav knowingly (review G13a-1${fixed ? ", G16c-2" : ""})`;
+      msg = `${d.src.signature} on ${d.target} carries ${what} ${shape} the vault's totalAssets() = ${assets}${behind}: a band only on paper caps nothing a colluding curator quorum marks away (docs sections 5 and 8); tighten it around the settled NAV, or pass --allow-unconstrained-nav knowingly (review G13a-1${fixed ? ", G16c-2" : ""})`;
     }
     if (!allowUnconstrainedNav) throw Error(msg);
     // Printed whatever `quiet` says: `curator-guard-verify --op / --manifest` run the plan quietly with the entry
@@ -1886,6 +1940,107 @@ async function planDiff(
   return { calls, lifts, revocations, loosenings, currentMode };
 }
 
+/// A figure the gate could not read as a number: an EVM-level answer (a revert, a Panic, no code behind `pool()`) is
+/// carried as its reason and COUNTS as custody (review G19d-1: a strategy whose `tvl()` reverts, the documented live
+/// condition of a fee rate above 100 % with a claimable request, is no evidence of an empty vault).
+type Figure = bigint | { unreadable: string };
+type StrategyFunding = { name: string; address: string; debtRatio: Figure; totalDebt: Figure; tvl: Figure };
+const nonZero = (f: Figure) => typeof f !== "bigint" || f > 0n;
+const figureText = (f: Figure) => (typeof f === "bigint" ? String(f) : `unreadable (${f.unreadable})`);
+
+/// The `Lagoon_Vetro_*` strategies: this network's deployment records when the repository has any (a rehearsal
+/// that deployed them), else the address book's `Lagoon.strategy` entries on chain 1 and its rehearsals (this
+/// repository carries no deployment records of the strategies, review G13g-2). The address book is imported
+/// lazily: it imports `hardhat` at its top, which a module loaded from hardhat.config.ts may not do (HH9).
+async function lagoonStrategyRecords(hre: HardhatRuntimeEnvironment, ctx: Ctx): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const NAME = /^(Lagoon_Vetro_[A-Za-z0-9]+)$/;
+  for (const [name, d] of Object.entries(await hre.deployments.all())) if (NAME.test(name)) out.set(name, d.address);
+  if (ctx.chainId === "1" || ctx.chainId === "31337") {
+    const { default: Addresses } = await import("../helpers/address");
+    const book = (Addresses.ethereum.Lagoon as { strategy?: Record<string, string> }).strategy;
+    // The gate's premise on chain 1 is this list: a book without it (a renamed key, a refactor the permissive cast
+    // above hides from tsc) would gate every vault on the curator's own number without a word (review G19d-2).
+    if (!book || !Object.keys(book).length)
+      throw Error(
+        "helpers/address.ts carries no Lagoon.strategy entries: the NAV gate cannot read the Vesper custody behind the vaults; restore the Lagoon_Vetro_* strategy records (reviews G11b-6, G13g-2)",
+      );
+    // The book's keys are `Vetro_<asset>`; the deployment records are `Lagoon_Vetro_<asset>` (one name, so a
+    // rehearsal that deployed a strategy never lists it twice; review g18f on the round-15 diff).
+    for (const [k, a] of Object.entries(book))
+      if (!out.has(`Lagoon_${k}`)) out.set(`Lagoon_${k}`, hre.ethers.getAddress(a));
+  }
+  return out;
+}
+
+/// The recorded strategies whose `vault()` is `target`, with what their pools account for them and what
+/// they hold. A record that does not answer `vault()` as a Lagoon strategy (an EVM-level answer, `isEvmAnswer`) is
+/// skipped; a transport error on any read is thrown, never read as "no debt" (reviews G11b-6, G17b-2); an EVM-level
+/// answer on `pool()`, `getStrategyConfig()` or `tvl()` of a strategy that ROUTES to the target is a figure the gate
+/// cannot read and counts as custody: the refusal names it and `--allow-unconstrained-nav` passes it knowingly,
+/// instead of every sync and verify dying on a raw provider error (review G19d-1).
+async function strategiesRoutingTo(
+  hre: HardhatRuntimeEnvironment,
+  records: Map<string, string>,
+  target: string,
+): Promise<StrategyFunding[]> {
+  const { ethers } = hre;
+  const out: StrategyFunding[] = [];
+  for (const [name, address] of records) {
+    const strategy = new ethers.Contract(
+      address,
+      [
+        "function vault() view returns (address)",
+        "function pool() view returns (address)",
+        "function tvl() view returns (uint256)",
+      ],
+      ethers.provider,
+    );
+    let vault: string;
+    try {
+      vault = await strategy.vault();
+    } catch (e: unknown) {
+      if (isEvmAnswer(e)) continue;
+      throw Error(
+        `could not read ${name} (${address}) as a Lagoon strategy (${errorText(e)}): refusing to judge the NAV gate on a failed read`,
+      );
+    }
+    if (lower(vault) !== lower(target)) continue;
+    // A read that answers at the EVM level (a revert, a Panic, nothing behind the address) is a figure the gate
+    // cannot read; a transport failure is thrown with the strategy's name, as the `vault()` read above.
+    const readFigure = async <T>(what: string, f: () => Promise<T>): Promise<T | { unreadable: string }> => {
+      try {
+        return await f();
+      } catch (e: unknown) {
+        if (isEvmAnswer(e)) return { unreadable: `${what}: ${errorText(e).split("\n")[0].slice(0, 160)}` };
+        throw Error(
+          `could not read ${what} of ${name} (${address}) (${errorText(e)}): refusing to judge the NAV gate on a failed read`,
+        );
+      }
+    };
+    const cfg = await readFigure("pool()/getStrategyConfig()", async () => {
+      const pool = new ethers.Contract(
+        await strategy.pool(),
+        [
+          "function getStrategyConfig(address) view returns (tuple(bool active, uint256 totalDebt, uint256 totalLoss, uint256 totalProfit, uint256 debtRatio))",
+        ],
+        ethers.provider,
+      );
+      const c = await pool.getStrategyConfig(address);
+      return { debtRatio: BigInt(c.debtRatio), totalDebt: BigInt(c.totalDebt) };
+    });
+    const unreadable = (c: typeof cfg): c is { unreadable: string } => "unreadable" in c;
+    out.push({
+      name,
+      address,
+      debtRatio: unreadable(cfg) ? cfg : cfg.debtRatio,
+      totalDebt: unreadable(cfg) ? cfg : cfg.totalDebt,
+      tvl: await readFigure("tvl()", async () => BigInt(await strategy.tvl())),
+    });
+  }
+  return out;
+}
+
 /// Why `after` is weaker than `before` for a function that is already allowed (empty = not weaker).
 /// A band (a floor and a ceiling on one word) that MOVES without growing is not weaker: it is the
 /// re-sync docs section 5 asks for at every funding step (the settled NAV moved, the band follows).
@@ -1978,6 +2133,7 @@ type SyncArgs = {
   confirmLoosening?: boolean;
   allowPending?: boolean;
   allowLargeBatch?: boolean;
+  confirmSensitive?: boolean;
   allowUnconstrainedNav?: boolean;
   viaTimelock?: boolean;
   deadlineDays?: string;
@@ -2147,7 +2303,8 @@ async function applyAsAdmin(
       throw Error(
         `${pending.length} operation(s) are still pending on the timelock:\n${list}\n` +
           `cancel what is abandoned, or pass --allow-pending to schedule the NEW diff next to them (it re-includes every ` +
-          `unapplied call of a pending sync operation and supersedes it: execute the new one, cancel the old one)`,
+          `unapplied call of a pending sync operation and supersedes it: execute the new one, cancel the old one; an operation ` +
+          `of a SIBLING guard under this timelock, section 7.5, is not abandoned: schedule next to it and leave it to its own --execute)`,
       );
     }
     console.log(chalk.yellow(`WARNING: scheduling next to ${pending.length} pending operation(s):\n${list}`));
@@ -2383,7 +2540,6 @@ async function executeScheduled(
   const { ethers } = hre;
   const timelock = ctx.timelock!;
   const { admin, guard, safe, chainId, forkLike } = ctx;
-  const enforceData = ctx.guardIface.encodeFunctionData("enforce", [safe]);
   type Op = ScheduledOp & { block: number };
   let ops: Op[];
   if (args.op) {
@@ -2399,10 +2555,29 @@ async function executeScheduled(
     for (const id of ids) {
       const op = await rebuildOperation(ctx, scan, id);
       if (op.calls.some((c) => lower(c.target) !== lower(guard)))
-        throw Error(`operation ${id} targets something other than the guard: not a sync operation`);
+        throw Error(
+          `operation ${id} targets something other than the guard (a timelock self-call or a foreign target): this task executes guard operations only; decode it with curator-guard-verify --op`,
+        );
+      // A value on a call is never what a sync or a runbook recipe schedules, and the guard's `executeBefore` is not
+      // payable: such an operation cannot execute, and sent with zero values it is another operation id, so the
+      // simulation would blame an unrelated id (review G19c-1; `curator-guard-verify --op / --manifest` name the value).
+      const valued = op.calls.filter((c) => c.value !== 0n).length;
+      if (valued)
+        throw Error(
+          `operation ${id} carries a value on ${valued} of its call(s): never what a sync or a runbook recipe schedules (the guard's executeBefore is not payable, so it can never execute); decode it with curator-guard-verify --op, then ${cancelHint(id)}`,
+        );
       const deadlines = op.calls.map((c) => unwrapExecuteBefore(ctx.guardIface, c.data)?.deadline);
       if (deadlines.some((d) => d === undefined))
-        throw Error(`operation ${id} has a call that is not an executeBefore wrapper: not a sync operation`);
+        throw Error(
+          `operation ${id} has a call that is not wrapped in executeBefore(deadline, call): this task executes wrapped operations only (docs section 7.5); an unwrapped one is executed by hand or cancelled`,
+        );
+      // A wrapper inside a wrapper hides its innermost call from `isSyncCall`, so a sync-shaped call the diff does not
+      // want would run as "a call no sync produces" behind --confirm-sensitive; no sync and no runbook recipe wraps
+      // twice (review G19c-2).
+      if (op.calls.some((c) => isNestedWrapper(ctx.guardIface, c.data)))
+        throw Error(
+          `operation ${id} wraps a call in executeBefore twice: a nested wrapper is never what a sync or a runbook recipe produces, and it hides its innermost call from the drift check; decode it with curator-guard-verify --op, land it by hand if it is wanted, or ${cancelHint(id)}`,
+        );
       const deadline = (deadlines as bigint[]).reduce((a, b) => (a < b ? a : b));
       ops.push({
         opId: op.opId,
@@ -2412,10 +2587,12 @@ async function executeScheduled(
         payloads: op.calls.map((c) => c.data),
         // An `enforce` lifts a lockdown / Bypass only on a CONFIGURED Safe (the plan's predicate); on a fresh
         // Safe it is the go-live enable, which needs no flag when the first sync is replayed by id after a
-        // reorg (review G14f-5).
-        lifts:
-          op.calls.some((c) => unwrapExecuteBefore(ctx.guardIface, c.data)?.data === enforceData) &&
-          (await safeIsConfigured(ctx.guardContract, safe)),
+        // reorg (review G14f-5). A hand-scheduled `bypass` is a lift wherever it lands: it ends a lockdown
+        // and voids the standing approvals (review G9e-1).
+        lifts: await liftsOf(
+          ctx,
+          op.calls.map((c) => c.data),
+        ),
         kind: op.kind,
         block: op.block,
       });
@@ -2456,9 +2633,7 @@ async function executeScheduled(
         ...op,
         // Never believed from the file: a lift is an `enforce` on a configured Safe, as the `--op` path derives it (the
         // id check above proves the payloads and nothing else; review G17b-4).
-        lifts:
-          op.payloads.some((p) => unwrapExecuteBefore(ctx.guardIface, p)?.data === enforceData) &&
-          (await safeIsConfigured(ctx.guardContract, safe)),
+        lifts: await liftsOf(ctx, op.payloads),
         block: (scan.ops.get(op.opId) ?? scan.ops.get(lower(op.opId)))?.block ?? 0,
       });
     }
@@ -2515,36 +2690,49 @@ async function executeScheduled(
     if (!args.dryRun && !args.op) removeState(stateFile);
     return;
   }
-  if (!plan.calls.length) {
+  // Calls no sync produces (`SYNC_CALLS`) in an operation named with --op: the operator scheduled them
+  // by hand (docs section 7.5 / 7.6) and names them again here; they run exactly as named, behind
+  // --confirm-sensitive, and the diff has no say on them. The state file only ever holds sync calls.
+  const explicitCalls = (op: Op): string[] =>
+    args.op ? op.payloads.filter((p) => !isSyncCall(ctx.guardIface, p)) : [];
+  if (!plan.calls.length && !pendingOps.some((op) => explicitCalls(op).length > 0)) {
     for (const op of pendingOps) {
-      // A hand-scheduled one-off (an approval, a role change, a window) is never a sync operation: this task
-      // does not execute it (review G9e-1, held) and must not advise cancelling it (review G15a-3).
+      // A hand-scheduled one-off (an approval, a role change, a window) reached here without being named:
+      // this task runs it only as `--execute --op <id> --confirm-sensitive` (review G9e-1) and must not
+      // advise cancelling it as an abandoned sync (review G15a-3).
       console.log(
         chalk.yellow(
           isOneOff(ctx, op.payloads)
-            ? `operation ${op.opId} is not a policy sync (a one-off: see curator-guard-verify --op): this task does not execute it; once Ready, land it with the timelock's own execute / executeBatch, or ${cancelHint(op.opId)}`
+            ? `operation ${op.opId} is not a policy sync (a one-off: see curator-guard-verify --op): once Ready, re-run with --execute --op ${op.opId} --confirm-sensitive to land it exactly as named, or land it with the timelock's own execute / executeBatch, or ${cancelHint(op.opId)}`
             : `the policy is already in sync; operation ${op.opId} is still queued: ${cancelHint(op.opId)}`,
         ),
       );
     }
     return;
   }
-  // Every stored call must still be wanted. Extra calls in the current diff (a fast-lane change during
-  // the delay: a council-added guardian, a guardian's revocation) do not invalidate what was reviewed
-  // and scheduled; they are picked up by the next sync.
+  // Every stored sync call must still be wanted. Extra calls in the current diff (a fast-lane change
+  // during the delay: a council-added guardian, a guardian's revocation) do not invalidate what was
+  // reviewed and scheduled; they are picked up by the next sync.
   const lockedAt: bigint = await ctx.guardContract.lockedAt(safe);
   const runnable: Op[] = [];
   for (const op of pendingOps) {
+    const named = explicitCalls(op);
+    if (!named.length && !plan.calls.length) {
+      console.log(
+        chalk.yellow(`the policy is already in sync; operation ${op.opId} is still queued: ${cancelHint(op.opId)}`),
+      );
+      continue;
+    }
     const wanted = new Set(wrap(plan.calls, BigInt(op.deadline)));
-    const stale = op.payloads.filter((p) => !wanted.has(p));
-    if (stale.length && isOneOff(ctx, op.payloads)) {
-      // A hand-scheduled one-off (an approval, a role change, a window, a hand-over step) is never a sync
-      // operation: this task does not execute it (review G9e-1, held) and must not advise cancelling it
-      // as a drifted sync (review G15a-3); `curator-guard-verify --op` gives it its own verdict.
+    const stale = op.payloads.filter((p) => !named.includes(p) && !wanted.has(p));
+    if (stale.length && !named.length && isOneOff(ctx, op.payloads)) {
+      // A hand-scheduled one-off (an approval, a role change, a window, a hand-over step) reached the
+      // state-file path or was named without --op: never a drifted sync (review G15a-3); it runs only as
+      // `--execute --op <id> --confirm-sensitive` (review G9e-1), and `curator-guard-verify --op` gives it its verdict.
       console.log(
         chalk.yellow(
-          `operation ${op.opId} is not a policy sync (a one-off: curator-guard-verify --op decodes it): this task does not ` +
-            `execute it; once Ready, land it with the timelock's own execute / executeBatch, or ${cancelHint(op.opId)}`,
+          `operation ${op.opId} is not a policy sync (a one-off: curator-guard-verify --op decodes it): once Ready, re-run with ` +
+            `--execute --op ${op.opId} --confirm-sensitive to land it exactly as named, or land it with the timelock's own execute / executeBatch, or ${cancelHint(op.opId)}`,
         ),
       );
       continue;
@@ -2554,8 +2742,8 @@ async function executeScheduled(
       // deadline, so it is named loudly rather than failing the run (review R7C-04).
       console.log(
         chalk.red(
-          `NOT executing operation ${op.opId}: ${stale.length} of its call(s) are no longer what the current diff wants (the file or the chain ` +
-            `changed since scheduling):\n    ${stale.map((p) => describeTimelockCall(ctx, guard, p)).join("\n    ")}\n  it stays executable by anyone until ${iso(BigInt(op.deadline))}: ${cancelHint(op.opId)}`,
+          `NOT executing operation ${op.opId}: ${stale.length} of its call(s) are not what the current diff wants (never in it: a sync-shaped ` +
+            `call scheduled by hand; or the file or the chain changed since scheduling):\n    ${stale.map((p) => describeTimelockCall(ctx, guard, p)).join("\n    ")}\n  it stays executable by anyone until ${iso(BigInt(op.deadline))}: ${cancelHint(op.opId)}`,
         ),
       );
       continue;
@@ -2567,6 +2755,22 @@ async function executeScheduled(
         ),
       );
       continue;
+    }
+    if (named.length) {
+      // Printed before anything is sent, the cancel calldata first: the operator reads what the
+      // operation does, not what the file would have done (review G9e-1, G10a / G10e second opinions).
+      const lines = named.map((p) => `    ${describeTimelockCall(ctx, guard, p)}`).join("\n");
+      if (!args.confirmSensitive)
+        throw Error(
+          `operation ${op.opId} carries ${named.length} call(s) no sync produces:\n${lines}\n  this task executes them only as named: ` +
+            `decode the operation with curator-guard-verify --op ${op.opId}, then re-run with --confirm-sensitive; if it is not wanted, ${cancelHint(op.opId)}`,
+        );
+      console.log(
+        chalk.yellow(
+          `operation ${op.opId} carries ${named.length} call(s) no sync produces; --op and --confirm-sensitive given, so they run exactly as named; ` +
+            `if that is wrong, stop now and ${cancelHint(op.opId)}\n${lines}`,
+        ),
+      );
     }
     if (op.lifts) {
       // The lift was reviewed with --allow-unlock when it was scheduled; a lockdown that happened AFTER
@@ -2650,7 +2854,13 @@ async function executeScheduled(
       throw Error(`operation ${op.opId} would revert: ${decoded}`);
     }
     if (args.dryRun) {
-      console.log(chalk.green(`dry run: operation ${op.opId} is ready, wanted and simulates fine`));
+      // A one-off (an operation with calls no sync produces, run as named behind --confirm-sensitive) is not "wanted"
+      // by any diff: say what it is (review G19c-4).
+      console.log(
+        chalk.green(
+          `dry run: operation ${op.opId} is ready, ${explicitCalls(op).length ? "run as named (a one-off)" : "wanted"} and simulates fine`,
+        ),
+      );
       continue;
     }
     const tx = await executor.sendTransaction({ to: admin, data });
@@ -2689,6 +2899,18 @@ async function executeScheduled(
     chalk.green(
       `${executed} of ${runnable.length} operation(s) executed; re-run without --execute to verify "already in sync"`,
     ),
+  );
+}
+
+/// A lift, re-derived from the payloads on BOTH execute paths (never believed from the state file, review G17b-4): an
+/// `enforce` of a CONFIGURED Safe (on a fresh Safe it is the go-live enable, review G14f-5), or a `bypass` wherever it
+/// lands (it ends a lockdown and voids the standing approvals, review G9e-1). One expression (review G19c-3).
+async function liftsOf(ctx: Ctx, payloads: string[]): Promise<boolean> {
+  const enforceData = ctx.guardIface.encodeFunctionData("enforce", [ctx.safe]);
+  return (
+    (payloads.some((p) => unwrapExecuteBefore(ctx.guardIface, p)?.data === enforceData) &&
+      (await safeIsConfigured(ctx.guardContract, ctx.safe))) ||
+    payloads.some((p) => innerGuardCall(ctx.guardIface, p)?.name === "bypass")
   );
 }
 
@@ -3048,17 +3270,79 @@ function unwrapExecuteBefore(iface: Interface, data: string): { deadline: bigint
   }
 }
 
+/// The guard calls `planDiff` produces, by name. In an operation named with `--op` these are compared
+/// with the current diff (a drifted one is refused); every other call is one the operator scheduled by
+/// hand (docs section 7.5 / 7.6) and runs only as named, behind `--confirm-sensitive` (review G9e-1).
+const SYNC_CALLS = new Set([
+  "allowFunction",
+  "addAllowedValues",
+  "removeAllowedValues",
+  "revokeFunction",
+  "setMultiSendUnwrapper",
+  "setModuleAllowed",
+  "setNativeTransferAllowed",
+  "setGuardian",
+  "setRequiredFallbackHandler",
+  "enforce",
+  "lockdown",
+]);
+/// Role, window, approval, admin-transfer and deployment-wide calls, lifts included: tagged wherever a
+/// scheduled call is printed, so a queue listing or a `--op` print names what an incident turns on. A cancel
+/// of a hand-over and a rollback of an admin-delay change decide the same race as the begin and the change
+/// (docs section 7.5, reviews G16a-1, G16f-2 and G18d-1).
+const SENSITIVE_CALL =
+  /^(grantRole|revokeRole|renounceRole|beginDefaultAdminTransfer|cancelDefaultAdminTransfer|acceptDefaultAdminTransfer|changeDefaultAdminDelay|rollbackDefaultAdminDelay|setDeploymentGuardian|setGuardian|setUnwrapperCodehash|bypass|enforce|lockdownAndRevoke|approveTransaction|revokeApproval|revokeAllApprovals)\b/;
+
+/// The guard call inside an `executeBefore` wrapper, by name, or `undefined` for anything else.
+function innerGuardCall(iface: Interface, payload: string): { name: string; data: string } | undefined {
+  const inner = unwrapExecuteBefore(iface, payload);
+  if (!inner) return undefined;
+  try {
+    const parsed = iface.parseTransaction({ data: inner.data });
+    return parsed ? { name: parsed.name, data: inner.data } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+const isSyncCall = (iface: Interface, payload: string): boolean => {
+  const name = innerGuardCall(iface, payload)?.name;
+  return name !== undefined && SYNC_CALLS.has(name);
+};
+
+/// A wrapper inside a wrapper (`executeBefore(d1, executeBefore(d2, call))`): the guard runs it (the delegatecall keeps
+/// the caller), the sync and every runbook recipe wrap exactly once, and the one-level decoders above see only the inner
+/// wrapper (review G19c-2).
+const isNestedWrapper = (iface: Interface, payload: string): boolean => {
+  const inner = unwrapExecuteBefore(iface, payload);
+  return inner !== undefined && unwrapExecuteBefore(iface, inner.data) !== undefined;
+};
+
 /// Human text for a call scheduled on the timelock, decoded through the guard's ABI (executeBefore
-/// unwrapped), the timelock's own ABI (flagged GOVERNANCE), or marked FOREIGN.
+/// unwrapped), the timelock's own ABI (flagged GOVERNANCE), or marked FOREIGN. A guard call that no
+/// sync produces is tagged, as `[ROLE / INCIDENT-SENSITIVE]` or `[NOT A SYNC CALL]`.
 function describeTimelockCall(ctx: Ctx, target: string, data: string): string {
   if (lower(target) === lower(ctx.guard)) {
     const inner = unwrapExecuteBefore(ctx.guardIface, data);
-    const prefix = inner ? `executeBefore(${iso(inner.deadline)}) ` : "";
-    const text = describeGuardCall(ctx.guardIface, inner ? inner.data : data);
+    let prefix = inner ? `executeBefore(${iso(inner.deadline)}) ` : "";
+    // A wrapper inside a wrapper is unwrapped level by level for the print and tagged, so the veto reads the innermost
+    // call and not a hex string (review G19c-2); `--execute --op` refuses it.
+    let innermost = inner ? inner.data : data;
+    let nested = false;
+    for (
+      let next = inner && unwrapExecuteBefore(ctx.guardIface, inner.data);
+      next;
+      next = unwrapExecuteBefore(ctx.guardIface, next.data)
+    ) {
+      nested = true;
+      prefix += `executeBefore(${iso(next.deadline)}) `;
+      innermost = next.data;
+    }
+    const text = describeGuardCall(ctx.guardIface, innermost);
     // A seat for the guard's own address is a dead seat (review G10a-2): say so where the veto reads the queue.
     const deadSeat = (() => {
       try {
-        const parsed = ctx.guardIface.parseTransaction({ data: inner ? inner.data : data });
+        const parsed = ctx.guardIface.parseTransaction({ data: innermost });
         if (!parsed) return false;
         const seatOf: Record<string, number> = {
           grantRole: 1,
@@ -3072,12 +3356,7 @@ function describeTimelockCall(ctx: Ctx, target: string, data: string): string {
         return false;
       }
     })();
-    // A cancel of a hand-over and a rollback of an admin-delay change decide the same race as the begin and the change
-    // (docs section 7.5, reviews G16a-1 and G16f-2): role-sensitive like them (review G18d-1).
-    const sensitive =
-      /^(grantRole|revokeRole|renounceRole|beginDefaultAdminTransfer|cancelDefaultAdminTransfer|changeDefaultAdminDelay|rollbackDefaultAdminDelay|setDeploymentGuardian|setGuardian|bypass|approveTransaction|enforce)\b/.test(
-        text,
-      );
+    const sensitive = SENSITIVE_CALL.test(text);
     // A cancel chained behind a hostile begin must be BARE: the begin carries no deadline and its proposer lands
     // it when it likes, so a wrapped cancel is waited out and dies `DeadlinePassed` in the block the begin lands
     // (section 7.5, review G16a-1). Named wherever the call is printed (the queue, --op, --manifest).
@@ -3086,7 +3365,10 @@ function describeTimelockCall(ctx: Ctx, target: string, data: string): string {
     // authorises (review G11f), and the queue print joins calls with " | " (review P1b-5).
     const [first, ...rest] = text.split("\n");
     const tags =
-      (sensitive ? "  [ROLE / INCIDENT-SENSITIVE]" : "") +
+      (sensitive ? "  [ROLE / INCIDENT-SENSITIVE]" : isSyncCall(ctx.guardIface, data) ? "" : "  [NOT A SYNC CALL]") +
+      (nested
+        ? "  [NESTED WRAPPER: a wrapper inside a wrapper, never what a sync or a recipe produces, review G19c-2]"
+        : "") +
       (deadSeat ? "  [DEAD SEAT: the guard itself, review G10a-2]" : "") +
       (wrappedCancel ? "  [WRAPPED CANCEL: can be waited out past its deadline, schedule it bare]" : "");
     return [`${prefix}${first}${tags}`, ...rest].join("\n");
@@ -3098,6 +3380,17 @@ function describeTimelockCall(ctx: Ctx, target: string, data: string): string {
     } catch {
       return `TIMELOCK SELF-CALL ${data.slice(0, 10)}…  [GOVERNANCE, undecodable]`;
     }
+  }
+  // A target that is not this guard but whose calldata decodes through this guard's ABI is, in practice, a sibling
+  // guard under the same timelock: the replacement guard of section 7.5, synced by its own run of this task, whose
+  // operations this run printed as opaque FOREIGN bytes with the advice to cancel what is abandoned (review G20g-3).
+  try {
+    if (ctx.guardIface.parseTransaction({ data })) {
+      const decoded = describeTimelockCall({ ...ctx, guard: target }, target, data);
+      return `SIBLING GUARD? ${target}: ${decoded}  [decoded through this guard's ABI: a replacement guard under this timelock (section 7.5) or a selector collision; its own sync lands it: never cancel it as abandoned]`;
+    }
+  } catch {
+    /* not a guard call: foreign */
   }
   return `FOREIGN TARGET ${target} data ${data.slice(0, 10)}… (${(data.length - 2) / 2} bytes)`;
 }
