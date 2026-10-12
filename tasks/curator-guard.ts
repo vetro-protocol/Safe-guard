@@ -446,6 +446,11 @@ type Plan = {
   revocations: number;
   loosenings: string[];
   currentMode: (typeof CHAIN_MODES)[number];
+  /// Unwrappers the file lists whose code hash the guard FORBIDS right now (a council or admin narrowing): left out of
+  /// the diff, printed, and a reason to refuse a NEW schedule; never a reason for `--execute` or `verify` to stop
+  /// (review G22c-6: one forbidden hash killed every tooling run on the committed file, the incident's own
+  /// `--execute --op --confirm-sensitive` included).
+  blocked: string[];
 };
 
 const lower = (a: string) => a.toLowerCase();
@@ -618,6 +623,10 @@ task("curator-guard-sync", "Reconcile a CuratorGuard policy for a Safe against a
         } else console.log(chalk.blue(`no operation pending on the timelock ${ctx.admin}`));
       }
       const plan = await planDiff(hre, ctx, policy, false, args.allowUnconstrainedNav === true);
+      // A forbidden unwrapper hash is an incident state of the chain, not a typo in the file: a new schedule of this
+      // file is refused (it would register nothing and the file is wrong for the chain), an --execute of what is
+      // already queued goes on (review G22c-6).
+      if (plan.blocked.length && !args.execute) throw Error(plan.blocked.join("\n"));
       if (!plan.calls.length && !args.execute) {
         console.log(chalk.blue("Policy already in sync; nothing to do."));
         return;
@@ -707,6 +716,8 @@ task(
         let pendingNamed = 0;
         const now = BigInt((await hre.ethers.provider.getBlock("latest"))!.timestamp);
         let pendingCalls = 0;
+        let otherSafeCalls = 0;
+        const otherSafes = new Set<string>();
         const siblings = new Set<string>();
         for (const id of args.op!.split(",")) {
           const op = await rebuildOperation(ctx, scan, id.trim());
@@ -741,8 +752,15 @@ task(
               if (guardTarget && inner !== undefined && SYNC_SELECTORS.has(inner.data.slice(0, 10))) ++syncShaped;
               if (guardTarget && isNestedWrapper(ctx.guardIface, c.data)) ++nested;
               if (sibling) siblings.add(getAddress(c.target));
+              const forSafe = guardTarget ? syncCallSafe(ctx.guardIface, c.data) : undefined;
+              if (forSafe !== undefined && lower(forSafe) !== lower(ctx.safe)) {
+                ++otherSafeCalls;
+                otherSafes.add(getAddress(forSafe));
+              }
             }
-            const [first, ...rest] = describeTimelockCall(ctx, c.target, c.data).split("\n");
+            const [first, ...rest] = (
+              describeTimelockCall(ctx, c.target, c.data) + (await designatorTag(ctx, c.data))
+            ).split("\n");
             // A wrapper whose deadline is behind the clock, or behind the Ready time, can never execute: the timelock
             // accepted it at proposal, the proposer signed it, and only the veto can clear it (review G21c-3).
             const deadline =
@@ -793,6 +811,26 @@ task(
             );
             return;
           }
+        }
+        // A sync for ANOTHER Safe under this guard (every pending guard call a sync call whose Safe is not this file's)
+        // is not drift: the execute path and the sync's pending print say so (review G21b-1); this verdict did not, and
+        // read "do not sign / execute blindly" to the veto (review G22c-3).
+        if (
+          !allMatch &&
+          syncShaped > 0 &&
+          nested === 0 &&
+          otherSafes.size &&
+          pendingCalls > 0 &&
+          otherSafeCalls === pendingCalls
+        ) {
+          console.log(
+            chalk.yellow(
+              `every pending call named is a policy sync for another Safe under this guard (${[...otherSafes].join(", ")}), ` +
+                `not for ${ctx.safe}: judge it with that Safe's policy file (curator-guard-verify --policy <its file> --op <id>); ` +
+                "it is not abandoned and not this file's drift",
+            ),
+          );
+          return;
         }
         if (!allMatch && syncShaped === 0) {
           // A wrapper inside a wrapper is no recipe's product (review G19c-2): the innermost call is decoded on its
@@ -1903,29 +1941,31 @@ async function planDiff(
       say(chalk.red(`- ${label} ${a}`));
     }
   };
+  const blocked: string[] = [];
+  const wantedUnwrappers: string[] = [];
   for (const u of policy.multiSendUnwrappers ?? []) {
     const code = await ethers.provider.getCode(u);
     if (code === "0x")
       throw Error(`unwrapper ${u} has no code (the contract rejects it: its code hash is not a canonical build)`);
     const codehash = ethers.keccak256(code);
     if (!(await guard.isUnwrapperCodehash(codehash))) {
-      throw Error(
+      // Not a throw (review G22c-6): the entry is left out of the diff and named; the schedule path refuses on it.
+      const why =
         `unwrapper ${u} runtime code hash ${codehash} is not allowed on the guard: only the canonical MultiSendCallOnly ` +
-          `builds seeded at deployment (v1.3.0 / v1.4.1 / v1.5.0) can ever be unwrappers (a forbidden seeded hash is ` +
-          `re-allowed by the admin or the council; a newer Safe release means a new guard)`,
-      );
+        `builds seeded at deployment (v1.3.0 / v1.4.1 / v1.5.0) can ever be unwrappers (a forbidden seeded hash is ` +
+        `re-allowed by the admin or the council; a newer Safe release means a new guard); its registration is left ` +
+        `out of this diff: re-allow the hash or drop the entry from the file before scheduling`;
+      blocked.push(why);
+      console.log(chalk.red(`WARNING: ${why}`));
+      continue;
     }
+    wantedUnwrappers.push(u);
   }
   for (const m of policy.modules ?? []) {
     if ((await ethers.provider.getCode(m)) === "0x")
       throw Error(`module ${m} has no code (the contract would accept it: a module is a contract, this is a typo)`);
   }
-  await syncSet(
-    "unwrap  ",
-    policy.multiSendUnwrappers ?? [],
-    await guard.multiSendUnwrappers(safe),
-    "setMultiSendUnwrapper",
-  );
+  await syncSet("unwrap  ", wantedUnwrappers, await guard.multiSendUnwrappers(safe), "setMultiSendUnwrapper");
   await syncSet("module  ", policy.modules ?? [], await guard.modules(safe), "setModuleAllowed");
   const nativeHave: string[] = [];
   for (const t of new Set([...onChainTargets, ...(policy.nativeTransfers ?? []).map((a) => ethers.getAddress(a))])) {
@@ -2076,7 +2116,7 @@ async function planDiff(
     }
     say(chalk.yellow(`~ mode    ${currentMode} -> ${policy.mode}`));
   }
-  return { calls, lifts, revocations, loosenings, currentMode };
+  return { calls, lifts, revocations, loosenings, currentMode, blocked };
 }
 
 /// A figure the gate could not read as a number: an EVM-level answer (a revert, a Panic, no code behind `pool()`) is
@@ -2606,6 +2646,21 @@ async function applyAsAdmin(
     null,
     2,
   );
+  // Who proposes is checked BEFORE the dry run returns and before the manifest is written: a dry run with no
+  // --proposer, or with a Safe that holds no PROPOSER_ROLE, passed as "would schedule", and the real run wrote the
+  // signer manifest (naming that Safe as the proposer) and only then refused (review G22c-1).
+  const proposerRole: string = await timelock.PROPOSER_ROLE();
+  const signerProposes = !!(signer && signerAddress && (await timelock.hasRole(proposerRole, signerAddress)));
+  let proposer: string | undefined;
+  if (!signerProposes) {
+    if (!args.proposer)
+      throw Error(
+        "the signer is not a timelock proposer: pass --proposer <address> (a proposer Safe, or an EOA on a fork)",
+      );
+    proposer = ethers.getAddress(args.proposer);
+    if (!(await timelock.hasRole(proposerRole, proposer)))
+      throw Error(`${proposer} does not hold PROPOSER_ROLE on ${admin}`);
+  }
   if (args.dryRun) {
     console.log(
       chalk.blue(
@@ -2617,8 +2672,7 @@ async function applyAsAdmin(
   fs.writeFileSync(manifest, manifestText);
   console.log(chalk.blue(`  signer manifest written to ${manifest}`));
 
-  const proposerRole: string = await timelock.PROPOSER_ROLE();
-  if (signer && signerAddress && (await timelock.hasRole(proposerRole, signerAddress))) {
+  if (signerProposes) {
     for (const data of scheduleCalls) {
       const tx = await signer.sendTransaction({ to: admin, data });
       await tx.wait();
@@ -2632,16 +2686,9 @@ async function applyAsAdmin(
     );
     return;
   }
-  if (!args.proposer)
-    throw Error(
-      "the signer is not a timelock proposer: pass --proposer <address> (a proposer Safe, or an EOA on a fork)",
-    );
-  const proposer = ethers.getAddress(args.proposer);
-  if (!(await timelock.hasRole(proposerRole, proposer)))
-    throw Error(`${proposer} does not hold PROPOSER_ROLE on ${admin}`);
   if (forkLike) {
-    console.log(chalk.yellow(`Fork network: impersonating proposer ${proposer}`));
-    const who = await impersonate(proposer);
+    console.log(chalk.yellow(`Fork network: impersonating proposer ${proposer!}`));
+    const who = await impersonate(proposer!);
     for (const data of scheduleCalls) {
       const tx = await who.sendTransaction({ to: admin, data });
       await tx.wait();
@@ -2659,7 +2706,7 @@ async function applyAsAdmin(
     );
   }
   try {
-    for (const data of scheduleCalls) await saveForSafeBatchExecution({ from: proposer, to: admin, data, value: "0" });
+    for (const data of scheduleCalls) await saveForSafeBatchExecution({ from: proposer!, to: admin, data, value: "0" });
     await executeBatchUsingSafe(hre);
   } catch (e: unknown) {
     // Nothing of ours may linger in the shared Safe batch file: another task would propose it, merged
@@ -3069,14 +3116,35 @@ async function executeScheduled(
   }
   if (scan.degraded)
     console.log(chalk.yellow(`WARNING: other pending operations could NOT be listed (${scan.degraded})`));
-  for (const other of await pendingOperations(ctx, scan)) {
-    if (ops.some((o) => o.opId === other.opId)) continue;
+  // Capped like the routine queue print (review G13f-1): after a flood this tail printed every pending operation
+  // in full, 52 lines of decoded batches at the end of an execute (review G22c-5).
+  const others = (await pendingOperations(ctx, scan)).filter((other) => !ops.some((o) => o.opId === other.opId));
+  for (const other of others.slice(0, QUEUE_PRINT_CAP)) {
+    // A pending sync of ANOTHER Safe under this guard (its own per-Safe file, review G21b-1) is not abandoned: the end-of-run
+    // warning must not hand out its cancel calldata (measured in review G22d: the curator Safe's --execute named the second
+    // Safe's sync with "if abandoned, cancel it").
+    const otherPayloads = other.calls.map((c) => c.data);
+    const otherSafes = new Set(
+      otherPayloads
+        .map((p) => syncCallSafe(ctx.guardIface, p))
+        .filter((s): s is string => s !== undefined && lower(s) !== lower(safe)),
+    );
+    const foreignSync =
+      otherSafes.size > 0 && otherPayloads.every((p) => otherSafes.has(syncCallSafe(ctx.guardIface, p) ?? ""));
     console.log(
       chalk.yellow(
-        `WARNING: operation ${other.opId} is still pending: ${other.description}; if abandoned, ${cancelHint(other.opId)}`,
+        foreignSync
+          ? `NOTE: operation ${other.opId} is still pending: a policy sync for another Safe under this guard (${[...otherSafes].join(", ")}); it is not abandoned: leave it to that Safe's own --execute`
+          : `WARNING: operation ${other.opId} is still pending: ${other.description}; if abandoned, ${cancelHint(other.opId)}`,
       ),
     );
   }
+  if (others.length > QUEUE_PRINT_CAP)
+    console.log(
+      chalk.yellow(
+        `  ... and ${others.length - QUEUE_PRINT_CAP} more still pending (curator-guard-verify --op <id> decodes any one)`,
+      ),
+    );
   console.log(
     chalk.green(
       `${executed} of ${runnable.length} operation(s) executed; re-run without --execute to verify "already in sync"`,
@@ -3204,11 +3272,35 @@ async function timelockScan(hre: HardhatRuntimeEnvironment, ctx: Ctx, tolerate: 
   return { from, ops };
 }
 
+/// An approval into an EIP-7702 designator (code `0xef0100…`): the guard checks the target's code when the approval is
+/// issued, and the designator's key can clear the delegation afterwards, after which the approved call lands on an empty
+/// account, is consumed and is reported as executed (review G22a-1). Tagged wherever the veto reads the queue; the policy
+/// lane refuses such a target at every use, the approval lane at issue only.
+async function designatorTag(ctx: Ctx, payload: string): Promise<string> {
+  const inner = innerGuardCall(ctx.guardIface, payload);
+  if (!inner || inner.name !== "approveTransaction") return "";
+  try {
+    const parsed = ctx.guardIface.parseTransaction({ data: inner.data });
+    const to = String(parsed?.args[2] ?? "");
+    const provider = ctx.guardContract.runner?.provider;
+    if (!provider || !/^0x[0-9a-fA-F]{40}$/.test(to)) return "";
+    const code = await provider.getCode(to);
+    return code.toLowerCase().startsWith("0xef0100")
+      ? "  [7702 DESIGNATOR: its key can clear the code after issue, and the approval would then spend on an empty account, review G22a-1]"
+      : "";
+  } catch {
+    return "";
+  }
+}
+
 async function pendingOperations(ctx: Ctx, scan: Scan): Promise<(ScanOp & { description: string })[]> {
   const out: (ScanOp & { description: string })[] = [];
   for (const op of scan.ops.values()) {
     if (!(await ctx.timelock!.isOperationPending(op.opId))) continue;
-    out.push({ ...op, description: op.calls.map((c) => describeTimelockCall(ctx, c.target, c.data)).join(" | ") });
+    const parts: string[] = [];
+    for (const c of op.calls)
+      parts.push(describeTimelockCall(ctx, c.target, c.data) + (await designatorTag(ctx, c.data)));
+    out.push({ ...op, description: parts.join(" | ") });
   }
   return out;
 }

@@ -1068,6 +1068,9 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     ///      code in the Safe's context, so that code must be a deployed contract: an EIP-7702 delegated
     ///      EOA (its code starts with `0xef`, which EIP-3541 reserves) can be re-pointed by its key at
     ///      any time, before or after the approval is issued.
+    ///      This rail runs at issue only: a plain call approved into such an EOA whose key then clears the
+    ///      delegation is consumed on an empty account (the policy lane refuses the same target at every
+    ///      use), so an approval never names a designator (review G22a-1).
     function _checkApprovalTarget(address to_, uint256 dataLength_, Operation operation_) internal view {
         bool _bad;
         assembly ("memory-safe") {

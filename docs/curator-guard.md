@@ -280,7 +280,11 @@ issued (`InvalidTarget`): never the guard itself, never the zero address (an app
 burn, review G17a-3), never an account without code when calldata is sent
 or for a delegatecall (the call would "succeed", spend the one-off and do nothing), never a
 delegatecall into EIP-7702 delegated code (its key can re-point it at any time), and a module-bound
-approval names a module that is neither the Safe nor the guard. An approved DELEGATECALL is bound to
+approval names a module that is neither the Safe nor the guard. The code rail runs when the approval is
+issued and not again at use: a plain call approved into EIP-7702 delegated code whose key then clears the
+delegation lands on an empty account, is consumed and is reported as executed (the policy lane refuses such a
+target at every use), so never approve a call into a designator; the tooling tags one wherever the veto reads
+the queue (review G22a-1). An approved DELEGATECALL is bound to
 the code at `to` when it was issued (the code hash is folded into the approval id: once the code
 differs, the approval is void). An approved delegatecall into canonical `MultiSendCallOnly` code is
 still a batch and is decoded at use with the strict decoder (canonical encoding, plain-call entries,
@@ -1528,8 +1532,8 @@ points at another guard. If the guard was installed before the policy sync execu
   `--execute --op <id> --confirm-sensitive`, the flag that says the operation was read and is wanted
   as named (review G9e-1); an operation scheduled by hand with salt 0 rebuilds too). While both guards sit
   under the timelock, `curator-guard-verify --op` judges an operation against the file of the guard named
-  with `--guard`: run with the installed guard it prints every call of the replacement's sync as "NOT a guard
-  call" and the verdict "a one-off operation (role- or incident-sensitive …)", which is not a reason to cancel
+  with `--guard`: run with the installed guard it prints every call of the replacement's sync as `SIBLING GUARD? <replacement>: …
+  (a SIBLING guard's call: not judged against this guard's file)` and the verdict "every pending call named addresses <replacement>: a guard under this timelock that is not --guard … never cancel it as abandoned on this verdict" (measured in review G22d; before G21b-2 it read "NOT a guard call" and "a one-off operation"), which is not a reason to cancel
   it; verify the replacement's operations with `--guard <replacement>` and the file pinned to it (review
   G21b-2). The post-check tolerates the change only on the approved transaction. Safe
   v1.5.0: the swap is TWO slots, and each self-call is checked by whichever guard sits in the
@@ -1854,7 +1858,7 @@ name the timelock's self-calls, foreign targets, `grantRole` / `revokeRole` / `u
 `approveTransaction` / `bypass` / `setRequiredFallbackHandler` / `setModuleAllowed` and every widening as the loudest
 (a `cancelDefaultAdminTransfer` wrapped in `executeBefore` is the shape §7.5 forbids, waited out past its deadline,
 review G16a-1; a grant, a guardian seat or a hand-over for the guard's OWN address is a dead seat, review G16g-4; an
-`approveTransaction` whose target is the zero address is an approved burn of the value, review G17a-3; and the
+`approveTransaction` whose target is the zero address can no longer be issued (the guard refuses it with `InvalidTarget` since the round-21 follow-up, G17a-3), so a queued one dies at execution for every executor and stays Ready until the veto cancels it: page it as a dead operation, never wait for the approval it will not issue (measured in review G22d); and the
 wrapper's `uint64` deadline is printed raw when no date type holds it, never dropped with the page or the wrapper,
 review G17b-1: all four measured in review G18d; and `executeBefore` is unwrapped to a FIXED POINT before any of these names is looked for: a wrapper inside a wrapper hid a 180-day admin window from a one-level decoder as `executeBefore(<deadline>, 0x3280d2ee…)` until `ModeUpdated` opened it, review G19g-1 and G20d): an approval of
 the curator Safe's own `setGuard(0)` or a 180-day admin window scheduled on the guard carries none of
@@ -1998,7 +2002,7 @@ these selectors (`cast sig`): `SafeLockedDown(address)` `0xf31caf41`, `FunctionN
 `GuardNotInstalled(address)` `0xd4038cc4`, `ForwardedHookCall()` `0xe2bdff4a`, `Unauthorized()` `0x82b42900`,
 `LockdownCooldown(address)` `0x30628f46`, `SafeConfigUnreadable(address)` `0x38cc646a`,
 `NestedExecution(address)` `0x4fef49c8`, `MissingSnapshot(address)` `0xb80de7e1`, `SafeConfigChanged(address)`
-`0xd2ed3dd7`, `ApprovedExecutionFailed(address)` `0x726e39f3`, `FailedCall()` `0xd6bda275` (review G17f-5).
+`0xd2ed3dd7`, `ApprovedExecutionFailed(address)` `0x726e39f3`, `FailedCall()` `0xd6bda275` (review G17f-5); from the deadline helper of §5, inside a `GS013` replay or bubbled unchanged on v1.5.0, `SettlementExpired(uint256)` `0xb225d3ed`; and, for the council's signers following the §7.5 habit (`cast call … --from <council Safe>` prints the selector raw), the council-lane refusals `InvalidTarget(address)` `0xd08525e9` (a zero or codeless target, a non-zero executor), `CouncilCannotApprove(bytes4,uint8)` `0x45816f88`, `SafeInBypass(address)` `0x1a192c33`, `InvalidDuration(uint64)` `0x019451cb`, `AdminIsGuarded(address)` `0xf5631145`, `AddressIsNull()` `0xfb7566d7` and, from the timelock's own rails at proposal, `DelayOutOfRange(uint256)` `0x73a27239`, `TargetHasNoCode(address)` `0xfff23361`, `ForwardedCall(address)` `0xa7eff457` and `DeadlinePassed(uint64)` `0x67680913` from `executeBefore` at execution (measured in review G22d).
 
 Safe{Wallet}'s Tenderly simulation runs with the guard slot zeroed, so "Simulation successful" says
 nothing about the guard; the executor's "Cannot estimate" with one of the reverts above is the real
@@ -2528,8 +2532,9 @@ management and venue one-offs within 7 days, the admin everything else):
 
 ## 10. Test coverage
 
-`forge test` (112 test files plus fifteen shared helpers under `test/guards/` at commit 215ae01, after round 20: 147 suites and
-2,510 tests without an RPC, and ten of the files are fork suites against the live Safe and vaults (38 tests): the six
+`forge test` (119 test files plus sixteen shared helpers under `test/guards/` at the round-22 close, commit cabea06 plus round 22's
+zero-byte applies: 156 suites and
+2,583 tests without an RPC, and ten of the files are fork suites against the live Safe and vaults (38 tests): the six
 `*.e2e.ethereum.t.sol` files need `ETHEREUM_FORK_NODE_URL`
 and `G9a_CanonicalProxyHashes`, `G10d_Fork`, `G11b_Policy` and `G13b_CrossSystem` skip without it; one
 more file, contract
@@ -4235,3 +4240,50 @@ deploy script's reviewed-build pin moved with it; the NatSpec of the target chec
 `[ZERO TARGET]` print stays for an approval read from a guard built before the rail. The only test that flips
 is the build pin. Still held after this: G17a-2, G9c-1, G9b-2, G10a-1, G10a-2, G13f-2b (leave), the symbolic
 suites' adoption (the owner's call), the approve cap and the settlement-deadline deployment (at funding).
+
+#### Round 22 (2026-10-12): the final comprehensive review of the final commit
+
+Seven reviewers took the pushed commit cabea06 as the auditor will: the contracts read end to end with the
+record closed (g22a), the whole property and mutation campaign with the new rail as a property (g22b), the
+tooling read and driven end to end with the lint differential (g22c), the runbook and the monitor executed as
+written (g22d), the package walked from a fresh clone with the lockfile installed (g22e), the remaining held
+list applied and measured (g22f) and the verdict (g22g). All seven say ready to audit and install as shipped.
+Nothing in the contracts: the auditor's own table holds every function's precondition, effect, event and
+reachable revert against §4 with its pin; the campaign gives every recorded verdict (321 checks, none changed since round 20) and
+proves the zero-target rail as a property on both Safe builds, 63 of 65 mutants dying to behaviour; 1,886 policies and 51,316 calldata vectors through the final lint with zero divergences; every runbook step ran as written
+with the round-21 prints and the new rail reaching every print; the fresh clone with `npm ci` under Node 22
+rebuilt the pinned bytes and passed every CI step; every commit of the branch carries true claims. What the
+round found, all zero bytes of guard code: the approval lane checks a target's code when the approval is
+issued and not again at use, so a plain call approved into an EIP-7702 designator whose key then clears the
+delegation lands on an empty account, is consumed and is reported as executed (not custody; §4 and the NatSpec
+say never to approve a call into a designator, the queue and the verify prints tag one, and the +55-byte
+use-time check is held as optional); the new rail, pinned until now by the build hash alone (the two mutants that weaken it
+passed every behavioural test), gets its pins and the two lanes their pinned table (`G22a_Lanes`,
+`G22b_ZeroTarget`, `G22g_ZeroTargetPin`); a dry run passed with a missing proposer and the real run wrote the
+manifest before refusing; the deploy's reused-timelock audit counted logs per call and its lost-guard-record
+re-run minted a second guard; another Safe's sync under the same guard is named as such in the verify verdict
+and in the execute tail, which is capped like the queue print; after the council forbids an unwrapper hash
+every run on the committed file no longer dies in the diff; the monitor variant of the review material pages a
+rescheduled operation, an approval's arguments, a sibling guard's calls, a dead deadline, a half swap and a
+second Safe; the held list re-measured on this commit, each item alone and all six together (every byte and
+flip of round 20 reproduced; the six at once 23,560 bytes, 32 under the gate, 20 flips; G13f-2b's slot-7 insertion
+now also flips the round-21 layout pin, an appended placement keeps it green at the same bytes; the symbolic
+suites' complete adoption counted at 20 files with this round's); §7.5, §7.7 (the zero-target sentence) and §7.8
+(two selectors) corrected; §10's counts. Suite:
+156 suites, 2,583 tests pass without an RPC, 38 fork tests at a settled head and at the CI pin, the
+recovery matrix at the floor, the seeded step, precancun, the drill, the Osaka profile identical; identity
+unchanged (23,267 / 8,204 / 177 bytes). Still held: G17a-2, G9c-1, G9b-2, G10a-1, G10a-2, G13f-2b (leave; append the counter if ever taken), the
+optional use-time code check on the approval lane (G22a-1, +55 bytes), the symbolic suites' adoption (the
+owner's call), the approve cap and the settlement-deadline deployment (at funding).
+
+#### After the twenty-two rounds (2026-10-12)
+
+Rounds 9 to 22 on this repository, 102 reports, every one since round 9 "install as shipped" and the last seven
+"ready to audit". In the bytecode since the port: one Medium contract fix in round 10, two rails and the
+one-day floor after round 13, the nine-byte handler-word mask in each contract after round 18, and the
+eighteen-byte zero-target approval rail after round 21; nothing else. The cheapest path to custody is outside
+the guard by design, two curator keys through the NAV mark on a funded public vault, bounded after funding by
+§8, the band and the debt gate. What remains is the owner's checklist in the review material's final page:
+force `main` to the final hash and make its ruleset effective, set the fork secret and get the first green run,
+send the prompt with the manifest and the summary, rehearse the proposal path once, and the governance moves of
+§8 before any funding.
