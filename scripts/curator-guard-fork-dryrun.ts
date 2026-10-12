@@ -391,6 +391,89 @@ async function main() {
   if ((await timelock.getTimestamp(hostileId)) !== 0n)
     throw Error("BUG: the veto could not cancel the hostile operation");
   console.log("hostile deadline printed as the raw number and cancelled by the veto");
+  // --- the prints the veto reads, pinned here (review G20g-6): the round-19 decoder and the debt gate ------------
+  // (a) A wrapper inside a wrapper hid a sensitive inner call from every print in round 19 (G19c-2 / G19g-1): the
+  //     queue print and `verify --op` must now name the INNERMOST call with the nesting tagged, and the confirm path
+  //     must refuse the operation outright, before readiness and whatever the flags.
+  // (b) The unconstrained-NAV gate must name what sits behind the vault (the recorded strategies' figures, or that
+  //     no record routes to it): the pre-round-18 text said neither.
+  console.log(
+    "--- a nested wrapper in the queue: decoded to its innermost call, tagged, refused on --execute --op ---",
+  );
+  const nestedInner = guard.interface.encodeFunctionData("executeBefore", [
+    BigInt(Math.floor(Date.now() / 1000)) + 20n * 86_400n,
+    guard.interface.encodeFunctionData("lockdown", [SAFE]),
+  ]);
+  const nested = guard.interface.encodeFunctionData("executeBefore", [
+    BigInt(Math.floor(Date.now() / 1000)) + 30n * 86_400n,
+    nestedInner,
+  ]);
+  const nestedSalt = hre.ethers.id("drill-nested-wrapper");
+  await (
+    await timelock.connect(await impersonate(PROPOSER)).getFunction("schedule")(
+      d.address,
+      0,
+      nested,
+      hre.ethers.ZeroHash,
+      nestedSalt,
+      minDelay,
+    )
+  ).wait();
+  const nestedId: string = await timelock.hashOperation(d.address, 0, nested, hre.ethers.ZeroHash, nestedSalt);
+  const printed2: string[] = [];
+  console.log = (...a: unknown[]) => {
+    printed2.push(a.map(String).join(" "));
+    log(...a);
+  };
+  let nestedRefused = "";
+  try {
+    await hre.run("curator-guard-sync", {
+      allowUnconstrainedNav: true,
+      guard: d.address,
+      policy: POLICY_RUN,
+      dryRun: true,
+    });
+    await hre.run("curator-guard-verify", { guard: d.address, policy: POLICY_RUN, op: nestedId });
+    try {
+      await hre.run("curator-guard-sync", {
+        allowUnconstrainedNav: true,
+        allowUnlock: true,
+        guard: d.address,
+        policy: POLICY_RUN,
+        execute: true,
+        op: nestedId,
+        confirmSensitive: true,
+      });
+    } catch (e: unknown) {
+      nestedRefused = e instanceof Error ? e.message : String(e);
+    }
+  } finally {
+    console.log = log;
+  }
+  const nestedLines = printed2.filter((l) => l.includes(nestedId) || l.startsWith("  [0]"));
+  if (
+    !nestedLines.some(
+      (l) => l.includes("lockdown(") && l.includes("[NESTED WRAPPER") && l.includes("[NOT A SYNC CALL]"),
+    )
+  )
+    throw Error(
+      "BUG: the queue print or verify --op did not name the innermost call of a nested wrapper with its tags (review G19c-2)",
+    );
+  if (!nestedRefused.includes("wraps a call in executeBefore twice"))
+    throw Error(
+      `BUG: --execute --op --confirm-sensitive did not refuse the nested wrapper (review G19c-2): ${nestedRefused.slice(0, 120)}`,
+    );
+  if (
+    !printed2.some(
+      (l) => l.includes("Vesper debt behind it") || l.includes("no Lagoon_Vetro_* strategy recorded for it"),
+    )
+  )
+    throw Error("BUG: the NAV gate's print no longer names what sits behind the vault (reviews G11b-6, G13g-2)");
+  await (await timelock.connect(canceller).getFunction("cancel")(nestedId)).wait();
+  if ((await timelock.getTimestamp(nestedId)) !== 0n) throw Error("BUG: the veto could not cancel the nested wrapper");
+  console.log(
+    "nested wrapper decoded to its innermost call, tagged, refused on --execute --op and cancelled by the veto",
+  );
   console.log("incident drill complete: mode", await guard.mode(SAFE));
   process.exitCode = 0;
 }

@@ -165,6 +165,7 @@ contract CuratorGuardTimelock is TimelockController {
     ///      queue): no role for such a caller. The probe is `getStorageAt(uint256,uint256)` with
     ///      (`keccak256("fallback_manager.handler.address")`, 1) as a Safe v1.3.0+ answers it; an EOA and
     ///      a contract that is not a Safe (this timelock administering itself) do not answer and pass.
+    ///      The slot's low 160 bits are compared, as the EVM masks a call target (review G16d-1).
     function _refuseForwarded(address account_) private view {
         bool _forwarded;
         assembly ("memory-safe") {
@@ -173,7 +174,7 @@ contract CuratorGuardTimelock is TimelockController {
             mstore(add(_p, 0x04), 0x6c9a6c4a39284e37ed1cf53d337577d14212a4870fb976a4366c693b939918d5)
             mstore(add(_p, 0x24), 1)
             let _ok := staticcall(gas(), account_, _p, 0x44, _p, 0x60)
-            _forwarded := and(and(_ok, eq(returndatasize(), 0x60)), eq(mload(add(_p, 0x40)), address()))
+            _forwarded := and(and(_ok, eq(returndatasize(), 0x60)), eq(and(mload(add(_p, 0x40)), 0xffffffffffffffffffffffffffffffffffffffff), address()))
         }
         if (_forwarded) revert ForwardedCall(account_);
     }

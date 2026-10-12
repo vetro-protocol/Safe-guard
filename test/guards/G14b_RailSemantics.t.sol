@@ -90,7 +90,7 @@ contract G14bProbe {
             mstore(add(_p, 0x04), _slot)
             mstore(add(_p, 0x24), 1)
             let _ok := staticcall(gas(), account_, _p, 0x44, _p, 0x60)
-            _yes := and(and(_ok, eq(returndatasize(), 0x60)), eq(mload(add(_p, 0x40)), guard_))
+            _yes := and(and(_ok, eq(returndatasize(), 0x60)), eq(and(mload(add(_p, 0x40)), 0xffffffffffffffffffffffffffffffffffffffff), guard_))
         }
         _gas = _g0 - gasleft();
     }

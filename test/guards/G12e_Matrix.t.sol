@@ -2055,3 +2055,161 @@ contract G12e_Matrix_C12_Test is G12eMatrixBase {
     function test_c12_f93_setNativeTransferAllowed_0_nt2_true() public { _runAll(93); }
     function test_c12_f94_setNativeTransferAllowed_0_nt_false() public { _runAll(94); }
 }
+
+/// @title Matrix class 13: Safe A with a DIRTY handler word whose low 160 bits are the guard, handler requirement ON (a stranger calls the Safe; the word forwards, review G16d-1)
+contract G12e_Matrix_C13_Test is G12eMatrixBase {
+    uint8 internal constant CLASS_ID = 13;
+
+    function _expTable() internal pure returns (bytes memory) {
+        return hex"0203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030c030c030c030c030c030c030c030c03020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030703070307030703070307030703070302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302032f032f032f032f032f032f032f032f0302030203020302030203020302030203020302030203020302030203020302032f032f032f032f032f032f032f032f030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020331033103310331033103310331033103020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302030203020302032903290329031a0300030003290300031b031b031b031b0300030003290300032903290329031a0300030003290300031b031b031b031b031b031b031b031b031f031f031f031f031f031f031f031f031f031f031f031f031f031f031f031f031b031b031b031b031b031b031b031b0302030203020302030203020302030203020302030203020302030203020302032903290329031a0300030003290300031b031b031b031b0300030003290300032903290329031a0300030003290300032903290329031a0300031a0329031a030e030e030e030e030e030e030e030e03010301030103010301030103010301030303030303030303030303030303030303030303030303030303030303030303020302030203020302030203020302030303030303030303030303030303030302030203020302030203020302030203030303030303030303030303030303030203020302030203020302030203020302030203020302030203020302030203";
+    }
+
+    function _exp(uint8 f_, uint8 s_) internal pure returns (uint8 _err, uint8 _pat) {
+        bytes memory _t = _expTable();
+        uint256 _i = (uint256(f_) * 8 + s_) * 2;
+        return (uint8(_t[_i]), uint8(_t[_i + 1]));
+    }
+
+    function _classSetup() internal {
+        vm.store(address(safeA), FALLBACK_SLOT, bytes32((uint256(0xdead) << 160) | uint256(uint160(address(g)))));
+        vm.prank(g.defaultAdmin());
+        g.setRequiredFallbackHandler(address(safeA), address(0), true);
+    }
+
+    function _sender(uint8 f_) internal view returns (address) {
+        if (f_ == 86) return stranger;
+        return stranger;
+    }
+
+    function _target(uint8 f_) internal view returns (address) {
+        if (f_ == 86) return address(g);
+        return address(safeA);
+    }
+
+    function _eff() internal view returns (address) {
+        return address(safeA);
+    }
+
+    function _call(uint8 f_) internal returns (bool _ok, bytes memory _ret) {
+        bytes memory _cd = _calldata(f_, _eff());
+        vm.recordLogs();
+        vm.prank(_sender(f_));
+        (_ok, _ret) = _target(f_).call{value: f_ == 86 ? 1 : 0}(_cd);
+    }
+
+    function _runCell(uint8 f_, uint8 s_) internal returns (bool) {
+        uint256 _snap = vm.snapshotState();
+        _classSetup();
+        _setState(s_);
+        (bool _ok, bytes memory _ret) = _call(f_);
+        (uint8 _expErr, uint8 _expPat) = _exp(f_, s_);
+        (bytes4 _got, uint8 _flags, uint256 _n) = _judge(_ok, _ret, vm.getRecordedLogs(), _expErr, _expPat, address(g));
+        _log("G", CLASS_ID, f_, s_, _expErr, _got, _flags, _n);
+        _clearTransient();
+        vm.revertToStateAndDelete(_snap);
+        vm.warp(T0);
+        return (_flags & 4) != 0;
+    }
+
+    function _runAll(uint8 f_) internal {
+        uint256 _mismatches;
+        for (uint8 s; s < 8; ++s) if (_runCell(f_, s)) ++_mismatches;
+        assertEq(_mismatches, 0, "cells disagree with the documented expectation");
+    }
+
+    function test_c13_f00_lockdown_A() public { _runAll(0); }
+    function test_c13_f01_lockdownAndRevoke_A() public { _runAll(1); }
+    function test_c13_f02_enforce_A() public { _runAll(2); }
+    function test_c13_f03_bypass_A_1_day() public { _runAll(3); }
+    function test_c13_f04_bypass_A_30_days() public { _runAll(4); }
+    function test_c13_f05_bypass_A_30_minutes() public { _runAll(5); }
+    function test_c13_f06_executeBefore_now_30d_lockdown_A() public { _runAll(6); }
+    function test_c13_f07_executeBefore_now_1_lockdown_A() public { _runAll(7); }
+    function test_c13_f08_setDeploymentGuardian_newKey_true() public { _runAll(8); }
+    function test_c13_f09_setDeploymentGuardian_gD_false() public { _runAll(9); }
+    function test_c13_f10_setDeploymentGuardian_admin_true() public { _runAll(10); }
+    function test_c13_f11_setDeploymentGuardian_A_true() public { _runAll(11); }
+    function test_c13_f12_setGuardian_A_newKey_true() public { _runAll(12); }
+    function test_c13_f13_setGuardian_A_gA_false() public { _runAll(13); }
+    function test_c13_f14_setGuardian_A_admin_true() public { _runAll(14); }
+    function test_c13_f15_setGuardian_A_guard_true() public { _runAll(15); }
+    function test_c13_f16_setRequiredFallbackHandler_A_0_true() public { _runAll(16); }
+    function test_c13_f17_allowFunction_A_P_wrap_value() public { _runAll(17); }
+    function test_c13_f18_allowFunctions_A_wrap() public { _runAll(18); }
+    function test_c13_f19_revokeFunction_A_P_settle() public { _runAll(19); }
+    function test_c13_f20_revokeTarget_A_P() public { _runAll(20); }
+    function test_c13_f21_setNativeTransferAllowed_A_nt2_true() public { _runAll(21); }
+    function test_c13_f22_setNativeTransferAllowed_A_nt_false() public { _runAll(22); }
+    function test_c13_f23_addAllowedValues_A_P_deposit_0_2() public { _runAll(23); }
+    function test_c13_f24_removeAllowedValues_A_P_deposit_0_1() public { _runAll(24); }
+    function test_c13_f25_clearAllowedValues_A_P_deposit_0() public { _runAll(25); }
+    function test_c13_f26_setMultiSendUnwrapper_A_M2_true() public { _runAll(26); }
+    function test_c13_f27_setMultiSendUnwrapper_A_M_false() public { _runAll(27); }
+    function test_c13_f28_setUnwrapperCodehash_h141_true() public { _runAll(28); }
+    function test_c13_f29_setUnwrapperCodehash_h150_false() public { _runAll(29); }
+    function test_c13_f30_setModuleAllowed_A_MOD2_true() public { _runAll(30); }
+    function test_c13_f31_setModuleAllowed_A_MOD_false() public { _runAll(31); }
+    function test_c13_f32_approveTransaction_A_0_P_settle_7_1_day() public { _runAll(32); }
+    function test_c13_f33_approveTransaction_A_0_P_settle_7_30_days() public { _runAll(33); }
+    function test_c13_f34_approveTransaction_A_0_P_settle_7_30_minutes() public { _runAll(34); }
+    function test_c13_f35_approveTransaction_A_0_A_setGuard_0_1_day() public { _runAll(35); }
+    function test_c13_f36_approveTransaction_A_0_A_changeThreshold_2_1_day() public { _runAll(36); }
+    function test_c13_f37_approveTransaction_A_0_A_changeThreshold_1_1_day() public { _runAll(37); }
+    function test_c13_f38_approveTransaction_caller_0_P_settle_7_1_day() public { _runAll(38); }
+    function test_c13_f39_approveTransaction_A_MODX_P_settle_7_1_day() public { _runAll(39); }
+    function test_c13_f40_approveTransaction_A_0_EOA_0x12345678_1_day() public { _runAll(40); }
+    function test_c13_f41_approveTransaction_A_0_guard_lockdown_A_1_day() public { _runAll(41); }
+    function test_c13_f42_revokeApproval_apprA() public { _runAll(42); }
+    function test_c13_f43_revokeApproval_apprB() public { _runAll(43); }
+    function test_c13_f44_revokeApproval_unknown_id() public { _runAll(44); }
+    function test_c13_f45_revokeAllApprovals_A() public { _runAll(45); }
+    function test_c13_f46_lockdown_caller() public { _runAll(46); }
+    function test_c13_f47_lockdown_B() public { _runAll(47); }
+    function test_c13_f48_grantRole_COUNCIL_newKey() public { _runAll(48); }
+    function test_c13_f49_grantRole_GUARDIAN_newKey() public { _runAll(49); }
+    function test_c13_f50_grantRole_COUNCIL_A() public { _runAll(50); }
+    function test_c13_f51_grantRole_COUNCIL_admin() public { _runAll(51); }
+    function test_c13_f52_grantRole_COUNCIL_0() public { _runAll(52); }
+    function test_c13_f53_grantRole_DEFAULT_ADMIN_newKey() public { _runAll(53); }
+    function test_c13_f54_revokeRole_COUNCIL_council() public { _runAll(54); }
+    function test_c13_f55_revokeRole_GUARDIAN_gD() public { _runAll(55); }
+    function test_c13_f56_revokeRole_DEFAULT_ADMIN_admin() public { _runAll(56); }
+    function test_c13_f57_renounceRole_COUNCIL_caller() public { _runAll(57); }
+    function test_c13_f58_renounceRole_GUARDIAN_caller() public { _runAll(58); }
+    function test_c13_f59_renounceRole_DEFAULT_ADMIN_caller() public { _runAll(59); }
+    function test_c13_f60_renounceRole_COUNCIL_stranger() public { _runAll(60); }
+    function test_c13_f61_beginDefaultAdminTransfer_newKey() public { _runAll(61); }
+    function test_c13_f62_beginDefaultAdminTransfer_0() public { _runAll(62); }
+    function test_c13_f63_beginDefaultAdminTransfer_A() public { _runAll(63); }
+    function test_c13_f64_beginDefaultAdminTransfer_council() public { _runAll(64); }
+    function test_c13_f65_beginDefaultAdminTransfer_guard() public { _runAll(65); }
+    function test_c13_f66_cancelDefaultAdminTransfer() public { _runAll(66); }
+    function test_c13_f67_acceptDefaultAdminTransfer() public { _runAll(67); }
+    function test_c13_f68_changeDefaultAdminDelay_2_days() public { _runAll(68); }
+    function test_c13_f69_changeDefaultAdminDelay_31_days() public { _runAll(69); }
+    function test_c13_f70_changeDefaultAdminDelay_1_hour() public { _runAll(70); }
+    function test_c13_f71_rollbackDefaultAdminDelay() public { _runAll(71); }
+    function test_c13_f72_checkTransaction_P_settle_1() public { _runAll(72); }
+    function test_c13_f73_checkTransaction_P_settle_9_approved() public { _runAll(73); }
+    function test_c13_f74_checkTransaction_P_wrap_denied() public { _runAll(74); }
+    function test_c13_f75_checkAfterExecution_h_true() public { _runAll(75); }
+    function test_c13_f76_checkModuleTransaction_P_settle_1_MOD() public { _runAll(76); }
+    function test_c13_f77_checkModuleTransaction_P_settle_1_MODX() public { _runAll(77); }
+    function test_c13_f78_checkAfterModuleExecution_h_true() public { _runAll(78); }
+    function test_c13_f79_executeBefore_now_30d_checkAfterExecution_h_true() public { _runAll(79); }
+    function test_c13_f80_executeBefore_now_30d_checkTransaction_P_settle_9_approved() public { _runAll(80); }
+    function test_c13_f81_validateTransaction_A_P_settle_1() public { _runAll(81); }
+    function test_c13_f82_validateTransaction_A_P_settle_9_approved() public { _runAll(82); }
+    function test_c13_f83_validateTransaction_A_P_wrap_denied() public { _runAll(83); }
+    function test_c13_f84_validateModuleTransaction_A_MOD_P_settle_1() public { _runAll(84); }
+    function test_c13_f85_validateModuleTransaction_A_MODX_P_settle_1() public { _runAll(85); }
+    function test_c13_f86_send_1_wei_to_the_guard_empty_calldata() public { _runAll(86); }
+    function test_c13_f87_enforce_0() public { _runAll(87); }
+    function test_c13_f88_lockdown_0() public { _runAll(88); }
+    function test_c13_f89_revokeFunction_0_P_settle() public { _runAll(89); }
+    function test_c13_f90_setGuardian_0_newKey_true() public { _runAll(90); }
+    function test_c13_f91_allowFunction_0_P_wrap_value() public { _runAll(91); }
+    function test_c13_f92_approveTransaction_0_0_P_settle_7_1_day() public { _runAll(92); }
+    function test_c13_f93_setNativeTransferAllowed_0_nt2_true() public { _runAll(93); }
+    function test_c13_f94_setNativeTransferAllowed_0_nt_false() public { _runAll(94); }
+}

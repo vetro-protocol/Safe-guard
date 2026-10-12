@@ -12,14 +12,16 @@ import {Test} from "forge-std/Test.sol";
 /// audited bytecode silently. Re-pin the two constants only together with the review of the change that moved
 /// them (the sizes are the ones docs section 10 and the README quote).
 contract G12a_BuildPin is Test {
-    uint256 internal constant GUARD_RUNTIME_BYTES = 23_240;
-    uint256 internal constant TIMELOCK_RUNTIME_BYTES = 8_195;
-    // keccak256 of the runtime code without its CBOR tail: CuratorGuard (sha256 2ef656ec...) and
-    // CuratorGuardTimelock (sha256 90bb0171...) as built from the round-13 follow-up commit (G9a-1, G9a-3/G9c-3
-    // and MIN_DELAY_FLOOR = 1 days applied on top of 830824e) with OpenZeppelin contracts 5.2.0, solc 0.8.25,
-    // 10 runs, cancun. The previous pins (830824e): 23,224 / 8,191 bytes, keccak b3ac8167... / 745ff0ea...
-    bytes32 internal constant GUARD_STRIPPED_KECCAK = 0xc8e0a9082376e985eec95d4185d178c1a667832b0990852bef052ca40d8d70a6;
-    bytes32 internal constant TIMELOCK_STRIPPED_KECCAK = 0xb7790f427d7dfc79e8c3b417a283f7baf39f498403f5a33cdd68e40aab8528aa;
+    uint256 internal constant GUARD_RUNTIME_BYTES = 23_249;
+    uint256 internal constant TIMELOCK_RUNTIME_BYTES = 8_204;
+    // keccak256 of the runtime code without its CBOR tail: CuratorGuard (sha256 7b7cc641...) and
+    // CuratorGuardTimelock (sha256 a43ecad6...) as built with the masked handler-word rails (G16d-1a/1b, +9 B each,
+    // applied after round 18) on top of the round-13 follow-up (G9a-1, G9a-3/G9c-3 and MIN_DELAY_FLOOR = 1 days
+    // applied on top of 830824e) with OpenZeppelin contracts 5.2.0, solc 0.8.25, 10 runs, cancun. The previous
+    // pins: d878077 (the round-13 follow-up build, rounds 14-18): 23,240 / 8,195 bytes, keccak c8e0a908... /
+    // b7790f42...; 830824e: 23,224 / 8,191 bytes, keccak b3ac8167... / 745ff0ea...
+    bytes32 internal constant GUARD_STRIPPED_KECCAK = 0xa1cc015977cf2dec4903326ddeb960c91caf6e3a50edca0ede881986ffbbd7f1;
+    bytes32 internal constant TIMELOCK_STRIPPED_KECCAK = 0x8a69e72c4ff2fbc0189b1ff3f6a7e74c239bcc3c3394a3fe158e952a02da786c;
 
     function test_guard_runtime_is_the_reviewed_build() public view {
         bytes memory _code = vm.getDeployedCode("CuratorGuard.sol:CuratorGuard");
