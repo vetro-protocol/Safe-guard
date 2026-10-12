@@ -31,6 +31,17 @@ const POLICY = path.join(__dirname, "..", "policies", "curator-guard", "vetro-la
 async function main() {
   if (!process.env.FORK_NODE_URL)
     throw Error("FORK_NODE_URL is required: this is a fork rehearsal, never the in-memory chain");
+  // The in-process fork answers nothing until the upstream has served the fork block: a non-archive
+  // FORK_NODE_URL at an old FORK_BLOCK_NUMBER (publicnode past ~128 blocks: HTTP 403 "Archive requests
+  // require a personal token") must say so, not "not a dev node" (review G21f).
+  try {
+    await hre.network.provider.send("eth_chainId", []);
+  } catch (e: unknown) {
+    throw Error(
+      `the fork cannot read its upstream at FORK_BLOCK_NUMBER=${process.env.FORK_BLOCK_NUMBER ?? "(latest - 32)"}: ` +
+        (e instanceof Error ? e.message : String(e)).slice(0, 300),
+    );
+  }
   let dev = false;
   for (const method of ["hardhat_metadata", "anvil_nodeInfo"]) {
     try {
@@ -235,9 +246,11 @@ async function main() {
   ] as const) {
     try {
       await guard.validateTransaction(SAFE, to, 0, data, 0);
-      console.log(`BUG: ${label} allowed`);
-      process.exitCode = 1;
+      // A refusal that did not happen is a failed drill, not a note: the last line of the drill clears
+      // `process.exitCode` and CI greps only the marker, so a bare exit code here never reached CI (review G21g-1).
+      throw Error(`BUG: ${label} allowed by the guard (the drill's negative check failed)`);
     } catch (e: unknown) {
+      if (e instanceof Error && e.message.startsWith("BUG:")) throw e;
       const msg = e instanceof Error ? e.message : String(e);
       console.log(
         `validate ${label}: blocked (${msg.match(/reverted with custom error '([^']*)'/)?.[1] ?? msg.slice(0, 60)})`,
@@ -296,7 +309,7 @@ async function main() {
     proposer: PROPOSER,
     allowUnlock: true,
   });
-  const stateFile = `safe.batch.tmp.json.timelock.${await hre.getChainId()}.${d.address.toLowerCase()}.json`;
+  const stateFile = `safe.batch.tmp.json.timelock.${await hre.getChainId()}.${d.address.toLowerCase()}.${SAFE.toLowerCase()}.json`;
   const stored = JSON.parse(fs.readFileSync(stateFile, "utf8")) as {
     operations: { opId: string; lifts: boolean; predecessor: string }[];
   };

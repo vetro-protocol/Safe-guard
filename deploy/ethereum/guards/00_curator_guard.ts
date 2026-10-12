@@ -11,22 +11,30 @@ const TIMELOCK_CONTRACT = "CuratorGuardTimelock";
 // to the installed one (docs/curator-guard.md section 7.5). The timelock alias follows it.
 const ALIAS = process.env.CURATOR_GUARD_ALIAS || CONTRACT;
 const TIMELOCK_ALIAS = `${ALIAS}Timelock`;
+// A delay typed as "2d" or "48h" threw a bare `SyntaxError: Cannot convert 2d to a BigInt` from the module's load, naming
+// no variable (review G21b-12): say which variable, and that the unit is seconds.
+function secondsFromEnv(name: string, fallback: bigint): bigint {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  if (!/^\d+$/.test(raw)) throw Error(`${name} must be a whole number of SECONDS (48 h = 172800), got ${raw}`);
+  return BigInt(raw);
+}
 // Widenings sit in public for this long before they can be executed (seconds). 48 h default.
-const TIMELOCK_DELAY = BigInt(process.env.CURATOR_GUARD_TIMELOCK_DELAY || 48 * 3600);
+const TIMELOCK_DELAY = secondsFromEnv("CURATOR_GUARD_TIMELOCK_DELAY", 48n * 3600n);
 // Delay of the guard's own two-step admin transfer (`AccessControlDefaultAdminRules`). Must sit at least a
 // day above the timelock delay (`ADMIN_DELAY_MARGIN`) so a `cancelDefaultAdminTransfer` scheduled when a
 // hostile begin lands keeps a signing round before the acceptance opens: 3 days default.
-const ADMIN_DELAY = BigInt(process.env.CURATOR_GUARD_ADMIN_DELAY || 3 * 24 * 3600);
+const ADMIN_DELAY = secondsFromEnv("CURATOR_GUARD_ADMIN_DELAY", 3n * 24n * 3600n);
 // Reuse an existing timelock (e.g. for a replacement guard) instead of deploying one per alias.
 const EXISTING_TIMELOCK = process.env.CURATOR_GUARD_TIMELOCK;
 const ZERO = "0x0000000000000000000000000000000000000000";
 // The reviewed runtimes, metadata stripped, as `test/guards/G12a_BuildPin.t.sol` pins them (keccak256 of the runtime
-// without its CBOR tail; 23,249 and 8,204 bytes, the masked handler-word rails of review G16d-1). The deploy sends whatever the local `node_modules` and solc compiled
+// without its CBOR tail; 23,267 and 8,204 bytes: the masked handler-word rails of review G16d-1 and the guard's zero-target approval rail of review G17a-3). The deploy sends whatever the local `node_modules` and solc compiled
 // to, and CI's parity step compares hardhat with foundry, never with the pin: this is the one step that must send the
 // reviewed bytes, so it checks them itself (review G18g-2). A re-pin is a contract change with a review: move these
 // two values together with the test's.
 const REVIEWED_RUNTIME_KECCAK: Record<string, string> = {
-  [CONTRACT]: "0xa1cc015977cf2dec4903326ddeb960c91caf6e3a50edca0ede881986ffbbd7f1",
+  [CONTRACT]: "0x3bfe33c8e8c7a8e4edbe454efb7efaef22182ba362b8b824ccc0610c763bea8d",
   [TIMELOCK_CONTRACT]: "0x8a69e72c4ff2fbc0189b1ff3f6a7e74c239bcc3c3394a3fe158e952a02da786c",
 };
 // Mirrors `CuratorGuardTimelock.MIN_DELAY_FLOOR / MIN_DELAY_CAP` and `CuratorGuardPolicy.MAX_ADMIN_DELAY`
