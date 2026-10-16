@@ -23,7 +23,7 @@
     "@safe-global/protocol-kit": "6.1.2",
     "@safe-global/safe-deployments": "1.37.56",
     "@safe-global/types-kit": "3.1.0",
-    "@typescript-eslint/eslint-plugin": "^8.29.0",
+    "@typescript-eslint/eslint-plugin": "^8.71.2",
     "chalk": "4.1.2",
     "dotenv": "^16.5.0",
     "eslint": "^9.23.0",
