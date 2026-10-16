@@ -16,18 +16,32 @@ const A = {
         Vetro_cbBTC: "0x110B1F3cD409Ef5A7b354AA1667c19998E1b6340",
         Vetro_hemiBTC: "0x26A6179247420B6e8036DBdeF48fD74d1E57fdc3",
       },
+      // The Vesper strategies (vesper-strategies `deployments/ethereum/Lagoon_Vetro_*.json`, the proxy
+      // addresses) that route pool custody into the vaults above. This repository carries no deployment
+      // records, so the sync task's unconstrained-NAV gate reads the strategies' debt from here (review
+      // G11b-6 as ported to this repository, review G13g-2): `getStrategyConfig(strategy)` on each
+      // strategy's `pool()` and the strategy's `tvl()` are the governance-written numbers the gate keys on;
+      // the vault's own `totalAssets()` is the curator's mark and is only reported. Keep in step with
+      // vesper-strategies: a strategy missing here leaves its vault gated on `totalAssets()` alone.
+      strategy: {
+        Vetro_USDC: "0x099d0Cdd85484B418D1E7375Df894619963D5b94",
+        Vetro_USDT: "0x26087C0ec98662C1682b47C7a3f73da955913581",
+        Vetro_WBTC: "0xF8D2bb6ab70A54d0005619F5Ff92C7F96D67a6Bf",
+        Vetro_cbBTC: "0x8214D8a7D6f1E2a10500299aC00D066D9DFe6120",
+        Vetro_hemiBTC: "0xaF0ad3ec0A162CEC8D833f1BDD27821360B20ff9",
+      },
     },
     Vetro: {
       feeCollector: "0x6649Ddb5c7e52348b73c8bBdD2A1cbA630b7AaEA",
       // Safe v1.4.1 (2-of-4) that is both `safe()` (custody) and `owner()` of every Lagoon.vault.Vetro_*
       // above. `CuratorGuard` policies are keyed by this address (policies/curator-guard/).
       lagoonCuratorSafe: "0x1b534a8543212F5957168D83311A41E0Ea1cfe48",
-      // CuratorGuard v2 roles (docs/curator-guard.md sections 4 and 12, IMPROVEMENTS_V2.md item 1).
+      // CuratorGuard v2 roles (docs/curator-guard.md sections 4 and 12; the v2 role split in section 13).
       // `curatorGuardProposers`: the Safes that PROPOSE widenings to the CuratorGuardTimelock, which is
       // the guard's DEFAULT_ADMIN. Proposed: the Vetro governance Safe (v1.4.1, 3-of-6) that is
       // `governor()` of every Vetro yield vault and of the Lagoon_Vetro_* strategies (same address as
-      // `feeCollector`). CAVEAT (verified on-chain 2026-10-04): three of its six owners are also owners
-      // of `lagoonCuratorSafe`. The deploy script REFUSES a proposer, canceller or council that shares a
+      // `feeCollector`). CAVEAT (verified on-chain 2026-10-09; three on 2026-10-04): two of its six owners
+      // are also owners of `lagoonCuratorSafe`. The deploy script REFUSES a proposer, canceller or council that shares a
       // signer with the curator Safe (CURATOR_GUARD_ALLOW_KEY_OVERLAP=1 downgrades it to a warning on
       // fork rehearsals only), so a dedicated governance Safe without curator keys must replace this
       // before mainnet. List two proposers so a single lost Safe cannot strand the guard; a proposer

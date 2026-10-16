@@ -5,12 +5,12 @@ import {TimelockController} from "@openzeppelin/contracts/governance/TimelockCon
 
 /// @title CuratorGuardTimelock
 /// @notice The `DEFAULT_ADMIN_ROLE` holder of `CuratorGuard` in production: an OpenZeppelin
-///         `TimelockController` with its role topology fixed at construction and four guard rails.
+///         `TimelockController` with its role topology fixed at construction and guard rails on it.
 ///         Every widening of a curator policy (and every long approval or long `Bypass`) is a scheduled
 ///         operation that sits in public for `minDelay` before anyone may execute it; the canceller
 ///         Safe can stop it in that window. Narrowing never goes through here: it is immediate on the
 ///         guard (council, guardians).
-/// @dev    Topology (docs/curator-guard.md sections 4 and 6, reviews V2-63 and V2-74):
+/// @dev    Topology (docs/curator-guard.md sections 4 and 6):
 ///         - `proposers_` hold `PROPOSER_ROLE` (in production two Safes, so one lost quorum cannot
 ///           strand the guard; the contract requires one); `cancellers_` hold `CANCELLER_ROLE` (in
 ///           production one dedicated veto Safe). Proposing and
@@ -23,9 +23,13 @@ import {TimelockController} from "@openzeppelin/contracts/governance/TimelockCon
 ///         - the executor role is open (`address(0)`): no key is needed to land a ready operation;
 ///         - the timelock administers itself; NO deployer admin (the role set is final at creation,
 ///           nothing to renounce, nothing a deployer key could have granted in between).
-///         Guard rails, all enforced on the timelock's own scheduled self-calls:
+///         Guard rails, enforced on the timelock's own scheduled self-calls and, for the last-holder
+///         rail, on a holder's own `renounceRole` too:
 ///         - `getMinDelay()` is clamped to [`MIN_DELAY_FLOOR`, `MIN_DELAY_CAP`]: an `updateDelay` typed
-///           in the wrong unit can neither make widenings instant nor take years to undo;
+///           in the wrong unit can neither make widenings instant nor take years to undo; the floor is
+///           a day, not an hour: at an hour, a scheduled `updateDelay(1 hours)` would be one vetoable
+///           operation that, if missed, shrinks the veto's window on EVERY later operation to an hour,
+///           below the time a multisig veto needs to convene (round 13, G13f-3; applied after round 13);
 ///         - the open executor cannot be revoked (nothing could execute again, the repair included);
 ///         - the timelock cannot drop its own admin role (the role set would be frozen for good) and
 ///           never grants it to anyone else (a second admin would manage roles with no delay and no
@@ -35,17 +39,22 @@ import {TimelockController} from "@openzeppelin/contracts/governance/TimelockCon
 ///           from inside an operation someone else scheduled: a phantom proposer for the last-holder
 ///           rail, and as a canceller a veto in every proposer's hands) ever holds a gated role;
 ///         - a proposer is never granted `CANCELLER_ROLE`, a canceller never `PROPOSER_ROLE`.
-///         Proposal-time rails (`schedule` / `scheduleBatch`): an operation delay above
-///         `MIN_DELAY_CAP` is refused (a unit mistake would park the operation, and the queue, for
-///         years), as is calldata for a target without code (it would "execute" and be Done with
-///         nothing run; `execute` refuses it again) and a scheduled `updateDelay` outside the clamp
-///         (refused when proposed instead of being silently read as the floor or the cap).
-///         Not enforced on-chain: the NUMBER of cancellers (a rotation needs two for one batch);
-///         monitoring pages on any `grantRole(CANCELLER_ROLE, …)`. Only a canceller can clear a
-///         pending operation, a dead one included, and cancelling a predecessor does not cancel its
-///         successor (cancel chained operations as a pair).
+///         Proposal-time rails (`schedule` / `scheduleBatch`): three things are refused when the
+///         operation is proposed instead of failing or misbehaving after the delay. An operation delay
+///         other than the live `getMinDelay()`: an operation id carries neither its proposer nor its
+///         delay, so with a longer delay one proposer could take another proposer's exact operation
+///         up to 30 days out, leaving the honest schedule to revert and the honest `executeBefore`
+///         wrapper dead on arrival, and a unit mistake would park the operation, and the queue, for
+///         years. Calldata for a target without code: it would "execute" and be Done with nothing run
+///         (`execute` refuses it again). A scheduled `updateDelay` outside the clamp: otherwise it is
+///         stored and silently read as the floor or the cap.
+///         Not enforced on-chain: the NUMBER of cancellers (a one-batch rotation of the veto Safe
+///         holds two for a moment: it grants the new one, then revokes the old); monitoring pages on
+///         any `grantRole(CANCELLER_ROLE, …)`. Only a canceller can clear a pending operation, a dead
+///         one included, and cancelling a predecessor does not cancel its successor (cancel chained
+///         operations as a pair).
 contract CuratorGuardTimelock is TimelockController {
-    uint256 public constant MIN_DELAY_FLOOR = 1 hours;
+    uint256 public constant MIN_DELAY_FLOOR = 1 days;
     uint256 public constant MIN_DELAY_CAP = 30 days;
 
     error CancellerCannotPropose(address account);
@@ -119,13 +128,15 @@ contract CuratorGuardTimelock is TimelockController {
         super.scheduleBatch(targets_, values_, payloads_, predecessor_, salt_, delay_);
     }
 
-    /// @dev Proposal-time rails. (1) An operation delay above the cap is a unit mistake: it would park the
-    ///      operation for years, and near 2^256 `block.timestamp + delay` is a bare `Panic`. (2) A scheduled
+    /// @dev Proposal-time rails. (1) An operation delay is exactly the live `getMinDelay()` (the base refuses
+    ///      a shorter one): a longer one would let a proposer take another proposer's exact operation (same
+    ///      id, up to 30 days out), a unit mistake would park the operation for years, and
+    ///      near 2^256 `block.timestamp + delay` is a bare `Panic`. (2) A scheduled
     ///      `updateDelay` outside the clamp is refused instead of being stored and silently read as the
     ///      floor or the cap (`updateDelay` can only ever run as a scheduled self-call, so this covers it).
     ///      (3) Calldata for an account without code would "execute" (`_execute` below refuses it too).
     function _checkScheduled(address target_, bytes calldata data_, uint256 delay_) private view {
-        if (delay_ > MIN_DELAY_CAP) revert DelayOutOfRange(delay_);
+        if (delay_ > getMinDelay()) revert DelayOutOfRange(delay_);
         if (data_.length != 0 && target_.code.length == 0) revert TargetHasNoCode(target_);
         if (target_ == address(this) && data_.length >= 36 && bytes4(data_[:4]) == this.updateDelay.selector) {
             uint256 _newDelay = uint256(bytes32(data_[4:36]));
@@ -154,6 +165,7 @@ contract CuratorGuardTimelock is TimelockController {
     ///      queue): no role for such a caller. The probe is `getStorageAt(uint256,uint256)` with
     ///      (`keccak256("fallback_manager.handler.address")`, 1) as a Safe v1.3.0+ answers it; an EOA and
     ///      a contract that is not a Safe (this timelock administering itself) do not answer and pass.
+    ///      The slot's low 160 bits are compared, as the EVM masks a call target (review G16d-1).
     function _refuseForwarded(address account_) private view {
         bool _forwarded;
         assembly ("memory-safe") {
@@ -162,7 +174,7 @@ contract CuratorGuardTimelock is TimelockController {
             mstore(add(_p, 0x04), 0x6c9a6c4a39284e37ed1cf53d337577d14212a4870fb976a4366c693b939918d5)
             mstore(add(_p, 0x24), 1)
             let _ok := staticcall(gas(), account_, _p, 0x44, _p, 0x60)
-            _forwarded := and(and(_ok, eq(returndatasize(), 0x60)), eq(mload(add(_p, 0x40)), address()))
+            _forwarded := and(and(_ok, eq(returndatasize(), 0x60)), eq(and(mload(add(_p, 0x40)), 0xffffffffffffffffffffffffffffffffffffffff), address()))
         }
         if (_forwarded) revert ForwardedCall(account_);
     }

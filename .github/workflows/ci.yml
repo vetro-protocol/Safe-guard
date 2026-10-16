@@ -17,12 +17,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (tag resolved 2026-10-09; a tag is re-pointable, a SHA is not)
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Use nvmrc
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version-file: ".nvmrc"
           cache: npm
@@ -31,7 +32,7 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
         with:
           version: ${{ env.FOUNDRY_VERSION }}
 
@@ -48,12 +49,39 @@ jobs:
       - name: Lint the policy files (corpus)
         run: ./scripts/curator-guard-lint-corpus.sh
 
-      # Same solc settings as the deployed bytecode (10 runs, cancun). The *.e2e.ethereum suites need the
-      # ETHEREUM_FORK_NODE_URL secret (archive RPC).
+      # Same solc settings as the deployed bytecode (10 runs, cancun). The fork suites (*.e2e.ethereum, G10d_Fork,
+      # G11b_Policy, G9a_CanonicalProxyHashes) need the ETHEREUM_FORK_NODE_URL secret (archive RPC) at the pinned block.
+      # Without traces: forge 1.5.1 (the pinned toolchain) hands a call that reverts with no data an ABI-encoded
+      # "call to non-contract address <the EOA the previous call was pranked as>" string whenever traces are
+      # recorded (-vvv and above); sixteen tests that classify empty reverts (the access matrix's value call in each
+      # of its fourteen caller classes, the two starvation sweeps) fail under `forge test -vvv` and pass without it
+      # (review G17c-1: fifteen before the dirty-word class of the round-18 follow-up, review G20e-2). The failures,
+      # if any, are re-run alone with traces for the report, and the step stays red (review G18g-3).
       - name: Run tests
-        run: forge test -vvv
+        run: forge test || { forge test --rerun -vvv; exit 1; }
         env:
           ETHEREUM_FORK_NODE_URL: ${{ secrets.ETHEREUM_FORK_NODE_URL }}
+          # One pinned fuzz seed on this step only (review G9f-10, pinned as review g17c advised): a fuzz or
+          # invariant failure here reproduces locally with `FOUNDRY_FUZZ_SEED=0x1 forge test` RUN THE SAME WAY (every
+          # suite, the fork variables set): forge draws a fuzz test's inputs from the seed AND the set of tests the
+          # invocation contains, so a narrowed re-run (`--match-*`, `--no-match-path`, the `--rerun` above) draws other
+          # inputs for some tests; the counterexample the failing run prints is the reproduction (review G21f). The
+          # osaka step below draws a fresh seed on every run, so CI keeps exploring.
+          FOUNDRY_FUZZ_SEED: "0x1"
+
+      # The same suites on the EVM mainnet runs today (Osaka): the bytecode is the default build's, only the
+      # test EVM moves (review G13c). The fork suites are covered by the step above.
+      - name: Run the unit suites on the live fork's EVM
+        run: forge test --no-match-path '*e2e*'
+        env:
+          FOUNDRY_PROFILE: osaka
+
+      # The recovery matrix at the timelock's one-day floor (the default run covers the 48 h deploy default): every
+      # recovery path's chain time as a closed form at the live delay (review G16f-3).
+      - name: Recovery matrix at the one-day floor
+        run: forge test --match-contract G16f_
+        env:
+          G16F_MIN_DELAY: "86400"
 
       # The guard must refuse to deploy on a pre-Cancun EVM (constructor EIP-1153 probe): this profile
       # compiles for Shanghai and deploys the Cancun creation code the default build above produced.
@@ -74,12 +102,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (tag resolved 2026-10-09; a tag is re-pointable, a SHA is not)
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Use nvmrc
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version-file: ".nvmrc"
           cache: npm
@@ -88,7 +117,7 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Cache hardhat artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             artifacts
@@ -120,7 +149,7 @@ jobs:
       # The Hardhat artifact must be byte-identical (metadata tail excluded) to the Foundry build
       # the test job exercises: same solc, same 10 runs, same evm version.
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
         with:
           version: ${{ env.FOUNDRY_VERSION }}
       - name: Toolchain parity of the guard bytecode

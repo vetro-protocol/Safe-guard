@@ -1,4 +1,5 @@
 import fs from "fs";
+import os from "os";
 import path from "path";
 import hre from "hardhat";
 import Addresses from "../helpers/address";
@@ -30,6 +31,17 @@ const POLICY = path.join(__dirname, "..", "policies", "curator-guard", "vetro-la
 async function main() {
   if (!process.env.FORK_NODE_URL)
     throw Error("FORK_NODE_URL is required: this is a fork rehearsal, never the in-memory chain");
+  // The in-process fork answers nothing until the upstream has served the fork block: a non-archive
+  // FORK_NODE_URL at an old FORK_BLOCK_NUMBER (publicnode past ~128 blocks: HTTP 403 "Archive requests
+  // require a personal token") must say so, not "not a dev node" (review G21f).
+  try {
+    await hre.network.provider.send("eth_chainId", []);
+  } catch (e: unknown) {
+    throw Error(
+      `the fork cannot read its upstream at FORK_BLOCK_NUMBER=${process.env.FORK_BLOCK_NUMBER ?? "(latest - 32)"}: ` +
+        (e instanceof Error ? e.message : String(e)).slice(0, 300),
+    );
+  }
   let dev = false;
   for (const method of ["hardhat_metadata", "anvil_nodeInfo"]) {
     try {
@@ -66,16 +78,34 @@ async function main() {
     await guard.owner(),
   );
   if ((await guard.defaultAdmin()).toLowerCase() !== t.address.toLowerCase()) throw Error("admin is not the timelock");
+  // The committed file is pinned to the PRODUCTION guard from section 7.2 step 0 on, and the task
+  // refuses a pin that differs from `--guard` on every network. This rehearsal deploys a fresh guard,
+  // so it syncs a copy of the file pinned to that guard; everything else in the file is unchanged
+  // (review G11a-1).
+  const committed = JSON.parse(fs.readFileSync(POLICY, "utf8")) as Record<string, unknown>;
+  // A per-run directory: the shared temp directory of a multi-session host must never let one rehearsal's copy
+  // be deleted or overwritten by another's (review G16g-3).
+  const POLICY_RUN = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), "curator-guard-fork-dryrun-")),
+    `policy.${d.address.toLowerCase()}.json`,
+  );
+  fs.writeFileSync(POLICY_RUN, JSON.stringify({ ...committed, guard: d.address }, null, 2));
+  console.log("policy copy for this rehearsal (pinned to the fresh guard):", POLICY_RUN);
 
   // Every sync here passes `allowUnconstrainedNav`: the live vaults hold dust (about 1 USDC), which the
   // unconstrained-NAV gate refuses on mainnet until a band is set or the flag is given knowingly.
   console.log("--- dry run ---");
-  await hre.run("curator-guard-sync", { allowUnconstrainedNav: true, guard: d.address, policy: POLICY, dryRun: true });
+  await hre.run("curator-guard-sync", {
+    allowUnconstrainedNav: true,
+    guard: d.address,
+    policy: POLICY_RUN,
+    dryRun: true,
+  });
   console.log("--- schedule through the timelock (proposer impersonated) ---");
   await hre.run("curator-guard-sync", {
     allowUnconstrainedNav: true,
     guard: d.address,
-    policy: POLICY,
+    policy: POLICY_RUN,
     viaTimelock: true,
     proposer: PROPOSER,
   });
@@ -86,7 +116,7 @@ async function main() {
     await hre.run("curator-guard-sync", {
       allowUnconstrainedNav: true,
       guard: d.address,
-      policy: POLICY,
+      policy: POLICY_RUN,
       execute: true,
     });
   } catch (e: unknown) {
@@ -98,9 +128,19 @@ async function main() {
   await hre.network.provider.send("evm_increaseTime", [minDelay + 1]);
   await hre.network.provider.send("evm_mine", []);
   console.log(`--- warped ${minDelay + 1}s; execute ---`);
-  await hre.run("curator-guard-sync", { allowUnconstrainedNav: true, guard: d.address, policy: POLICY, execute: true });
+  await hre.run("curator-guard-sync", {
+    allowUnconstrainedNav: true,
+    guard: d.address,
+    policy: POLICY_RUN,
+    execute: true,
+  });
   console.log("--- re-run (expect: already in sync) ---");
-  await hre.run("curator-guard-sync", { allowUnconstrainedNav: true, guard: d.address, policy: POLICY, dryRun: true });
+  await hre.run("curator-guard-sync", {
+    allowUnconstrainedNav: true,
+    guard: d.address,
+    policy: POLICY_RUN,
+    dryRun: true,
+  });
   if ((await guard.targets(SAFE)).length === 0) throw Error("policy not applied");
   console.log(
     "mode:",
@@ -110,6 +150,69 @@ async function main() {
     "guardians:",
     await guard.guardians(SAFE),
   );
+
+  // The NAV gate on a band that only looks like one (review G13a-1): on a vault that holds anything, a
+  // band the live totalAssets() does not sit in, or one wider than +-50 % of it, is refused at its first
+  // sync like an unconstrained mark; the flag admits it knowingly. The settles carry the mark's band
+  // (the validator demands the repetition).
+  console.log("--- band gate: a band on paper is refused at its first sync ---");
+  type PolicyFn = { target: string; signature: string; rules?: unknown[]; [k: string]: unknown };
+  const policyRun = JSON.parse(fs.readFileSync(POLICY_RUN, "utf8")) as { functions: PolicyFn[] };
+  const vaultAbi = ["function totalAssets() view returns (uint256)"];
+  let dusty: { target: string; assets: bigint } | undefined;
+  for (const f of policyRun.functions) {
+    if (f.signature !== "updateNewTotalAssets(uint256)") continue;
+    const assets: bigint = await new hre.ethers.Contract(f.target, vaultAbi, hre.ethers.provider).totalAssets();
+    if (assets > 0n) {
+      dusty = { target: f.target, assets };
+      break;
+    }
+  }
+  if (!dusty) {
+    console.log("no vault holds assets on this fork: the band gate has nothing to refuse (step skipped)");
+  } else {
+    const dustyTarget = dusty.target;
+    const banded = (lo: bigint, hi: bigint) => ({
+      ...policyRun,
+      functions: policyRun.functions.map((f) =>
+        f.target === dustyTarget &&
+        ["updateNewTotalAssets(uint256)", "settleDeposit(uint256)", "settleRedeem(uint256)"].includes(f.signature)
+          ? {
+              target: f.target,
+              signature: f.signature,
+              rules: [
+                { kind: "GreaterThanOrEqual", wordIndex: 0, value: lo.toString() },
+                { kind: "LessThanOrEqual", wordIndex: 0, value: hi.toString() },
+              ],
+            }
+          : f,
+      ),
+    });
+    for (const [label, lo, hi, expect] of [
+      ["wider than the NAV", 1n, (1n << 256n) - 2n, "wider than +-50 %"],
+      ["away from the NAV", dusty.assets * 2n + 1n, dusty.assets * 3n + 1n, "does not contain"],
+    ] as const) {
+      const file = `${POLICY_RUN}.${label.replace(/ /g, "-")}.json`;
+      fs.writeFileSync(file, JSON.stringify(banded(lo, hi), null, 2));
+      let refusedBand = false;
+      try {
+        await hre.run("curator-guard-sync", { guard: d.address, policy: file, dryRun: true });
+      } catch (e: unknown) {
+        const m = e instanceof Error ? e.message : String(e);
+        refusedBand = m.includes(expect);
+        console.log(`band ${label} refused:`, m.slice(0, 140));
+      }
+      if (!refusedBand) throw Error(`BUG: a band ${label} was not refused at its first sync (expected "${expect}")`);
+      await hre.run("curator-guard-sync", {
+        allowUnconstrainedNav: true,
+        guard: d.address,
+        policy: file,
+        dryRun: true,
+      });
+      console.log(`band ${label} admitted with --allow-unconstrained-nav (dry run)`);
+      fs.unlinkSync(file);
+    }
+  }
 
   // Install step the signers execute on mainnet (approved self-calls): drop the EIP-1271 capable
   // fallback handler, then install the guard. Impersonate the Safe for the fork.
@@ -143,9 +246,11 @@ async function main() {
   ] as const) {
     try {
       await guard.validateTransaction(SAFE, to, 0, data, 0);
-      console.log(`BUG: ${label} allowed`);
-      process.exitCode = 1;
+      // A refusal that did not happen is a failed drill, not a note: the last line of the drill clears
+      // `process.exitCode` and CI greps only the marker, so a bare exit code here never reached CI (review G21g-1).
+      throw Error(`BUG: ${label} allowed by the guard (the drill's negative check failed)`);
     } catch (e: unknown) {
+      if (e instanceof Error && e.message.startsWith("BUG:")) throw e;
       const msg = e instanceof Error ? e.message : String(e);
       console.log(
         `validate ${label}: blocked (${msg.match(/reverted with custom error '([^']*)'/)?.[1] ?? msg.slice(0, 60)})`,
@@ -187,7 +292,7 @@ async function main() {
     await hre.run("curator-guard-sync", {
       allowUnconstrainedNav: true,
       guard: d.address,
-      policy: POLICY,
+      policy: POLICY_RUN,
       viaTimelock: true,
       proposer: PROPOSER,
     });
@@ -199,12 +304,12 @@ async function main() {
   await hre.run("curator-guard-sync", {
     allowUnconstrainedNav: true,
     guard: d.address,
-    policy: POLICY,
+    policy: POLICY_RUN,
     viaTimelock: true,
     proposer: PROPOSER,
     allowUnlock: true,
   });
-  const stateFile = `safe.batch.tmp.json.timelock.${await hre.getChainId()}.${d.address.toLowerCase()}.json`;
+  const stateFile = `safe.batch.tmp.json.timelock.${await hre.getChainId()}.${d.address.toLowerCase()}.${SAFE.toLowerCase()}.json`;
   const stored = JSON.parse(fs.readFileSync(stateFile, "utf8")) as {
     operations: { opId: string; lifts: boolean; predecessor: string }[];
   };
@@ -213,7 +318,7 @@ async function main() {
   if (stored.operations.length !== 1)
     throw Error(`expected the lift alone (nothing else to change), got ${stored.operations.length} operations`);
   console.log("--- verify the queued lift from the logs ---");
-  await hre.run("curator-guard-verify", { guard: d.address, policy: POLICY, op: lift.opId });
+  await hre.run("curator-guard-verify", { guard: d.address, policy: POLICY_RUN, op: lift.opId });
   // A re-lock by the council one hour before the delay ends: the lift is held back by the cooldown.
   await hre.network.provider.send("evm_increaseTime", [minDelay - 3600]);
   await hre.network.provider.send("evm_mine", []);
@@ -226,7 +331,7 @@ async function main() {
     await hre.run("curator-guard-sync", {
       allowUnconstrainedNav: true,
       guard: d.address,
-      policy: POLICY,
+      policy: POLICY_RUN,
       execute: true,
     });
   } catch (e: unknown) {
@@ -238,7 +343,7 @@ async function main() {
   await hre.run("curator-guard-sync", {
     allowUnconstrainedNav: true,
     guard: d.address,
-    policy: POLICY,
+    policy: POLICY_RUN,
     execute: true,
     allowUnlock: true,
   });
@@ -248,13 +353,140 @@ async function main() {
   await hre.run("curator-guard-sync", {
     allowUnconstrainedNav: true,
     guard: d.address,
-    policy: POLICY,
+    policy: POLICY_RUN,
     execute: true,
     allowUnlock: true,
   });
   if (Number(await guard.mode(SAFE)) !== 1) throw Error("BUG: the lift did not land after the cooldown");
   if (fs.existsSync(stateFile)) throw Error("BUG: state file left behind after a complete execution");
   if (fs.existsSync(`${stateFile}.manifest.json`)) throw Error("BUG: manifest left behind after a complete execution");
+  // --- a hostile proposer value in the queue (review G17b-1; pinned in the drill at review G18g-6's request) ---
+  // One scheduled operation whose executeBefore deadline is the largest uint64 must take neither the queue print,
+  // the dry run nor `verify --op` down: the task prints the raw number and the veto can still decode and cancel it.
+  console.log("--- hostile deadline in the queue: the prints survive, the veto cancels ---");
+  const hostile = guard.interface.encodeFunctionData("executeBefore", [
+    (1n << 64n) - 1n,
+    guard.interface.encodeFunctionData("lockdown", [SAFE]),
+  ]);
+  const hostileSalt = hre.ethers.id("drill-hostile-deadline");
+  await (
+    await timelock.connect(await impersonate(PROPOSER)).getFunction("schedule")(
+      d.address,
+      0,
+      hostile,
+      hre.ethers.ZeroHash,
+      hostileSalt,
+      minDelay,
+    )
+  ).wait();
+  const hostileId: string = await timelock.hashOperation(d.address, 0, hostile, hre.ethers.ZeroHash, hostileSalt);
+  const printed: string[] = [];
+  const log = console.log;
+  console.log = (...a: unknown[]) => {
+    printed.push(a.map(String).join(" "));
+    log(...a);
+  };
+  try {
+    await hre.run("curator-guard-sync", {
+      allowUnconstrainedNav: true,
+      guard: d.address,
+      policy: POLICY_RUN,
+      dryRun: true,
+    });
+    await hre.run("curator-guard-verify", { guard: d.address, policy: POLICY_RUN, op: hostileId });
+  } finally {
+    console.log = log;
+  }
+  if (!printed.some((l) => l.includes("not a representable date")))
+    throw Error("BUG: the queue print did not name the hostile deadline as such (review G17b-1)");
+  const canceller = await impersonate(Addresses.ethereum.Vetro.curatorGuardCancellers[0]);
+  await (await timelock.connect(canceller).getFunction("cancel")(hostileId)).wait();
+  if ((await timelock.getTimestamp(hostileId)) !== 0n)
+    throw Error("BUG: the veto could not cancel the hostile operation");
+  console.log("hostile deadline printed as the raw number and cancelled by the veto");
+  // --- the prints the veto reads, pinned here (review G20g-6): the round-19 decoder and the debt gate ------------
+  // (a) A wrapper inside a wrapper hid a sensitive inner call from every print in round 19 (G19c-2 / G19g-1): the
+  //     queue print and `verify --op` must now name the INNERMOST call with the nesting tagged, and the confirm path
+  //     must refuse the operation outright, before readiness and whatever the flags.
+  // (b) The unconstrained-NAV gate must name what sits behind the vault (the recorded strategies' figures, or that
+  //     no record routes to it): the pre-round-18 text said neither.
+  console.log(
+    "--- a nested wrapper in the queue: decoded to its innermost call, tagged, refused on --execute --op ---",
+  );
+  const nestedInner = guard.interface.encodeFunctionData("executeBefore", [
+    BigInt(Math.floor(Date.now() / 1000)) + 20n * 86_400n,
+    guard.interface.encodeFunctionData("lockdown", [SAFE]),
+  ]);
+  const nested = guard.interface.encodeFunctionData("executeBefore", [
+    BigInt(Math.floor(Date.now() / 1000)) + 30n * 86_400n,
+    nestedInner,
+  ]);
+  const nestedSalt = hre.ethers.id("drill-nested-wrapper");
+  await (
+    await timelock.connect(await impersonate(PROPOSER)).getFunction("schedule")(
+      d.address,
+      0,
+      nested,
+      hre.ethers.ZeroHash,
+      nestedSalt,
+      minDelay,
+    )
+  ).wait();
+  const nestedId: string = await timelock.hashOperation(d.address, 0, nested, hre.ethers.ZeroHash, nestedSalt);
+  const printed2: string[] = [];
+  console.log = (...a: unknown[]) => {
+    printed2.push(a.map(String).join(" "));
+    log(...a);
+  };
+  let nestedRefused = "";
+  try {
+    await hre.run("curator-guard-sync", {
+      allowUnconstrainedNav: true,
+      guard: d.address,
+      policy: POLICY_RUN,
+      dryRun: true,
+    });
+    await hre.run("curator-guard-verify", { guard: d.address, policy: POLICY_RUN, op: nestedId });
+    try {
+      await hre.run("curator-guard-sync", {
+        allowUnconstrainedNav: true,
+        allowUnlock: true,
+        guard: d.address,
+        policy: POLICY_RUN,
+        execute: true,
+        op: nestedId,
+        confirmSensitive: true,
+      });
+    } catch (e: unknown) {
+      nestedRefused = e instanceof Error ? e.message : String(e);
+    }
+  } finally {
+    console.log = log;
+  }
+  const nestedLines = printed2.filter((l) => l.includes(nestedId) || l.startsWith("  [0]"));
+  if (
+    !nestedLines.some(
+      (l) => l.includes("lockdown(") && l.includes("[NESTED WRAPPER") && l.includes("[NOT A SYNC CALL]"),
+    )
+  )
+    throw Error(
+      "BUG: the queue print or verify --op did not name the innermost call of a nested wrapper with its tags (review G19c-2)",
+    );
+  if (!nestedRefused.includes("wraps a call in executeBefore twice"))
+    throw Error(
+      `BUG: --execute --op --confirm-sensitive did not refuse the nested wrapper (review G19c-2): ${nestedRefused.slice(0, 120)}`,
+    );
+  if (
+    !printed2.some(
+      (l) => l.includes("Vesper debt behind it") || l.includes("no Lagoon_Vetro_* strategy recorded for it"),
+    )
+  )
+    throw Error("BUG: the NAV gate's print no longer names what sits behind the vault (reviews G11b-6, G13g-2)");
+  await (await timelock.connect(canceller).getFunction("cancel")(nestedId)).wait();
+  if ((await timelock.getTimestamp(nestedId)) !== 0n) throw Error("BUG: the veto could not cancel the nested wrapper");
+  console.log(
+    "nested wrapper decoded to its innermost call, tagged, refused on --execute --op and cancelled by the veto",
+  );
   console.log("incident drill complete: mode", await guard.mode(SAFE));
   process.exitCode = 0;
 }

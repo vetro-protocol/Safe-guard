@@ -1,0 +1,17 @@
+{
+  "chainId": 1,
+  "safe": "0x1b534a8543212F5957168D83311A41E0Ea1cfe48",
+  "mode": "Enforced",
+  "requiredFallbackHandler": {
+    "handler": "0x0000000000000000000000000000000000000000",
+    "enforce": true
+  },
+  "guardians": [],
+  "functions": [
+    {
+      "target": "0x131CcfDFfeD712885aAc31445d351E6b62656679",
+      "signature": "settleDeposit(uint256)",
+      "allowValue": "yes"
+    }
+  ]
+}

@@ -8,7 +8,7 @@ contract Plain {
     uint256 public x = 1;
 }
 
-/// @title The guard refuses to deploy on a pre-Cancun EVM (IMPROVEMENTS_V2.md item 8)
+/// @title The guard refuses to deploy on a pre-Cancun EVM (v2 robustness item: the constructor's EIP-1153 probe)
 /// @notice Runs under `FOUNDRY_PROFILE=precancun` (EVM version Shanghai, compiled without any Cancun
 ///         opcode). The guard's creation code is the Cancun build the `guards` profile produced
 ///         (`out-guards/`): its constructor probes EIP-1153 with a `tload` / `tstore` pair, so the raw
@@ -18,8 +18,8 @@ contract Plain {
 ///         hook, `setGuard(0)` included, would hit the invalid opcode.
 contract CuratorGuardPreCancunTest is Test {
     function test_guard_deployment_fails_on_a_shanghai_evm_while_a_plain_contract_deploys() public {
-        // The default profile compiles this directory too and runs on Cancun, where the guard deploys:
-        // the check is only meaningful without transient storage.
+        // A Cancun profile that compiled this directory would deploy the guard: the check is only
+        // meaningful without transient storage (the default profile compiles `test/guards/` only).
         if (_hasTransientStorage()) {
             vm.skip(true);
             return;

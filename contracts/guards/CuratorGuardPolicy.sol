@@ -14,33 +14,34 @@ import {Operation} from "../interfaces/safe/ISafeGuard.sol";
 ///          - `DEFAULT_ADMIN_ROLE` ("admin", exactly one account, two-step transfer with a delay; in
 ///            production `CuratorGuardTimelock`, an OpenZeppelin `TimelockController` fed by Vetro
 ///            governance): the only role that can WIDEN a policy, approve long-lived transactions, open
-///            a long `Bypass` window and administer roles. Transferring the admin to `address(0)` is
-///            refused: an adminless guard could never be reconfigured or removed from a Safe (every
-///            `setGuard` is a self-call that only the admin's approval or window can authorise). The
-///            admin's lifts (`enforce` after a lockdown), windows and approvals come out of a public
-///            queue anyone can execute, so they are refused for `LOCKDOWN_COOLDOWN` after every
-///            lockdown of the Safe (time for the cancellers to cancel what was queued before the
-///            incident). The admin itself is never constrained by the guard (see
+///            a long `Bypass` window and grant or revoke the council. Transferring the admin to
+///            `address(0)` is refused: an adminless guard could never be widened again or removed from
+///            a Safe (every `setGuard` is a self-call that only the admin's approval or window can
+///            authorise). The admin's lifts (`enforce` after a lockdown), windows and approvals come
+///            out of a public queue anyone can execute, so they are refused for `LOCKDOWN_COOLDOWN`
+///            after every lockdown of the Safe (time for the cancellers to cancel what was queued
+///            before the incident). The admin itself is never constrained by the guard (see
 ///            `CuratorGuard`), so installing the guard on the admin cannot deadlock it; keep the admin a
 ///            contract that is never a guarded Safe.
 ///          - `COUNCIL_ROLE` ("council", a fast multisig with no curator keys): lifts a lockdown
-///            (`enforce`), issues short approvals (≤ `MAX_COUNCIL_APPROVAL_TTL`) whose Safe self-calls
-///            are limited to an allowlist (owner management that never sets a threshold below 2,
-///            `disableModule`, `setFallbackHandler(0)`, the empty rejection call; the policy's required
-///            fallback handler counts as part of the Safe and is unreachable),
-///            opens a short `Bypass` (≤ `MAX_COUNCIL_BYPASS`) that relaxes the owner-signed path only
-///            (the same self-call allowlist applies there; the module path stays under the policy and
-///            the module allowlist), manages per-Safe and deployment-wide guardians,
-///            re-allows a canonical unwrapper hash, and can narrow anything. No role holder can act on
-///            itself as a Safe (`enforce`, `bypass`, `approveTransaction` with `safe == msg.sender`).
+///            (`enforce`) and can narrow anything. Issues short approvals (≤ `MAX_COUNCIL_APPROVAL_TTL`)
+///            whose Safe self-calls are limited to an allowlist: owner management that never sets a
+///            threshold below 2, `disableModule`, `setFallbackHandler(0)` and the empty rejection call;
+///            the policy's required fallback handler counts as part of the Safe and is unreachable.
+///            Opens a short `Bypass` (≤ `MAX_COUNCIL_BYPASS`) that relaxes the owner-signed path only,
+///            within the same allowlist; the module path stays under the policy and the module
+///            allowlist. Manages per-Safe and deployment-wide guardians and re-allows a canonical
+///            unwrapper hash. No role holder can act on itself as a Safe (`enforce`, `bypass`,
+///            `approveTransaction` with `safe == msg.sender`).
 ///          - guardians (warm keys / monitoring bots), per Safe (`setGuardian`) or deployment-wide
 ///            (`GUARDIAN_ROLE`): can only NARROW a policy (lockdown, revoke, remove values, revoke
 ///            approvals). They can never widen it.
 /// @dev    Policies are keyed by Safe address: `checkTransaction` is called by the Safe itself, so
 ///         `msg.sender` identifies the policy. One deployment serves any number of Safes.
 /// @dev    An unconfigured Safe is in `Mode.Lockdown` (enum default): every transaction is rejected
-///         until the admin configures a policy or an approval authorises the transaction. Fail-closed.
-///         `Bypass` is always time-boxed and reads as `Lockdown` once it expires.
+///         until `enforce` or a `Bypass` window (admin or council) lifts the lockdown, or an approval
+///         authorises the transaction. Fail-closed. `Bypass` is always time-boxed and reads as
+///         `Lockdown` once it expires.
 abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     using EnumerableSet for EnumerableSet.AddressSet;
     using EnumerableSet for EnumerableSet.Bytes32Set;
@@ -51,12 +52,13 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
 
     /// @notice `Lockdown`: reject everything except approved transactions (default, and what an
     ///         expired `Bypass` reads as). `Enforced`: evaluate the allowlist. `Bypass`: the policy is
-    ///         off for this Safe's owner-signed path until `bypassUntil` (emergency valve; nothing is
-    ///         recorded or compared there, and no approval can be issued or consumed). A council-opened
-    ///         window still refuses the self-calls outside the council's allowlist on that path and
-    ///         leaves the module path entirely under the policy (snapshot, allowlist, post-execution
-    ///         comparison, nesting check); an admin window checks nothing on either path but the
-    ///         module allowlist and that the guard is never a call target.
+    ///         off until `bypassUntil` (emergency valve; nothing is recorded or compared there, and no
+    ///         approval can be issued or consumed), on the owner-signed path alone or on both paths
+    ///         depending on who opened the window. A council-opened window still refuses the self-calls
+    ///         outside the council's allowlist on that path and leaves the module path entirely under
+    ///         the policy (snapshot, allowlist, post-execution comparison, nesting check); an admin
+    ///         window checks nothing on either path but the module allowlist and that the guard is
+    ///         never a call target.
     enum Mode {
         Lockdown,
         Enforced,
@@ -73,9 +75,11 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     ///         `TAIL_FLAG` set in `wordIndex` the rule's subject is instead the hash of the calldata
     ///         from that word to its end (`keccak256(data[4 + 32 * (wordIndex & 0x7fff):])`), which
     ///         binds a dynamic payload exactly (`EqualTo` one reviewed payload, `OneOf` a set of them)
-    ///         when the word is the FIRST dynamic parameter's head word: from a later word the offset
-    ///         of an earlier dynamic parameter stays outside the hash and the callee reads that
-    ///         parameter from wherever the offset points (the tooling refuses such a rule).
+    ///         on two conditions: the word is the FIRST dynamic parameter's head word, and the reviewed
+    ///         payload is a canonical encoding. From a later word the offset of an earlier dynamic
+    ///         parameter stays outside the hash; in a non-canonical payload an offset can point back
+    ///         into an unbound static word before it. Either way the callee reads that parameter from
+    ///         wherever the offset points; the tooling refuses such a rule and such raw bytes.
     /// @dev    `GreaterThanOrEqual` alone is fail-open (a word with dirty high bits, or a negative
     ///         `intN`, exceeds any floor), so it is only accepted together with an upper bound
     ///         (`LessThanOrEqual`, `EqualTo` or `OneOf`) on the same word.
@@ -104,15 +108,16 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
         bool allowed;
         bool allowValue;
         /// @dev Bumped by every revocation and folded into the keys of the function's `OneOf` sets:
-        ///      revoking abandons the sets in O(1) instead of iterating their members (about 14k gas
-        ///      each on committed storage), and a later re-allow starts from empty sets.
+        ///      revoking abandons the sets in O(1) instead of iterating their members (a storage clear
+        ///      per member), and a later re-allow starts from empty sets.
         uint32 generation;
         ParamRule[] rules;
     }
 
     /// @dev One storage slot. `safe` lets revocation events name the Safe and `epoch` lets views tell
     ///      a stale record from a live one; the id itself already binds
-    ///      `(safe, epoch, executor, to, value, data, operation)`.
+    ///      `(safe, epoch, executor, to, value, data, operation)` and, for a delegatecall, the code at
+    ///      `to` (`computeApprovalId`).
     struct Approval {
         address safe;
         uint64 expiry;
@@ -232,7 +237,8 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     /// @notice Guard generation, for tooling and migrations (the deployed bytecode is what the tooling
     ///         pins; this is what an indexer or a replacement runbook can read).
     uint256 public constant VERSION = 2;
-    /// @notice Fast lane: lift lockdowns, short approvals and bypasses, per-Safe guardians, narrowing.
+    /// @notice Fast lane: lift lockdowns, short approvals and bypasses, guardians (per-Safe and
+    ///         deployment-wide), unwrapper hash re-allows, narrowing.
     bytes32 public constant COUNCIL_ROLE = keccak256("COUNCIL_ROLE");
     /// @notice Deployment-wide narrow-only responder (every Safe). Per-Safe guardians: `setGuardian`.
     bytes32 public constant GUARDIAN_ROLE = keccak256("GUARDIAN_ROLE");
@@ -242,7 +248,12 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     /// @dev Upper bound on rules per `(target, selector)`; bounds the per-call check cost.
     uint256 internal constant MAX_RULES = 16;
     /// @dev Upper bound on members of one `OneOf` set; keeps `clearAllowedValues` and a re-allow that
-    ///      drops a `OneOf` rule (which iterate the set) executable in one block.
+    ///      drops ONE `OneOf` rule (both iterate the set, a storage clear per member; §4 of
+    ///      `docs/curator-guard.md` carries the measured cost) inside one transaction (EIP-7825 caps a
+    ///      transaction at 16,777,216 gas). A re-allow that drops several full sets at once iterates all
+    ///      of them: the tooling's joint cap of 256 members per function keeps that inside the limit,
+    ///      sixteen full sets would not fit (`revokeFunction` abandons them in O(1) instead, and
+    ///      `clearAllowedValues` empties one set at a time).
     uint256 internal constant MAX_ALLOWED_VALUES = 128;
     /// @dev Upper bound on allowed selectors per target; bounds what `revokeTarget` iterates.
     uint256 internal constant MAX_SELECTORS = 32;
@@ -310,9 +321,10 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     /// @dev Runtime code hashes a delegatecall unwrapper must have, at registration and at every use.
     ///      Only the canonical `MultiSendCallOnly` builds seeded in the constructor can ever be allowed:
     ///      any other code runs in the Safe's storage context, can plant dangling `modules[x]` /
-    ///      `owners[x]` entries the configuration digest cannot see, and can even re-arm the hooks to
-    ///      launder the digest. A new Safe release therefore means a new guard (approved `setGuard`),
-    ///      never a widening of this set. Guardians may forbid a hash; the admin may re-allow a seeded one.
+    ///      `owners[x]` entries the configuration digest cannot see, and can even call the hooks to
+    ///      replace the snapshot with one of the modified configuration. A new Safe release therefore
+    ///      means a new guard (approved `setGuard`), never a widening of this set. Guardians may forbid
+    ///      a hash; the admin may re-allow a seeded one.
     mapping(bytes32 codehash => bool) internal _unwrapperCodehashes;
     mapping(bytes32 codehash => bool) internal _canonicalCodehashes;
     /// @dev Runtime code hashes of the Safe proxies and singletons this guard supports: the proxy the
@@ -402,7 +414,8 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     ///         and replayed after it. When the window expires the Safe reads as `Lockdown`. A council
     ///         window relaxes the owner-signed path only, within the council's limits; a module
     ///         (no owner signature) stays under the policy and the module allowlist. An admin window
-    ///         is inert on both paths, but for the module allowlist and the guard as a call target.
+    ///         is inert on both paths, but for the module allowlist and the guard as the top-level call
+    ///         target (batch entries are not decoded in it).
     function bypass(address safe_, uint64 duration_) external {
         _nonZero(safe_);
         bool _admin = _checkAdminOrCouncilFor(safe_);
@@ -419,7 +432,14 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     ///         passed, as the caller (`delegatecall` to self keeps `msg.sender`). For operations that
     ///         sit in a timelock queue: a queued `bypass` / `approveTransaction` / widening that nobody
     ///         executed in time is then dead instead of a latent, permissionless action months later.
+    /// @dev    Refused for a caller that is a Safe with this guard in its fallback-handler slot
+    ///         (`Unauthorized`, like every role check): such a Safe forwards anyone's `executeBefore`
+    ///         with itself as the caller, and the delegatecall below re-dispatches `call_` as the whole
+    ///         calldata of the inner frame, so the after-hooks' 68-byte check (`ForwardedHookCall`)
+    ///         would see a canonical call and a stranger could report a transaction that never ran
+    ///         (round 9, G9a-1; applied after round 13).
     function executeBefore(uint64 deadline_, bytes calldata call_) external returns (bytes memory) {
+        _refuseForwarded();
         if (block.timestamp > deadline_) revert DeadlinePassed(deadline_);
         (bool _ok, bytes memory _ret) = address(this).delegatecall(call_);
         if (!_ok) {
@@ -527,7 +547,8 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     }
 
     /// @notice Permit (admin) or forbid (any narrower) empty-calldata calls to `target_`, i.e. plain
-    ///         native-token transfers. Also required for zero-value empty calls.
+    ///         native-token transfers. Also required for zero-value empty calls. Emits on every call,
+    ///         a no-op included (`setModuleAllowed` and `setMultiSendUnwrapper` emit on a change only).
     function setNativeTransferAllowed(address safe_, address target_, bool allowed_) external {
         SafePolicy storage $ = _checkSetter(safe_, target_, allowed_);
         $.nativeTransferAllowed[target_] = allowed_;
@@ -908,7 +929,12 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     ///      bounds when it may be accepted (`MAX_ADMIN_DELAY` after the schedule; a successor timelock
     ///      at the slowest delay still makes it), so an abandoned hand-over cannot be accepted years
     ///      later by keys nobody watches any more. The admin re-arms it by beginning again.
+    ///      Refused for a forwarded caller like every other role entry (`Unauthorized`): a pending-admin
+    ///      Safe whose fallback handler is this guard would otherwise let any stranger complete the
+    ///      hand-over on its behalf and cost the outgoing admin its late cancel (round 9, G9a-3 /
+    ///      G9c-3; applied after round 13).
     function _acceptDefaultAdminTransfer() internal virtual override {
+        _refuseForwarded();
         _requireUnguarded(msg.sender, true);
         (, uint48 _schedule) = pendingDefaultAdmin();
         unchecked {
@@ -946,7 +972,7 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     }
 
     /// @dev Member-wise so the legacy codegen writes the packed record with one `sstore` and no
-    ///      memory copy (three masked writes otherwise).
+    ///      memory copy (a struct literal is built in memory first and copied from there).
     function _storeApproval(bytes32 id_, address safe_, uint64 expiry_, uint32 epoch_) internal {
         Approval storage _a = _approvals[id_];
         _a.safe = safe_;
@@ -969,6 +995,8 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     ///      address to everyone: its hooks if it is guarded, its ROLE if it holds one (the council Safe,
     ///      a guardian Safe). True when `account_` answers `getStorageAt` like a Safe (v1.3.0+) and its
     ///      handler slot holds this guard; an EOA or a contract that is not a Safe (the timelock) is not.
+    ///      The slot's low 160 bits are compared, as the EVM masks a call target: a word with dirty high
+    ///      bits still forwards to this guard and is read as forwarding (review G16d-1).
     function _isHandlerOf(address account_) internal view returns (bool _yes) {
         bytes32 _slot = FALLBACK_HANDLER_STORAGE_SLOT;
         assembly ("memory-safe") {
@@ -979,7 +1007,7 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
             mstore(add(_p, 0x04), _slot)
             mstore(add(_p, 0x24), 1)
             let _ok := staticcall(gas(), account_, _p, 0x44, _p, 0x60)
-            _yes := and(and(_ok, eq(returndatasize(), 0x60)), eq(mload(add(_p, 0x40)), address()))
+            _yes := and(and(_ok, eq(returndatasize(), 0x60)), eq(and(mload(add(_p, 0x40)), 0xffffffffffffffffffffffffffffffffffffffff), address()))
         }
     }
 
@@ -989,8 +1017,10 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     }
 
     /// @dev The library's own role surface gets the same refusal: `onlyRole` (grants, revocations, the
-    ///      admin transfer, for an admin that is a Safe) and `renounceRole` (a forwarded stranger must not
-    ///      be able to make a Safe drop its role).
+    ///      begin and cancel of the admin transfer, for an admin that is a Safe) and `renounceRole` (a
+    ///      forwarded stranger must not be able to make a Safe drop its role). The acceptance
+    ///      (`acceptDefaultAdminTransfer`) is not `onlyRole`: `_acceptDefaultAdminTransfer` carries the
+    ///      refusal itself, as does `executeBefore`, the one re-dispatcher.
     function _checkRole(bytes32 role_, address account_) internal view virtual override {
         _refuseForwarded();
         super._checkRole(role_, account_);
@@ -1030,12 +1060,17 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
         if (!$.modules.contains(module_)) revert ModuleNotAllowed(module_);
     }
 
-    /// @dev What an approval may address, checked when it is issued. Never this guard. Calldata sent to
+    /// @dev What an approval may address, checked when it is issued. Never this guard, never the zero
+    ///      address (an approved value to it would be a burn; the policy's native lane refuses it too,
+    ///      review G17a-3). Calldata sent to
     ///      an account without code "succeeds" and does nothing (so does a delegatecall): the one-off
     ///      would be spent, and reported as executed, for nothing. And an approved delegatecall runs
     ///      code in the Safe's context, so that code must be a deployed contract: an EIP-7702 delegated
     ///      EOA (its code starts with `0xef`, which EIP-3541 reserves) can be re-pointed by its key at
     ///      any time, before or after the approval is issued.
+    ///      This rail runs at issue only: a plain call approved into such an EOA whose key then clears the
+    ///      delegation is consumed on an empty account (the policy lane refuses the same target at every
+    ///      use), so an approval never names a designator (review G22a-1).
     function _checkApprovalTarget(address to_, uint256 dataLength_, Operation operation_) internal view {
         bool _bad;
         assembly ("memory-safe") {
@@ -1046,7 +1081,7 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
                 and(operation_, eq(byte(0, mload(0)), 0xef))
             )
         }
-        if (_bad || to_ == address(this)) revert InvalidTarget(to_);
+        if (_bad || to_ == address(this) || to_ == address(0)) revert InvalidTarget(to_);
     }
 
     /// @dev Council approvals: plain calls only, self-calls only from the council's allowlist.
@@ -1104,8 +1139,9 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
 
     /// @dev A precompile has no code, so the no-code rule of `_councilMaySelfCall` would take it for a
     ///      plain key: the identity precompile (0x04) echoes an EIP-1271 query back as the magic value on
-    ///      a Safe build without the pre-call code check, so the low address range is refused as well. A
-    ///      keyless address stays a dead seat the rule cannot tell apart.
+    ///      a Safe build that does not check for code before the call (solc 0.8.10+ skips that check
+    ///      when return data is expected; the deployed 0.7.6 singletons keep it), so the low address
+    ///      range is refused as well. A keyless address stays a dead seat the rule cannot tell apart.
     function _hasNoCode(bytes calldata word_) private view returns (bool) {
         address _account = address(uint160(uint256(bytes32(word_))));
         return uint160(_account) > 0xffff && _account.code.length == 0;

@@ -50,8 +50,8 @@ if [ -n "$violations" ]; then
     printf '  %5sB  %3s%%  %5sB  %s\n' "$size" "$pct" "$margin" "$name"
   done
   printf '\n❌ Contract(s) at or above %s%% of the %sB EIP-170 limit.\n' "$THRESHOLD_PCT" "$LIMIT"
-  printf 'If a contract legitimately needs viaIR, add it to BOTH viaIrContracts\n'
-  printf '(hardhat.config.ts) and compilation_restrictions (foundry.toml).\n'
+  printf 'The guard contracts compile at 10 optimizer runs without via-IR in both toolchains (the single compiler\n'
+  printf 'setting of hardhat.config.ts, foundry.toml); a contract near the gate is measured before code is added (docs section 10).\n'
   exit 1
 fi
 

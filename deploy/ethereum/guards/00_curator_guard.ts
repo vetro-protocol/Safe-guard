@@ -1,7 +1,7 @@
 import chalk from "chalk";
 import { DeployFunction } from "hardhat-deploy/types";
 import { HardhatRuntimeEnvironment } from "hardhat/types";
-import { getAddress } from "ethers";
+import { getAddress, keccak256 } from "ethers";
 import type { Contract, EventLog, Log } from "ethers";
 import Addresses from "../../../helpers/address";
 
@@ -11,18 +11,43 @@ const TIMELOCK_CONTRACT = "CuratorGuardTimelock";
 // to the installed one (docs/curator-guard.md section 7.5). The timelock alias follows it.
 const ALIAS = process.env.CURATOR_GUARD_ALIAS || CONTRACT;
 const TIMELOCK_ALIAS = `${ALIAS}Timelock`;
+// A delay typed as "2d" or "48h" threw a bare `SyntaxError: Cannot convert 2d to a BigInt` from the module's load, naming
+// no variable (review G21b-12): say which variable, and that the unit is seconds.
+function secondsFromEnv(name: string, fallback: bigint): bigint {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  if (!/^\d+$/.test(raw)) throw Error(`${name} must be a whole number of SECONDS (48 h = 172800), got ${raw}`);
+  return BigInt(raw);
+}
 // Widenings sit in public for this long before they can be executed (seconds). 48 h default.
-const TIMELOCK_DELAY = BigInt(process.env.CURATOR_GUARD_TIMELOCK_DELAY || 48 * 3600);
-// Delay of the guard's own two-step admin transfer (`AccessControlDefaultAdminRules`). Must exceed the
-// timelock delay so a scheduled `cancelDefaultAdminTransfer` can land in time: 3 days default.
-const ADMIN_DELAY = BigInt(process.env.CURATOR_GUARD_ADMIN_DELAY || 3 * 24 * 3600);
+const TIMELOCK_DELAY = secondsFromEnv("CURATOR_GUARD_TIMELOCK_DELAY", 48n * 3600n);
+// Delay of the guard's own two-step admin transfer (`AccessControlDefaultAdminRules`). Must sit at least a
+// day above the timelock delay (`ADMIN_DELAY_MARGIN`) so a `cancelDefaultAdminTransfer` scheduled when a
+// hostile begin lands keeps a signing round before the acceptance opens: 3 days default.
+const ADMIN_DELAY = secondsFromEnv("CURATOR_GUARD_ADMIN_DELAY", 3n * 24n * 3600n);
 // Reuse an existing timelock (e.g. for a replacement guard) instead of deploying one per alias.
 const EXISTING_TIMELOCK = process.env.CURATOR_GUARD_TIMELOCK;
 const ZERO = "0x0000000000000000000000000000000000000000";
-// Mirrors `CuratorGuardTimelock.MIN_DELAY_FLOOR / MIN_DELAY_CAP` and `CuratorGuardPolicy.MAX_ADMIN_DELAY`.
-const MIN_DELAY_FLOOR = 3600n;
+// The reviewed runtimes, metadata stripped, as `test/guards/G12a_BuildPin.t.sol` pins them (keccak256 of the runtime
+// without its CBOR tail; 23,267 and 8,204 bytes: the masked handler-word rails of review G16d-1 and the guard's zero-target approval rail of review G17a-3). The deploy sends whatever the local `node_modules` and solc compiled
+// to, and CI's parity step compares hardhat with foundry, never with the pin: this is the one step that must send the
+// reviewed bytes, so it checks them itself (review G18g-2). A re-pin is a contract change with a review: move these
+// two values together with the test's.
+const REVIEWED_RUNTIME_KECCAK: Record<string, string> = {
+  [CONTRACT]: "0x3bfe33c8e8c7a8e4edbe454efb7efaef22182ba362b8b824ccc0610c763bea8d",
+  [TIMELOCK_CONTRACT]: "0x8a69e72c4ff2fbc0189b1ff3f6a7e74c239bcc3c3394a3fe158e952a02da786c",
+};
+// Mirrors `CuratorGuardTimelock.MIN_DELAY_FLOOR / MIN_DELAY_CAP` and `CuratorGuardPolicy.MAX_ADMIN_DELAY`
+// (the floor is one day since the round-13 follow-up, G13f-3; keep the three in sync with the contracts).
+const MIN_DELAY_FLOOR = 86_400n;
 const MIN_DELAY_CAP = 30n * 24n * 3600n;
 const MAX_ADMIN_DELAY = 30n * 24n * 3600n;
+// How far the admin delay must sit above the timelock delay. The ordering exists so that a
+// `cancelDefaultAdminTransfer` scheduled when a hostile begin lands is Ready (minDelay later) before the
+// acceptance opens (adminDelay later): the honest side keeps adminDelay - minDelay, which must hold a
+// proposer Safe's signing round; "above by one second" satisfies the strict rule and keeps nothing
+// (review G16b-3). The defaults keep a day.
+const ADMIN_DELAY_MARGIN = 86_400n;
 const OVERRIDES = [
   "CURATOR_GUARD_ALLOW_KEY_OVERLAP",
   "CURATOR_GUARD_ALLOW_NO_COUNCIL",
@@ -102,6 +127,25 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
       `${msg}.${override ? ` (${override}=1 to override${rehearsalOnly ? ", on a rehearsal only" : ""})` : ""}`,
     );
   };
+  // --- the build ---------------------------------------------------------------------------------
+  // Before any preflight: the artifacts about to be deployed must be the reviewed build (a rehearsal of a changed
+  // build warns, as every refusal does on a fork; a real network refuses, with no override: re-pin with a review).
+  for (const [name, expected] of Object.entries(REVIEWED_RUNTIME_KECCAK)) {
+    const stripped = stripMetadata((await hre.artifacts.readArtifact(name)).deployedBytecode);
+    const actual = keccak256(`0x${stripped}`);
+    if (actual !== expected)
+      refuse(
+        `${name}: the compiled artifact's stripped runtime (${stripped.length / 2} bytes) hashes to ${actual}, not the reviewed ` +
+          `${expected}: this is not the audited build; re-pin it with a review (test/guards/G12a_BuildPin.t.sol and ` +
+          `REVIEWED_RUNTIME_KECCAK in this script) before deploying`,
+      );
+    else
+      console.log(
+        chalk.green(
+          `${name}: the artifact is the reviewed build (${actual.slice(0, 10)}…, ${stripped.length / 2} bytes)`,
+        ),
+      );
+  }
   const active = OVERRIDES.filter((v) => process.env[v] === "1");
   if (active.length) {
     const realEffect = active.filter((v) => !REHEARSAL_ONLY.includes(v));
@@ -166,11 +210,11 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
     );
   }
   // Delays typed in the wrong unit: a 48-second timelock makes every widening executable at once; the
-  // contract clamps `getMinDelay()` to [1 h, 30 d] and refuses a constructor value outside it.
+  // contract clamps `getMinDelay()` to [1 d, 30 d] and refuses a constructor value outside it.
   // A fresh timelock cannot be constructed below the floor (`DelayOutOfRange`); no override.
   if (TIMELOCK_DELAY < MIN_DELAY_FLOOR && !EXISTING_TIMELOCK) {
     throw Error(
-      `CURATOR_GUARD_TIMELOCK_DELAY is ${TIMELOCK_DELAY}s (${human(TIMELOCK_DELAY)}): the contract refuses less than an hour (the value is in seconds; 48 h = 172800)`,
+      `CURATOR_GUARD_TIMELOCK_DELAY is ${TIMELOCK_DELAY}s (${human(TIMELOCK_DELAY)}): the contract refuses less than a day (the value is in seconds; 48 h = 172800)`,
     );
   }
   if (TIMELOCK_DELAY > MIN_DELAY_CAP)
@@ -179,9 +223,10 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
     );
   if (ADMIN_DELAY > MAX_ADMIN_DELAY)
     throw Error(`CURATOR_GUARD_ADMIN_DELAY ${ADMIN_DELAY}s exceeds the contract cap of 30 days`);
-  if (ADMIN_DELAY <= TIMELOCK_DELAY) {
+  if (ADMIN_DELAY < TIMELOCK_DELAY + ADMIN_DELAY_MARGIN) {
     refuse(
-      `admin delay ${ADMIN_DELAY}s <= timelock delay ${TIMELOCK_DELAY}s: a scheduled cancelDefaultAdminTransfer could not land in time (set CURATOR_GUARD_ADMIN_DELAY above the timelock delay)`,
+      `admin delay ${ADMIN_DELAY}s is less than a day above the timelock delay ${TIMELOCK_DELAY}s: a cancelDefaultAdminTransfer scheduled when a hostile begin lands keeps ${ADMIN_DELAY > TIMELOCK_DELAY ? ADMIN_DELAY - TIMELOCK_DELAY : 0n}s before the acceptance opens, less than a signing round (set CURATOR_GUARD_ADMIN_DELAY at least a day above the timelock delay)`,
+      "CURATOR_GUARD_ALLOW_SHORT_DELAY",
     );
   }
   // The guard's constructor probes EIP-1153 (a guard on a pre-Cancun chain would brick the first Safe
@@ -311,6 +356,18 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
   if (EXISTING_TIMELOCK) {
     timelockAddress = ethers.getAddress(EXISTING_TIMELOCK);
     console.log(chalk.blue(`reusing timelock ${timelockAddress} (CURATOR_GUARD_TIMELOCK)`));
+  } else if ((await deployments.getOrNull(ALIAS)) && !(await deployments.getOrNull(TIMELOCK_ALIAS))) {
+    // A guard record without its timelock record (a re-run after a lost or uncommitted record, review G20g-2): the
+    // recorded guard's admin IS its timelock. Deploying another here would be refused by the admin check below only
+    // after the deploy was paid for, and would leave the record naming an orphan that holds the proposer roles.
+    const recorded = (await deployments.get(ALIAS)).address;
+    timelockAddress = ethers.getAddress(await (await ethers.getContractAt(CONTRACT, recorded)).defaultAdmin());
+    console.log(
+      chalk.blue(
+        `${TIMELOCK_ALIAS} record missing: using the admin of the recorded ${ALIAS} ${recorded}, ${timelockAddress} ` +
+          `(CURATOR_GUARD_TIMELOCK overrides; restore the record from the chain and commit both)`,
+      ),
+    );
   } else {
     const timelock = await deployments.deploy(TIMELOCK_ALIAS, {
       contract: TIMELOCK_CONTRACT,
@@ -344,9 +401,10 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
       "CURATOR_GUARD_ALLOW_SHORT_DELAY",
     );
   }
-  if (ADMIN_DELAY <= liveMinDelay)
+  if (ADMIN_DELAY < liveMinDelay + ADMIN_DELAY_MARGIN)
     refuse(
-      `admin delay ${ADMIN_DELAY}s <= live timelock delay ${liveMinDelay}s: a scheduled cancelDefaultAdminTransfer could not land in time`,
+      `admin delay ${ADMIN_DELAY}s is less than a day above the live timelock delay ${liveMinDelay}s: a cancelDefaultAdminTransfer scheduled when a hostile begin lands keeps ${ADMIN_DELAY > liveMinDelay ? ADMIN_DELAY - liveMinDelay : 0n}s before the acceptance opens`,
+      "CURATOR_GUARD_ALLOW_SHORT_DELAY",
     );
   await auditTimelock(hre, tl, timelockAddress, proposers, cancellers, council, forkLike);
 
@@ -355,6 +413,11 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
   // a second, unconfigured guard and repoint the artifact away from the one the Safe installed).
   // A replacement guard (docs/curator-guard.md section 7.5) is a new, versioned alias.
   const guardArgs = [ADMIN_DELAY, timelockAddress, council];
+  // A lost or uncommitted guard record (review G22c-4): `skipIfAlreadyDeployed` sees no record and mints a second guard
+  // behind the same timelock, then repoints the record at it. Two cheap reads catch the common cases before any gas
+  // is spent: the curator Safe's guard slot (an installed guard), and the timelock's queue (a synced, not yet installed
+  // guard: every sync targets the guard). Both are read for this repository's build with this timelock as admin.
+  if (!(await deployments.getOrNull(ALIAS))) await refuseIfGuardExists(hre, timelockAddress, curatorSafe, forkLike);
   const result = await deployments.deploy(ALIAS, {
     contract: CONTRACT,
     from: deployer,
@@ -415,6 +478,56 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
   }
 };
 
+/// A guard of this build with `timelock` as its admin is already installed on the curator Safe, or is the target of an
+/// operation this timelock has scheduled: a deploy without its record would mint a second one (review G22c-4).
+async function refuseIfGuardExists(
+  hre: HardhatRuntimeEnvironment,
+  timelock: string,
+  curatorSafe: string,
+  forkLike: boolean,
+): Promise<void> {
+  const { ethers } = hre;
+  const artifact = await hre.artifacts.readArtifact(CONTRACT);
+  const expected = stripMetadata(artifact.deployedBytecode);
+  const isOurs = async (candidate: string): Promise<boolean> => {
+    if (!/^0x[0-9a-fA-F]{40}$/.test(candidate) || candidate === ZERO) return false;
+    if (stripMetadata(await ethers.provider.getCode(candidate)) !== expected) return false;
+    try {
+      const admin: string = await (await ethers.getContractAt(CONTRACT, candidate)).defaultAdmin();
+      return admin.toLowerCase() === timelock.toLowerCase();
+    } catch {
+      return false;
+    }
+  };
+  const found = new Set<string>();
+  const safe = await hre.ethers.getContractAt("ISafe", curatorSafe);
+  try {
+    const raw: string = await safe.getStorageAt(
+      "0x4a204f620c8c5ccdca3fd54d003badd85ba500436a431f0cbda4f558c93c34c8",
+      1,
+    );
+    const slot = ethers.getAddress("0x" + raw.slice(-40));
+    if (await isOurs(slot)) found.add(slot);
+  } catch {
+    /* not a Safe that answers getStorageAt: nothing installed to read */
+  }
+  const from = await creationBlock(hre, timelock);
+  if (from !== undefined) {
+    const tl = (await ethers.getContractAt(TIMELOCK_CONTRACT, timelock)) as unknown as Contract;
+    const targets = new Set<string>();
+    for (const l of await scanLogs(hre, tl, tl.filters.CallScheduled(), from))
+      targets.add(String((l as EventLog).args.target));
+    for (const t of targets) if (await isOurs(t)) found.add(ethers.getAddress(t));
+  }
+  if (!found.size) return;
+  const msg =
+    `${ALIAS} has no deployment record here, but ${[...found].join(", ")} is this build with ${timelock} as its admin ` +
+    `(installed on the curator Safe, or the target of a scheduled operation): a deploy now would mint a second guard and ` +
+    `repoint the record; restore deployments/<network>/${ALIAS}.json from the chain and commit it (CURATOR_GUARD_ALIAS=... for a replacement guard)`;
+  if (forkLike) console.log(chalk.yellow(`WARNING: ${msg}`));
+  else throw Error(msg);
+}
+
 /// Rebuilds the timelock's role set from its own `RoleGranted` / `RoleRevoked` logs (roles are not
 /// enumerable) and compares it with the expected topology: admin = the timelock only, executor = anyone
 /// only, proposers and cancellers exactly as configured, the council nowhere; and the queue empty.
@@ -466,10 +579,12 @@ async function auditTimelock(
         else problems.push(`${name}: missing holder ${m}`);
       }
     }
+    // One CallScheduled log per CALL of an operation: counted by log, a single 40-call sync read as "40 operation(s)"
+    // (review G22c-2). Count operation ids.
+    const ids = new Set<string>();
+    for (const l of await scanLogs(hre, tl, tl.filters.CallScheduled(), from)) ids.add(String((l as EventLog).args.id));
     let pending = 0;
-    for (const l of await scanLogs(hre, tl, tl.filters.CallScheduled(), from)) {
-      if (await tl.isOperationPending((l as EventLog).args.id)) ++pending;
-    }
+    for (const id of ids) if (await tl.isOperationPending(id)) ++pending;
     if (pending)
       problems.push(
         `${pending} operation(s) are pending in the queue (any target); review and cancel them before a guard goes behind this timelock`,
@@ -492,7 +607,15 @@ async function auditTimelock(
 
 async function creationBlock(hre: HardhatRuntimeEnvironment, address: string): Promise<number | undefined> {
   const explicit = process.env.CURATOR_GUARD_TIMELOCK_BLOCK;
-  if (explicit) return Number(explicit);
+  if (explicit) {
+    // Validated as the sync task does: `Number("abc")` is NaN, every scan is then empty and the audit
+    // reports every expected holder as "held without a log" (review G11e-3).
+    if (!/^\d+$/.test(explicit)) throw Error(`CURATOR_GUARD_TIMELOCK_BLOCK must be a block number, got ${explicit}`);
+    const head = await hre.ethers.provider.getBlockNumber();
+    if (Number(explicit) > head)
+      throw Error(`CURATOR_GUARD_TIMELOCK_BLOCK ${explicit} is after the chain head ${head}`);
+    return Number(explicit);
+  }
   const d = Object.values(await hre.deployments.all()).find((x) => x.address.toLowerCase() === address.toLowerCase());
   if (d?.receipt?.blockNumber !== undefined) return Number(d.receipt.blockNumber);
   return undefined;

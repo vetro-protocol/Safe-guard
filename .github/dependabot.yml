@@ -1,0 +1,24 @@
+# Dependabot security updates are enabled for this repository. Nothing in this file may touch the
+# Solidity dependency of the deployed contracts: a bump of @openzeppelin/contracts can recompile
+# CuratorGuard and CuratorGuardTimelock to other bytecode than the reviewed build (5.4.0 leaves the guard
+# byte-identical and moves the timelock by one byte, 5.7.0 moves both: review G21e; review G12a-1;
+# test/guards/G12a_BuildPin.t.sol pins both). Bump it by hand, with a review of the diff and a re-pin.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    ignore:
+      - dependency-name: "@openzeppelin/contracts"
+      # The tooling is written for hardhat 2 / hardhat-deploy 1 (the hardhat 3 bump of 2026-10-08 breaks
+      # every task and the deploy script: tsc fails on main).
+      - dependency-name: "hardhat"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "hardhat-deploy"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@nomicfoundation/hardhat-toolbox"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@nomicfoundation/hardhat-network-helpers"
+        update-types: ["version-update:semver-major"]
