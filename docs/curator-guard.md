@@ -273,8 +273,12 @@ the moment the call lands (admin ≤ 180 days, council ≤ 7 days; a relative TT
 proposal never reverts for being executed early or late), and void en bloc after
 `revokeAllApprovals(safe)` or whenever a `Bypass` window opens (a per-Safe epoch is part of the
 approval id; `approvalExpiry` reports `0` for records from an older epoch). Re-approving a payload
-overwrites its expiry; it never grants a second execution. Approvals outlive admin transfers (they are
-keyed by Safe and epoch, not by who issued them) and a decommissioned guard keeps its unexpired ones,
+overwrites its expiry and makes the record the caller's; it never grants a second execution. An approval
+dies with its issuer's role: once the account that issued it loses `COUNCIL_ROLE` or `DEFAULT_ADMIN_ROLE`
+(`revokeRole`, `renounceRole`, the outgoing admin at `acceptDefaultAdminTransfer`) the hooks treat it as
+absent (an allowlisted payload then runs on the policy lane, as after an expiry), `approvalExpiry` reports
+`0`, and a re-grant does not revive it (Quantstamp GUARD-1); a live issuer approves the payload again. A
+decommissioned guard keeps the unexpired approvals of issuers that have not lost their role on it,
 so `revokeAllApprovals` on decommission (§7.5). What an approval may address is checked when it is
 issued (`InvalidTarget`): never the guard itself, never the zero address (an approved value to it would be a
 burn, review G17a-3), never an account without code when calldata is sent
@@ -348,7 +352,8 @@ Evaluation order in `checkTransaction` / `checkModuleTransaction` (the tests pin
    any ERC-20 or ETH through the refund path without any call to the token. Approvals do not bypass
    this check.
 7. Unconsumed, unexpired approval for `(safe, epoch, executor, to, value, keccak(data), operation,
-   code hash of `to` for a delegatecall)` → no approval is spent while the Safe's fallback handler
+   code hash of `to` for a delegatecall)`, issued by an account that has not lost its admin or council
+   role since → no approval is spent while the Safe's fallback handler
    is this guard (`ForwardedHookCall`: `FallbackManager` forwards every selector a Safe does not
    implement to its handler, for ANY caller, with the Safe as `msg.sender`, so with the guard in that
    slot a stranger could call `safe.checkTransaction(<approved payload>)` and burn the approval; the
@@ -662,8 +667,8 @@ Residual (document, monitor, mitigate outside the guard):
   of §4 lands): guardians are a control against a
   mistaken council, not a malicious one. Pick its signers accordingly. Its removal batch is
   `[revokeRole(old), grantRole(new), lockdownAndRevoke(safe)]` per Safe and never a lift: what a
-  council did in its last hour (a 7-day window it opened, 7-day approvals, a guardian it planted)
-  outlives the role, and the new council, which the cooldown does not hold back, clears it at once.
+  council did in its last hour (a 7-day window it opened, a guardian it planted)
+  outlives the role (its approvals do not: they are void from the revoke, §4), and the new council, which the cooldown does not hold back, clears it at once.
   What it NARROWED in that hour (`revokeTarget`, `revokeFunction`, `clearAllowedValues`, an unwrapper
   it de-registered) outlives the role too and the new council cannot restore it: only the timelock
   widens those (a forbidden canonical hash is the one narrowing the new council undoes itself,
@@ -956,7 +961,7 @@ Residual (document, monitor, mitigate outside the guard):
   `gasUsed.sub(gasleft())`, which reverts with no data when that call nets such a refill; nothing the guard does
   before that window allocates storage, so only a bundled transaction (an outer frame allocates, the Safe
   transaction clears) can hit it. EIP-7954 raises the EIP-170 limit to 64 KiB (the 96 % gate stays as a margin on
-  the old limit) and a replacement guard's deployment then costs about 36 M state gas (23,267 bytes at 1,530
+  the old limit) and a replacement guard's deployment then costs about 36 M state gas (23,509 bytes at 1,530
   each). Before the mainnet activation: re-run the unit suites under `amsterdam` on a forge that models it (31 of
   the tests pin Osaka numbers or subtract gas across clears and fail there by design) and re-measure §7.2.
 - **Safe builds.** The supported set is fixed at deployment: the proxies the v1.3.0 / v1.4.1 /
@@ -1271,7 +1276,7 @@ of step 0 does not stop it; review G11a-1), or after install.
   and compare the chain with `helpers/address.ts` on that machine: a tampered address book or operator
   audits itself as "expected". The install signers therefore read, from their own node, before signing
   the batch of §7.4: `keccak256(eth_getCode(guard))` and `keccak256(eth_getCode(guard.defaultAdmin()))`
-  with their CBOR tails stripped equal the reviewed build (`test/guards/G12a_BuildPin.t.sol`, 23,267 and
+  with their CBOR tails stripped equal the reviewed build (`test/guards/G12a_BuildPin.t.sol`, 23,509 and
   8,204 bytes); `guard.defaultAdmin()` is the timelock named in this runbook and in the policy file's
   `$comment`, `guard.defaultAdminDelay()` is 3 days and `guard.pendingDefaultAdmin()` empty;
   `timelock.getMinDelay()` is 48 h; `timelock.hasRole(PROPOSER_ROLE, p)` for exactly the proposer Safes
@@ -1578,8 +1583,18 @@ points at another guard. If the guard was installed before the policy sync execu
   the new admin is a timelock; the predicate is re-checked at acceptance) within 30 days of the
   schedule (`DeadlinePassed` afterwards: begin again); `cancelDefaultAdminTransfer` aborts a pending
   hand-over. A council can hold the acceptance back for as long as it holds the role (§4): evict it in
-  one batch and accept inside the 30 days, or begin again. Roles, policies and live approvals survive the hand-over; the proposers and cancellers of
-  the old timelock do not carry over. A successor timelock brings its QUEUE with it: an operation
+  one batch and accept inside the 30 days, or begin again. Roles and policies survive the hand-over; the proposers and cancellers of
+  the old timelock do not carry over, and neither do the outgoing admin's approvals: every approval it issued
+  (pre-staged `pause()` payloads, an approved `setGuard(newGuard)`) is void from the acceptance block (a block anyone picks once the
+  successor's acceptance operation is Ready: the successor timelock's executor is open) and a
+  hand-back does not revive it (§4, Quantstamp GUARD-1). Before the begin, record each Safe's standing approvals
+  (`curator-guard-sync --dry-run` lists them without their issuer; the admin's are those whose latest
+  `TransactionApproved` log carries the timelock as issuer, `topics[3]`: a re-approval takes a record over)
+  and finish any guard swap. After the acceptance the successor schedules `approveTransaction` again for each one
+  it still wants; they are live one successor `minDelay` later (up to a day more for a Safe locked in the meantime,
+  `LockdownCooldown`). Until then the council's approvals (at once, 7 days) cover what a council may approve, a
+  single `pause()` included, so keep a council seated across the acceptance; the admin-only payloads (`setGuard`,
+  `setModuleGuard`, `enableModule`, a non-zero handler, batches) have no issuer in that interval. A successor timelock brings its QUEUE with it: an operation
   scheduled on it before it is the admin matures with no power and becomes executable by anyone in
   the block of the acceptance (an `approveTransaction(setGuard(0))` scheduled months earlier removes
   the guard with no delay anyone could use). Prefer a FRESH `CuratorGuardTimelock` as successor (the deploy
@@ -1795,8 +1810,9 @@ both hooks (owner path: `txHash` is the `safeTxHash`, so it joins directly with 
 hash `keccak256(abi.encode(safe, module, to, value, keccak256(data), operation))`), `outcome`
 `Policy` / `Approval` / `Bypass`. `safe`, `txHash` and `outcome` are topics (`topics = [sig, safe, null, 2]`
 filters every `Bypass` report server-side; `ModeUpdated` likewise carries `mode` as a topic), `path`
-is the data word. No guard event names its caller: `ModeUpdated`, `GuardianUpdated`, `FunctionRevoked`,
-`ApprovalsRevoked` and `TransactionApproved` read the same whether a guardian bot, the council or the
+is the data word. No guard event but `TransactionApproved` names its caller (it carries its issuer as its third
+indexed argument, `topics[3]`, which for an admin approval is the timelock): `ModeUpdated`, `GuardianUpdated`, `FunctionRevoked`
+and `ApprovalsRevoked` read the same whether a guardian bot, the council or the
 admin acted, and the receipt tells them apart (the timelock's `CallExecuted` for the admin, a
 governance Safe's `ExecutionSuccess` for the council, the veto or a proposer, else `tx.from`), so key
 every "who did it" alert on receipts, never on `eth_getLogs` alone (review G12d-2). Log adjacency: on the owner path the report is the log immediately AFTER the
@@ -1826,7 +1842,7 @@ and `lockdownAndRevoke`; the admin's cooldown ends one day after the block times
 `ModeUpdated(safe, Lockdown)`, whatever mode logs follow),
 `RequiredFallbackHandlerUpdated` (emitted on every call, a repeated identical requirement included),
 `TransactionApproved` (carries the full calldata, the absolute
-expiry and the epoch), `ApprovalConsumed`, `ApprovalRevoked` (it may name a record that was already
+expiry, the epoch and, as `topics[3]`, the issuer), `ApprovalConsumed`, `ApprovalRevoked` (it may name a record that was already
 void or expired: the live set is what `approvalExpiry` reports), `ApprovalsRevoked` (also emitted by
 every `bypass` and by `lockdownAndRevoke`), `MultiSendUnwrapperUpdated` and `ModuleUpdated` (emitted
 only when the set changed), `UnwrapperCodehashUpdated` (only ever for one of the three seeded hashes, and on every call, a repeated state included;
@@ -2544,8 +2560,8 @@ is kept as an alias; CI pins a pristine fork block through `.github/actions/fork
 `forge test` in `.github/workflows/ci.yml`):
 
 - `G12a_BuildPin.t.sol`: the runtime bytecode of `CuratorGuard`, `CuratorGuardTimelock` and the
-  `SettlementDeadline` helper, metadata stripped, is pinned to the reviewed build (23,267, 8,204 and 177 bytes;
-  keccak `3bfe33c8…`, `8a69e72c…`, `15af8250…`; the deploy script carries the same two guard and timelock
+  `SettlementDeadline` helper, metadata stripped, is pinned to the reviewed build (23,509, 8,204 and 177 bytes;
+  keccak `305bfa47…`, `8a69e72c…`, `15af8250…`; the deploy script carries the same two guard and timelock
   pins and refuses to send an artifact that does not hash to them, review G18g-2; the helper's pin is the build the sync compares a
   deadline entry's target against, §5, review G16c-1). CI's toolchain-parity step compares
   hardhat with foundry, never with the reviewed build, and the deploy script deploys whatever the local
@@ -3439,7 +3455,7 @@ accepted finding was fixed with a regression test; the suite went from 178 to 19
 | V2-11 | Low | Handing the admin role to a Safe that carries a policy (a paste error away) would make it exempt from everything, including `setGuard(0)`. | `_beginDefaultAdminTransfer` refuses an address with a policy, guardians or a handler requirement (`AdminIsGuarded`). Test: `test_guarded_safe_cannot_become_admin_but_an_unconfigured_safe_can`. |
 | V2-12 | Info | Nested same-Safe execution after a mid-transaction flip into `Bypass` consumed the outer digest early (the Bypass return preceded the nesting check). | Nesting check moved ahead of the Bypass return. Test: `test_nested_execution_after_a_mid_transaction_bypass_flip_is_rejected`. |
 | V2-13 | Info | `setModuleAllowed` accepted the Safe or the guard as a module; `--allow-unlock` would be typed by habit (every runbook command needed it); revocations were silent raw selectors; IMPROVEMENTS_V2.md listed `disableModule` in the council denylist (code denies four selectors: disabling a module is a narrowing); `bypassUntil` NatSpec disagreed with its behaviour after expiry. | `_checkTarget` on modules; `--allow-unlock` only for an already configured Safe; `--confirm-revocations` required when the diff narrows; plan corrected; `bypassWindow(safe)` returns the window end and who opened it. |
-| V2-14 | Info (documented) | An approval matching an allowlisted payload captures it (so `safeTxGas != 0` is refused where the policy alone would tolerate it); approvals outlive admin transfers; re-installing a decommissioned guard revives its unexpired approvals; the admin exemption is dormant with a timelock admin but an admin Safe handing over inside its own transaction hits `MissingSnapshot`; v1.5.0 bubbles the inner revert reason where v1.4.1 says GS013. | Documented in §4 / §7; tests `test_approval_matching_an_allowlisted_payload_captures_it`, `test_approved_guard_removal_still_gets_its_post_hook_and_leaves_no_state`, `test_gas_refund_is_rejected_even_with_a_live_approval`. |
+| V2-14 | Info (documented) | An approval matching an allowlisted payload captures it (so `safeTxGas != 0` is refused where the policy alone would tolerate it); approvals outlive admin transfers; re-installing a decommissioned guard revives its unexpired approvals (since Quantstamp GUARD-1 both hold only for an issuer that has not lost its role, so never for the outgoing admin's approvals across a transfer: an approval dies with its issuer's role, §4); the admin exemption is dormant with a timelock admin but an admin Safe handing over inside its own transaction hits `MissingSnapshot`; v1.5.0 bubbles the inner revert reason where v1.4.1 says GS013. | Documented in §4 / §7; tests `test_approval_matching_an_allowlisted_payload_captures_it`, `test_approved_guard_removal_still_gets_its_post_hook_and_leaves_no_state`, `test_gas_refund_is_rejected_even_with_a_live_approval`. |
 
 Verified sound by the round (with evidence in the reports): no non-admin widening path (every mutator
 enumerated, invariants); the council denylist is complete for Safe v1.4.1 / v1.5.0 self-calls that

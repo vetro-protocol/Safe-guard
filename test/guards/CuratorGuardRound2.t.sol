@@ -663,6 +663,7 @@ contract CuratorGuardRound2Test is CuratorGuardTestBase {
         emit CuratorGuardPolicy.TransactionApproved(
             address(safe),
             _id,
+            vetro,
             address(0),
             address(protocol),
             0,

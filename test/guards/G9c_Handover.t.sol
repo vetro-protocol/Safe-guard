@@ -3,6 +3,7 @@ pragma solidity 0.8.25;
 
 import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 
+import {CuratorGuard} from "contracts/guards/CuratorGuard.sol";
 import {CuratorGuardPolicy} from "contracts/guards/CuratorGuardPolicy.sol";
 import {CuratorGuardTimelock} from "contracts/guards/CuratorGuardTimelock.sol";
 import {ISafe} from "contracts/interfaces/safe/ISafe.sol";
@@ -35,13 +36,16 @@ contract G9c_HandoverTest is G9cBase {
     }
 
     /// @dev The successor at the SLOWEST delay the contract allows (30 days): the acceptance still
-    ///      lands inside the 30-day window after the schedule, roles / policies / approvals survive, the
-    ///      old queue is powerless and the new one widens (docs section 7.5).
+    ///      lands inside the 30-day window after the schedule, roles and policies survive, A's standing
+    ///      approval is void at the acceptance and B re-issues it after the acceptance, one successor delay
+    ///      later, under the same id (Quantstamp GUARD-1), the old queue is powerless and the new one
+    ///      widens (docs section 7.5).
     function test_timelock_to_timelock_handover_end_to_end_at_the_slowest_successor_delay() public {
         tlB = _newTimelock(30 days);
         bytes memory _pause = abi.encodeCall(MockProtocol.wrap, ());
         _adminCall(abi.encodeCall(g.approveTransaction, (address(curatorSafe), address(0), address(protocol), 0, _pause, Operation.Call, uint64(180 days))), "approve");
         uint48 _sched = _begin("begin");
+        bytes32 _pauseId = g.computeApprovalId(address(curatorSafe), address(0), address(protocol), 0, _pause, Operation.Call);
         bytes32 _id = _scheduleOn(tlB, p1, p1Pk, address(g), acceptData, NONE, "accept");
         vm.warp(block.timestamp + 30 days);
         assertTrue(tlB.isOperationReady(_id));
@@ -51,7 +55,19 @@ contract G9c_HandoverTest is G9cBase {
         assertFalse(g.hasRole(g.DEFAULT_ADMIN_ROLE(), address(tl)), "A is not");
         assertTrue(g.hasRole(g.COUNCIL_ROLE(), council), "council survives");
         assertTrue(_settle(), "policy intact");
-        assertTrue(_exec(curatorSafe, curatorPk, address(protocol), 0, _pause, Operation.Call), "A's approval still consumable");
+        assertEq(g.approvalExpiry(_pauseId), 0, "A's approval is void at the acceptance");
+        vm.expectRevert(abi.encodeWithSelector(CuratorGuard.FunctionNotAllowed.selector, address(protocol), MockProtocol.wrap.selector));
+        _exec(curatorSafe, curatorPk, address(protocol), 0, _pause, Operation.Call);
+        // docs section 7.5: the successor schedules the approval again AFTER the acceptance; live one `minDelay` later
+        bytes memory _reissue = _wrap(
+            uint64(block.timestamp + 30 days + 1 days),
+            abi.encodeCall(g.approveTransaction, (address(curatorSafe), address(0), address(protocol), 0, _pause, Operation.Call, uint64(180 days)))
+        );
+        _scheduleOn(tlB, p1, p1Pk, address(g), _reissue, NONE, "re-approve");
+        vm.warp(block.timestamp + 30 days);
+        _executeOn(tlB, address(g), _reissue, NONE, "re-approve");
+        assertGt(g.approvalExpiry(_pauseId), 0, "B's re-issue, same id");
+        assertTrue(_exec(curatorSafe, curatorPk, address(protocol), 0, _pause, Operation.Call), "B's approval consumable");
         bytes memory _widen = abi.encodeCall(g.allowFunction, (address(curatorSafe), address(protocol), MockProtocol.deposit.selector, false, _noRules()));
         _schedule(p1, p1Pk, address(g), _widen, NONE, "stale");
         vm.warp(block.timestamp + MIN_DELAY);

@@ -327,10 +327,11 @@ contract CuratorGuardV2Test is CuratorGuardTestBase {
         guard.revokeAllApprovals(address(safe));
         bytes32 _id = guard.computeApprovalId(address(safe), address(0), address(protocol), 0, _data, Operation.Call);
         vm.prank(council);
-        vm.expectEmit(true, true, false, true, address(guard));
+        vm.expectEmit(true, true, true, true, address(guard));
         emit CuratorGuardPolicy.TransactionApproved(
             address(safe),
             _id,
+            council,
             address(0),
             address(protocol),
             0,

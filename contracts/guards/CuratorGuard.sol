@@ -50,10 +50,11 @@ import {CuratorGuardPolicy} from "./CuratorGuardPolicy.sol";
 ///          5. Gas refunds are rejected (`gasPrice != 0`): `handlePayment` can otherwise pay out
 ///             the Safe's ERC-20 / native balance to an arbitrary `refundReceiver`.
 ///          6. An unconsumed, unexpired approval for the exact payload AND execution path
-///             (owner-signed, or a specific module; for a delegatecall also the code at the target)
-///             passes, is consumed, and skips the policy. An approved delegatecall into canonical
-///             `MultiSendCallOnly` code is strictly decoded first (canonical encoding, plain-call
-///             entries, none addressed to this guard), and no approval is spent while the Safe's
+///             (owner-signed, or a specific module; for a delegatecall also the code at the target),
+///             issued by an account that has not lost the admin or council role it issued with since
+///             (a re-grant revives nothing), passes, is consumed, and skips the policy. An approved
+///             delegatecall into canonical `MultiSendCallOnly` code is strictly decoded first (canonical
+///             encoding, plain-call entries, none addressed to this guard), and no approval is spent while the Safe's
 ///             fallback handler is this guard (`ForwardedHookCall`: the Safe would forward anyone's
 ///             call here with itself as the caller). A failing approved execution reverts the whole
 ///             Safe transaction, whatever `safeTxGas` says (the Safe's own rule when it is zero, the
@@ -384,8 +385,7 @@ contract CuratorGuard is CuratorGuardPolicy, ISafeTransactionGuard, ISafeModuleG
         }
         if (c_.gasPrice != 0) revert GasRefundNotAllowed();
         bytes32 _approvalId = computeApprovalId(msg.sender, c_.executor, c_.to, c_.value, data_, c_.operation);
-        uint64 _expiry = _approvals[_approvalId].expiry;
-        if (_expiry != 0 && block.timestamp <= _expiry) {
+        if (_approvalUsable(_approvalId)) {
             _checkApprovalUse(msg.sender, c_.to, data_, c_.operation);
             delete _approvals[_approvalId];
             _tstore(_key, APPROVED_SENTINEL);
@@ -481,8 +481,7 @@ contract CuratorGuard is CuratorGuardPolicy, ISafeTransactionGuard, ISafeModuleG
         _checkModule($, path_, executor_);
         Mode _mode = _effectiveMode($);
         if (_mode == Mode.Bypass && _checkWindow($, safe_, path_, to_, data_, operation_, 0)) return;
-        uint64 _expiry = _approvals[computeApprovalId(safe_, executor_, to_, value_, data_, operation_)].expiry;
-        if (_expiry != 0 && block.timestamp <= _expiry) {
+        if (_approvalUsable(computeApprovalId(safe_, executor_, to_, value_, data_, operation_))) {
             _checkApprovalUse(safe_, to_, data_, operation_);
             return;
         }

@@ -29,12 +29,12 @@ const ADMIN_DELAY = secondsFromEnv("CURATOR_GUARD_ADMIN_DELAY", 3n * 24n * 3600n
 const EXISTING_TIMELOCK = process.env.CURATOR_GUARD_TIMELOCK;
 const ZERO = "0x0000000000000000000000000000000000000000";
 // The reviewed runtimes, metadata stripped, as `test/guards/G12a_BuildPin.t.sol` pins them (keccak256 of the runtime
-// without its CBOR tail; 23,267 and 8,204 bytes: the masked handler-word rails of review G16d-1 and the guard's zero-target approval rail of review G17a-3). The deploy sends whatever the local `node_modules` and solc compiled
+// without its CBOR tail; 23,509 and 8,204 bytes: the masked handler-word rails of review G16d-1, the guard's zero-target approval rail of review G17a-3 and the issuer binding of approvals, Quantstamp GUARD-1). The deploy sends whatever the local `node_modules` and solc compiled
 // to, and CI's parity step compares hardhat with foundry, never with the pin: this is the one step that must send the
 // reviewed bytes, so it checks them itself (review G18g-2). A re-pin is a contract change with a review: move these
 // two values together with the test's.
 const REVIEWED_RUNTIME_KECCAK: Record<string, string> = {
-  [CONTRACT]: "0x3bfe33c8e8c7a8e4edbe454efb7efaef22182ba362b8b824ccc0610c763bea8d",
+  [CONTRACT]: "0x305bfa47b4f7d3d954d5ff0030e3f30ebd05fe7af0e54e2987e3666568835a3d",
   [TIMELOCK_CONTRACT]: "0x8a69e72c4ff2fbc0189b1ff3f6a7e74c239bcc3c3394a3fe158e952a02da786c",
 };
 // Mirrors `CuratorGuardTimelock.MIN_DELAY_FLOOR / MIN_DELAY_CAP` and `CuratorGuardPolicy.MAX_ADMIN_DELAY`

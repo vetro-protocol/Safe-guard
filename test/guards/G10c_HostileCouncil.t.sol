@@ -11,10 +11,10 @@ import {G10cBase} from "test/guards/G10c_Base.sol";
 
 /// @dev g10c, finding G10c-3 (a council's last-hour NARROWING outlives the rotation) and G10c-6 (the
 ///      per-Safe guardian cap as a council lever; a last-second plant on a pending admin). Docs section 6
-///      lists what a council leaves behind (a window, approvals, a planted guardian) and says the new
-///      council clears it at once. A revocation is not on that list and the new council cannot undo it:
-///      only the timelock widens, so the freeze lasts one more `minDelay` unless the full policy
-///      re-assertion is chained behind the rotation in the same cycle.
+///      lists what a council leaves behind (a window, a planted guardian; its approvals are void from the
+///      revoke) and says the new council clears it at once. A revocation is not on that list and the new
+///      council cannot undo it: only the timelock widens, so the freeze lasts one more `minDelay` unless
+///      the full policy re-assertion is chained behind the rotation in the same cycle.
 contract G10c_HostileCouncilTest is G10cBase {
     address internal newCouncil = makeAddr("new-council");
 

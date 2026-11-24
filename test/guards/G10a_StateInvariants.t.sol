@@ -17,7 +17,8 @@ import {G10aHarness} from "test/guards/G10aBase.sol";
 ///      verdict (mode changes, windows, approvals, the cooldown, the admin hand-over, the hooks) from a
 ///      model written from docs section 4 and compares the model's state with the guard's views after
 ///      every call. Model: raw mode, window end and owner, `lockedAt`, approval epoch, three approval
-///      records, two allowlist bits, the admin and the pending admin. Universe: three payloads
+///      records with their issuer, the revocation count of each account that can issue (Quantstamp GUARD-1),
+///      two allowlist bits, the admin and the pending admin. Universe: three payloads
 ///      (`settleDeposit(1)` on a venue, `transfer(stranger, 1)` on the token, the empty call to a third
 ///      venue), the admin (which hands over to one of two successors and back), the council, a per-Safe
 ///      guardian, a stranger, the curator and time.
@@ -51,6 +52,10 @@ contract G10aModelHandler {
     address public mAdmin;
     address public mPending;
     uint48 public mSchedule;
+    // ---- Quantstamp GUARD-1: revocation count per account, issuer and count at issue per record ----
+    mapping(address => uint256) public mRev;
+    address[3] public mIssuer;
+    uint256[3] public mIssuerGen;
 
     // ---- ghosts ----
     bool public verdictMismatch;
@@ -110,9 +115,15 @@ contract G10aModelHandler {
         return mExpiry[p_] != 0 && mEpochAt[p_] == mEpoch;
     }
 
-    /// @dev What the hooks spend: recorded and not past its expiry second.
+    /// @dev The issuer of record `p_` has not lost the role it issued with since (GUARD-1). In this handler
+    ///      only the admin ever loses a role (the hand-over); the council seat is never revoked.
+    function _issuerLive(uint256 p_) internal view returns (bool) {
+        return mRev[mIssuer[p_]] == mIssuerGen[p_];
+    }
+
+    /// @dev What the hooks spend: recorded, not past its expiry second, issuer still standing.
     function _live(uint256 p_) internal view returns (bool) {
-        return _recorded(p_) && block.timestamp <= mExpiry[p_];
+        return _recorded(p_) && block.timestamp <= mExpiry[p_] && _issuerLive(p_);
     }
 
     function _toLockdown() internal {
@@ -135,9 +146,10 @@ contract G10aModelHandler {
         ++mEpoch;
     }
 
-    /// @dev Expected live expiry as `approvalExpiry` reports it (0 when voided by an epoch bump).
+    /// @dev Expected live expiry as `approvalExpiry` reports it (0 when voided by an epoch bump or by its
+    ///      issuer's loss of the role, GUARD-1).
     function expectedExpiry(uint256 p_) external view returns (uint64) {
-        return _recorded(p_) ? mExpiry[p_] : 0;
+        return _recorded(p_) && _issuerLive(p_) ? mExpiry[p_] : 0;
     }
 
     function payload(uint256 p_) public view returns (address _to, bytes memory _data) {
@@ -227,6 +239,8 @@ contract G10aModelHandler {
         if (_ok) {
             mExpiry[_p] = uint64(block.timestamp) + _ttl;
             mEpochAt[_p] = mEpoch;
+            mIssuer[_p] = mAdmin;
+            mIssuerGen[_p] = mRev[mAdmin];
         }
     }
 
@@ -282,6 +296,7 @@ contract G10aModelHandler {
         bool _ok = _as(mPending, abi.encodeCall(guard.acceptDefaultAdminTransfer, ()));
         _check(_ok, _expected, "successor_accepts");
         if (_ok) {
+            ++mRev[mAdmin]; // the acceptance revokes the OUTGOING admin: its approvals are void for good
             mAdmin = mPending;
             mPending = address(0);
             mSchedule = 0;
@@ -333,6 +348,8 @@ contract G10aModelHandler {
         if (_ok) {
             mExpiry[_p] = uint64(block.timestamp) + _ttl;
             mEpochAt[_p] = mEpoch;
+            mIssuer[_p] = council;
+            mIssuerGen[_p] = mRev[council];
         }
     }
 
@@ -512,7 +529,8 @@ contract G10aStateInvariantsTest is CuratorGuardTestBase {
     }
 
     /// @dev The guard's state IS the model's state: raw mode, window end and owner, `lockedAt`, epoch,
-    ///      effective mode, the three approval records, the admin and the pending admin.
+    ///      effective mode, the three approval records, the admin and the pending admin, and the raw
+    ///      revocation count (slot 9) of every account that can issue.
     function invariant_g10a_the_guard_state_is_the_model_state() public view {
         address _safe = address(safe);
         assertEq(uint8(h.rawMode(_safe)), uint8(handler.mRaw()), "raw mode");
@@ -527,6 +545,10 @@ contract G10aStateInvariantsTest is CuratorGuardTestBase {
         (address _pending, uint48 _schedule) = h.pendingDefaultAdmin();
         assertEq(_pending, handler.mPending(), "pending admin");
         assertEq(_schedule, handler.mSchedule(), "pending schedule");
+        address[4] memory _accounts = [vetro, s1, s2, council];
+        for (uint256 i; i < 4; ++i) {
+            assertEq(uint256(vm.load(address(h), keccak256(abi.encode(_accounts[i], uint256(9))))), handler.mRev(_accounts[i]), "revocation count");
+        }
     }
 
     /// @dev Structural invariants of the mode record (docs section 4): a window end is set exactly in
@@ -555,7 +577,8 @@ contract G10aStateInvariantsTest is CuratorGuardTestBase {
         assertFalse(handler.reportMismatch(), "TransactionChecked missing, duplicated or wrong");
     }
 
-    /// @dev Liveness anchor: the model drives every branch at least once, deterministically.
+    /// @dev Liveness anchor: the model drives every branch at least once, deterministically, the record voided
+    ///      by its issuer's hand-over included (GUARD-1: the campaigns reach it too rarely to count on).
     function test_g10a_model_handler_is_live() public {
         handler.admin_allowSettle();
         handler.admin_enforce();
@@ -573,10 +596,17 @@ contract G10aStateInvariantsTest is CuratorGuardTestBase {
         handler.admin_bypass(0); // refused: one second under the floor
         handler.admin_bypass(1); // the floor
         handler.admin_enforce();
+        handler.admin_approve(49); // payload 1 again, by the admin that is about to hand over
+        assertGt(handler.expectedExpiry(1), 0, "the outgoing admin's approval is live before the hand-over");
         handler.admin_begin(0);
         handler.successor_accepts(); // refused: same second as the schedule
         handler.time_passes(0);
         handler.successor_accepts(); // s1 is the admin now
+        // GUARD-1: the record is still stored, unexpired and of the current epoch, and void for its issuer's loss
+        assertGt(handler.mExpiry(1), block.timestamp, "the record is unexpired");
+        assertEq(handler.expectedExpiry(1), 0, "the model voids the outgoing admin's record");
+        invariant_g10a_the_guard_state_is_the_model_state(); // the view agrees
+        handler.curator_exec(1); // refused: the void record is not spent, transfer is never allowlisted
         handler.admin_lockdownAndRevoke(); // as s1
         handler.admin_begin(0); // refused: s1 is the admin
         handler.admin_begin(1);
@@ -584,12 +614,12 @@ contract G10aStateInvariantsTest is CuratorGuardTestBase {
         handler.successor_accepts(); // s2
         handler.stranger_tries(0);
         assertFalse(handler.verdictMismatch(), string(abi.encodePacked("verdict mismatch: ", handler.lastTag())));
-        assertEq(handler.execs(), 4);
+        assertEq(handler.execs(), 5);
         assertEq(handler.passedBy(0) + handler.passedBy(1) + handler.passedBy(2), 3, "three outcomes seen");
         assertEq(handler.passedBy(0), 1);
         assertEq(handler.passedBy(1), 1);
         assertEq(handler.passedBy(2), 1);
-        assertEq(handler.refused(), 1);
+        assertEq(handler.refused(), 2);
         assertEq(handler.handovers(), 2);
         assertEq(h.defaultAdmin(), s2);
         assertFalse(handler.reportMismatch());

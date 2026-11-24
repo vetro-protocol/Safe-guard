@@ -175,7 +175,8 @@ contract CuratorGuardG9fMutationTest is CuratorGuardTestBase {
               DOCUMENTED CLAIMS WITHOUT A TEST (docs section 4)
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev "Re-approving a payload overwrites its expiry; it never grants a second execution."
+    /// @dev "Re-approving a payload overwrites its expiry and makes the record the caller's; it never grants a
+    ///      second execution."
     function test_reapproval_overwrites_the_expiry_and_never_grants_a_second_execution() public {
         bytes memory _data = _settle(1);
         bytes32 _id = _approve(address(protocol), 0, _data, Operation.Call);
@@ -190,8 +191,10 @@ contract CuratorGuardG9fMutationTest is CuratorGuardTestBase {
         _execSafeTx(address(protocol), 0, _data, Operation.Call);
     }
 
-    /// @dev "Approvals outlive admin transfers (they are keyed by Safe and epoch, not by who issued them)."
-    function test_approvals_outlive_an_admin_transfer() public {
+    /// @dev The outgoing admin's approvals die with an admin transfer: a record is bound to the account that
+    ///      issued it and is void once that account loses the role it issued with; the new admin re-issues
+    ///      (Quantstamp GUARD-1).
+    function test_approvals_die_with_an_admin_transfer() public {
         bytes memory _data = _settle(2);
         bytes32 _id = _approve(address(protocol), 0, _data, Operation.Call);
         address _next = makeAddr("next-admin");
@@ -201,15 +204,20 @@ contract CuratorGuardG9fMutationTest is CuratorGuardTestBase {
         vm.prank(_next);
         guard.acceptDefaultAdminTransfer();
         assertEq(guard.defaultAdmin(), _next);
-        assertGt(guard.approvalExpiry(_id), 0, "still live under the new admin");
-        assertTrue(_execSafeTx(address(protocol), 0, _data, Operation.Call), "consumed under the new admin");
-        assertEq(protocol.lastAmount(), 2);
+        assertEq(guard.approvalExpiry(_id), 0, "void at the acceptance (GUARD-1)");
+        vm.expectRevert(abi.encodeWithSelector(CuratorGuard.SafeLockedDown.selector, address(safe)));
+        _execSafeTx(address(protocol), 0, _data, Operation.Call);
         vm.prank(vetro);
         vm.expectRevert(CuratorGuardPolicy.Unauthorized.selector);
         guard.approveTransaction(address(safe), address(0), address(protocol), 0, _data, Operation.Call, 1 days);
+        vm.prank(_next);
+        guard.approveTransaction(address(safe), address(0), address(protocol), 0, _data, Operation.Call, 1 days);
+        assertTrue(_execSafeTx(address(protocol), 0, _data, Operation.Call), "the new admin's re-issue is consumed");
+        assertEq(protocol.lastAmount(), 2);
     }
 
-    /// @dev "A decommissioned guard keeps its unexpired ones, so `revokeAllApprovals` on decommission":
+    /// @dev "A decommissioned guard keeps the unexpired approvals of issuers that have not lost their role
+    ///      on it, so `revokeAllApprovals` on decommission":
     ///      an approval issued before an approved `setGuard(0)` is consumable after a re-install.
     function test_a_decommissioned_guard_keeps_its_unexpired_approvals_until_revoked() public {
         bytes memory _data = _settle(3);

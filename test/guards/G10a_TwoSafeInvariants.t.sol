@@ -15,6 +15,10 @@ import {G10aHarness} from "test/guards/G10aBase.sol";
 /// @title Round 10 (g10a): two Safes on ONE guard. Every per-Safe transition names a Safe; the other
 ///        Safe's whole per-Safe record is a ghost that must never move, whoever acts and however the
 ///        hooks run; deployment-wide actions move no per-Safe record either.
+/// @dev One exception since Quantstamp GUARD-1, outside this handler (it never revokes `COUNCIL_ROLE` or hands
+///      the admin over): an account's loss of `COUNCIL_ROLE` / `DEFAULT_ADMIN_ROLE` names no Safe and voids the
+///      approvals that account issued on EVERY Safe, and nothing else of any Safe
+///      (`test_g10a_a_role_loss_voids_the_issuers_approvals_on_both_safes_and_nothing_else`).
 contract G10aTwoSafeHandler {
     Vm internal constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
     bytes32 internal constant DOMAIN_SEPARATOR_TYPEHASH = 0x47e79534a245952e8b16893a336b85a3d9ea9fa8c573f3d803afb92a79469218;
@@ -282,5 +286,33 @@ contract G10aTwoSafeInvariantsTest is CuratorGuardTestBase {
         assertEq(handler.actions(), 40);
         assertFalse(handler.isolationBroken(), string(abi.encodePacked("isolation broken by: ", handler.lastTag())));
         assertFalse(handler.crossReport());
+    }
+
+    /// @dev The one transition that reaches a Safe it does not name (Quantstamp GUARD-1): one
+    ///      `revokeRole(COUNCIL_ROLE, council)` returns each Safe's record to what it was before the council
+    ///      approved anything there; the admin's approvals and everything else stand.
+    function test_g10a_a_role_loss_voids_the_issuers_approvals_on_both_safes_and_nothing_else() public {
+        handler.act(47 << 1); // k = 47 % 20 = 7, r = 1: the admin approves payload 1 on Safe A
+        handler.act((47 << 1) | 1); // and on Safe B
+        bytes32[2] memory _before = [handler.fingerprint(0), handler.fingerprint(1)];
+        handler.act(8 << 1); // the council approves payload 0 on Safe A
+        handler.act((8 << 1) | 1); // and on Safe B
+        assertGt(h.approvalExpiry(_twoSafeId(0, 0)), 0);
+        assertGt(h.approvalExpiry(_twoSafeId(1, 0)), 0);
+        bytes32 _role = h.COUNCIL_ROLE();
+        vm.prank(vetro);
+        h.revokeRole(_role, council);
+        assertEq(h.approvalExpiry(_twoSafeId(0, 0)), 0, "Safe A: the council's approval is void");
+        assertEq(h.approvalExpiry(_twoSafeId(1, 0)), 0, "Safe B: the council's approval is void");
+        assertGt(h.approvalExpiry(_twoSafeId(0, 1)), 0, "Safe A: the admin's approval stands");
+        assertGt(h.approvalExpiry(_twoSafeId(1, 1)), 0, "Safe B: the admin's approval stands");
+        assertEq(handler.fingerprint(0), _before[0], "Safe A: nothing but the council's approval moved");
+        assertEq(handler.fingerprint(1), _before[1], "Safe B: nothing but the council's approval moved");
+        assertFalse(handler.isolationBroken());
+    }
+
+    function _twoSafeId(uint256 i_, uint256 p_) internal view returns (bytes32) {
+        bytes memory _data = p_ == 0 ? abi.encodeCall(MockProtocol.settleDeposit, (1)) : abi.encodeCall(MockProtocol.deposit, (1, address(0xBEEF)));
+        return h.computeApprovalId(handler.safes(i_), address(0), handler.venues(i_), 0, _data, Operation.Call);
     }
 }

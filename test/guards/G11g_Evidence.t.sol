@@ -77,16 +77,21 @@ contract G11gEvidenceTest is CuratorGuardTestBase {
         assertEq(vm.getRecordedLogs().length, 0, "no forged report");
     }
 
-    /// @dev `CuratorGuardPolicy.sol:954-955`: the member-wise store writes the packed record with ONE
-    ///      `sstore`. `vm.record` lists every storage write of the guard during `approveTransaction`.
-    function test_approveTransaction_writes_one_storage_slot() public {
+    /// @dev `CuratorGuardPolicy._storeApproval`: the member-wise store writes the record with ONE `sstore`
+    ///      per slot, two in all since the record carries its issuer (Quantstamp GUARD-1). `vm.record` lists
+    ///      every storage write of the guard during `approveTransaction`.
+    function test_approveTransaction_writes_two_storage_slots() public {
         _enforce();
         bytes memory _call = abi.encodeCall(MockProtocol.settleDeposit, (2));
+        bytes32 _id = guard.computeApprovalId(address(safe), address(0), address(protocol), 0, _call, Operation.Call);
         vm.record();
         vm.prank(vetro);
         guard.approveTransaction(address(safe), address(0), address(protocol), 0, _call, Operation.Call, 1 hours);
         (, bytes32[] memory _writes) = vm.accesses(address(guard));
-        assertEq(_writes.length, 1, "one storage write");
+        assertEq(_writes.length, 2, "two storage writes: {safe, expiry, epoch} and {issuer, issuerGen}");
+        bytes32 _s1 = keccak256(abi.encode(_id, uint256(7)));
+        assertEq(_writes[0], _s1, "first: the record's first slot");
+        assertEq(_writes[1], bytes32(uint256(_s1) + 1), "second: the record's second slot");
     }
 
     /// @dev `CuratorGuardPolicy.sol:111-112` priced the iteration of a committed `OneOf` set per member

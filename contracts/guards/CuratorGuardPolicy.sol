@@ -32,7 +32,10 @@ import {Operation} from "../interfaces/safe/ISafeGuard.sol";
 ///            within the same allowlist; the module path stays under the policy and the module
 ///            allowlist. Manages per-Safe and deployment-wide guardians and re-allows a canonical
 ///            unwrapper hash. No role holder can act on itself as a Safe (`enforce`, `bypass`,
-///            `approveTransaction` with `safe == msg.sender`).
+///            `approveTransaction` with `safe == msg.sender`). An approval is bound to the account that
+///            issued it, admin or council: void from the moment that account loses the role it issued
+///            with (`revokeRole`, `renounceRole`, the outgoing admin at `acceptDefaultAdminTransfer`),
+///            and a re-grant does not revive it (Quantstamp GUARD-1, review G26).
 ///          - guardians (warm keys / monitoring bots), per Safe (`setGuardian`) or deployment-wide
 ///            (`GUARDIAN_ROLE`): can only NARROW a policy (lockdown, revoke, remove values, revoke
 ///            approvals). They can never widen it.
@@ -114,7 +117,7 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
         ParamRule[] rules;
     }
 
-    /// @dev One storage slot. `safe` lets revocation events name the Safe and `epoch` lets views tell
+    /// @dev Two storage slots. `safe` lets revocation events name the Safe and `epoch` lets views tell
     ///      a stale record from a live one; the id itself already binds
     ///      `(safe, epoch, executor, to, value, data, operation)` and, for a delegatecall, the code at
     ///      `to` (`computeApprovalId`).
@@ -122,6 +125,10 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
         address safe;
         uint64 expiry;
         uint32 epoch;
+        /// @dev Second slot, full width: who issued the record and `_revocations[issuer]` at issue; void
+        ///      once that count moved (the issuer lost `COUNCIL_ROLE` / `DEFAULT_ADMIN_ROLE` since).
+        address issuer;
+        uint96 issuerGen;
     }
 
     struct SafePolicy {
@@ -218,9 +225,13 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     event NativeTransferUpdated(address indexed safe, address indexed target, bool allowed);
     event RequiredFallbackHandlerUpdated(address indexed safe, address handler, bool enforce);
     event UnwrapperCodehashUpdated(bytes32 indexed codehash, bool allowed);
+    /// @dev `issuer` is the admin or council account that issued the approval (`msg.sender`, which
+    ///      `executeBefore` preserves), indexed so responders can list one account's approvals
+    ///      (Quantstamp suggestion S2). The approval is void once that account loses the role it issued with.
     event TransactionApproved(
         address indexed safe,
         bytes32 indexed approvalId,
+        address indexed issuer,
         address executor,
         address to,
         uint256 value,
@@ -332,11 +343,21 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     ///      (safe-deployments `codeHash`; the proxy hashes follow from the factories' code). Fixed at
     ///      deployment like the unwrapper set: a new Safe release means a new guard.
     mapping(bytes32 codehash => bool) internal _safeCodehashes;
-    /// @dev One-shot approvals, keyed by `computeApprovalId`. `expiry == 0` means none.
+    /// @dev One-shot approvals, keyed by `computeApprovalId`. `expiry == 0` means none; a record whose
+    ///      issuer's count moved (`_revocations`) reads as none in the hooks and in `approvalExpiry` but
+    ///      stays in storage until `revokeApproval` or a re-approval.
     mapping(bytes32 approvalId => Approval) internal _approvals;
     /// @dev Folded into every approval id; bumping it voids all outstanding approvals of a Safe.
     ///      Bumped by `revokeAllApprovals` and whenever a `Bypass` window opens.
     mapping(address safe => uint32 epoch) internal _approvalEpochs;
+    /// @dev Appended after the round-22 layout (slot 9): the slot numbers above are pinned by tests.
+    ///      Times `COUNCIL_ROLE` or `DEFAULT_ADMIN_ROLE` was revoked from an account (`revokeRole`,
+    ///      `renounceRole`, the outgoing admin at the hand-over's acceptance). An approval records its
+    ///      issuer's count: every approval the account issued is void from the revocation on, and stays
+    ///      void if the role comes back (Quantstamp GUARD-1, review G26). Full width so the checked `++`
+    ///      cannot overflow in uint256 (2^256 revocations, each behind a new grant by the admin or a
+    ///      completed hand-over): no role revocation ever fails because of this count.
+    mapping(address account => uint256) internal _revocations;
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
@@ -676,8 +697,10 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
     ///         bypassed. A failed approved execution reverts the whole Safe transaction and keeps the
     ///         approval, on both paths. An approved delegatecall into a canonical `MultiSendCallOnly` is
     ///         decoded at use (canonical encoding, plain-call entries, none addressed to this guard).
-    ///         Re-approving the same payload overwrites the expiry (still one execution). Refused
-    ///         while the Safe is in `Bypass`. `to_` must carry code when calldata is sent or on a
+    ///         Re-approving the same payload overwrites the expiry and makes the record the caller's
+    ///         (still one execution): it then dies with the caller's role, and a council re-approval
+    ///         re-times an admin's record to the council's `ttl_` (at most `MAX_COUNCIL_APPROVAL_TTL`
+    ///         from now). Refused while the Safe is in `Bypass`. `to_` must carry code when calldata is sent or on a
     ///         delegatecall (an EIP-7702 delegated account never for a delegatecall), and a
     ///         delegatecall approval is bound to the code at `to_` when it was issued.
     /// @dev    Approved payloads should not nest another `execTransaction` of the same Safe: the
@@ -692,29 +715,35 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
         uint64 ttl_
     ) external returns (bytes32 _approvalId) {
         _nonZero(safe_);
-        bool _admin = _checkAdminOrCouncilFor(safe_);
-        _checkApprovalTarget(to_, data_.length, operation_);
-        // `executor_` names a module: never the Safe itself nor this guard (neither can be allowlisted,
-        // so such an approval could never be consumed).
-        if (executor_ != address(0)) _checkTarget(safe_, executor_);
-        SafePolicy storage $ = _policies[safe_];
-        if (_effectiveMode($) == Mode.Bypass) revert SafeInBypass(safe_);
-        uint64 _cap = _admin ? MAX_ADMIN_APPROVAL_TTL : MAX_COUNCIL_APPROVAL_TTL;
-        if (ttl_ < MIN_APPROVAL_TTL || ttl_ > _cap) revert InvalidDuration(ttl_);
-        if (!_admin) {
-            _checkCouncilApproval(safe_, to_, data_, operation_);
-            // The fast lane never re-arms a module a guardian removed: like a council window, a council
-            // approval only reaches a module that is still on the allowlist.
-            if (executor_ != address(0)) _checkModuleAllowed($, executor_);
-        }
+        bool _admin;
         uint64 _expiry;
-        unchecked {
-            _expiry = uint64(block.timestamp) + ttl_; // ttl_ <= 180 days: no uint64 overflow
+        // Block-scoped: `_expiry` outlives the block, `$` and `_cap` must not, since the legacy codegen's
+        // stack is at its limit at the emit (an indexed `issuer` does not compile otherwise). `_admin` is
+        // only read inside the block.
+        {
+            _admin = _checkAdminOrCouncilFor(safe_);
+            _checkApprovalTarget(to_, data_.length, operation_);
+            // `executor_` names a module: never the Safe itself nor this guard (neither can be allowlisted,
+            // so such an approval could never be consumed).
+            if (executor_ != address(0)) _checkTarget(safe_, executor_);
+            SafePolicy storage $ = _policies[safe_];
+            if (_effectiveMode($) == Mode.Bypass) revert SafeInBypass(safe_);
+            uint64 _cap = _admin ? MAX_ADMIN_APPROVAL_TTL : MAX_COUNCIL_APPROVAL_TTL;
+            if (ttl_ < MIN_APPROVAL_TTL || ttl_ > _cap) revert InvalidDuration(ttl_);
+            if (!_admin) {
+                _checkCouncilApproval(safe_, to_, data_, operation_);
+                // The fast lane never re-arms a module a guardian removed: like a council window, a council
+                // approval only reaches a module that is still on the allowlist.
+                if (executor_ != address(0)) _checkModuleAllowed($, executor_);
+            }
+            unchecked {
+                _expiry = uint64(block.timestamp) + ttl_; // ttl_ <= 180 days: no uint64 overflow
+            }
         }
         uint32 _epoch = _approvalEpochs[safe_];
         _approvalId = computeApprovalId(safe_, executor_, to_, value_, data_, operation_);
         _storeApproval(_approvalId, safe_, _expiry, _epoch);
-        emit TransactionApproved(safe_, _approvalId, executor_, to_, value_, data_, operation_, _expiry, _epoch);
+        emit TransactionApproved(safe_, _approvalId, msg.sender, executor_, to_, value_, data_, operation_, _expiry, _epoch);
     }
 
     /// @notice Narrow: cancel an unconsumed approval (admin, council or a guardian of its Safe).
@@ -752,12 +781,19 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
         return _approvalEpochs[safe_];
     }
 
-    /// @notice Expiry of a live approval, `0` if none or if the Safe's approval epoch moved on
-    ///         (`revokeAllApprovals`, `bypass`) since it was issued. Compare against `block.timestamp`.
+    /// @notice Expiry of a live approval, `0` if none, if the Safe's approval epoch moved on
+    ///         (`revokeAllApprovals`, `bypass`) since it was issued, or if its issuer lost `COUNCIL_ROLE` /
+    ///         `DEFAULT_ADMIN_ROLE` since (a re-grant does not revive it). A past expiry is reported as
+    ///         is: compare against `block.timestamp`.
     function approvalExpiry(bytes32 approvalId_) external view returns (uint64) {
         Approval storage _approval = _approvals[approvalId_];
-        if (_approval.expiry == 0 || _approval.epoch != _approvalEpochs[_approval.safe]) return 0;
-        return _approval.expiry;
+        uint64 _expiry = _approval.expiry;
+        if (
+            _expiry == 0 ||
+            _approval.epoch != _approvalEpochs[_approval.safe] ||
+            _revocations[_approval.issuer] != _approval.issuerGen
+        ) return 0;
+        return _expiry;
     }
 
     /// @notice End of the last `Bypass` window opened for `safe_` and whether the council opened it.
@@ -915,6 +951,18 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
         return super._grantRole(role_, account_);
     }
 
+    /// @dev Every approval the account issued dies with its issuing role (`revokeRole`, `renounceRole`,
+    ///      the hand-over's acceptance for the outgoing admin) and does not come back with a re-grant:
+    ///      the count moves once per loss and an approval carries the count at issue. Complete because
+    ///      OpenZeppelin 5.2.0 clears a role in `AccessControl._revokeRole` and nowhere else, and only
+    ///      the admin and the council can issue, so an unchanged count implies that the issuer has held
+    ///      the role it issued with ever since; `GUARDIAN_ROLE` issues nothing and is out of scope
+    ///      (Quantstamp GUARD-1, review G26).
+    function _revokeRole(bytes32 role_, address account_) internal virtual override returns (bool _had) {
+        _had = super._revokeRole(role_, account_);
+        if (_had && (role_ == COUNCIL_ROLE || role_ == DEFAULT_ADMIN_ROLE)) ++_revocations[account_];
+    }
+
     /// @dev Transferring the admin to `address(0)` would leave the guard without any widening or
     ///      removal path forever; refuse it. This also closes the library's renounce path, which needs
     ///      a pending transfer to `address(0)`.
@@ -971,13 +1019,31 @@ abstract contract CuratorGuardPolicy is AccessControlDefaultAdminRules {
         super._changeDefaultAdminDelay(newDelay_);
     }
 
-    /// @dev Member-wise so the legacy codegen writes the packed record with one `sstore` and no
-    ///      memory copy (a struct literal is built in memory first and copied from there).
+    /// @dev Member-wise so the legacy codegen writes each slot with one `sstore` and no memory copy (a
+    ///      struct literal is built in memory first and copied from there); the count is read before the
+    ///      writes so that nothing is evaluated between the writes of the second slot's two members. The
+    ///      issuer is the caller (`executeBefore` delegatecalls to self, so it keeps `msg.sender`). The
+    ///      narrowing cast can only fail closed: a count at or above 2^96 (unreachable) stores a value
+    ///      the full-width comparisons in `_approvalUsable` and `approvalExpiry` never match, so such an
+    ///      approval is void from issue, never revived (the call still succeeds and emits
+    ///      `TransactionApproved`; `approvalExpiry(id) == 0` is the only signal).
     function _storeApproval(bytes32 id_, address safe_, uint64 expiry_, uint32 epoch_) internal {
+        uint256 _gen = _revocations[msg.sender];
         Approval storage _a = _approvals[id_];
         _a.safe = safe_;
         _a.expiry = expiry_;
         _a.epoch = epoch_;
+        _a.issuer = msg.sender;
+        _a.issuerGen = uint96(_gen);
+    }
+
+    /// @dev A record the hooks and the dry run honour: present, not past its expiry second, and its issuer
+    ///      has lost no `COUNCIL_ROLE` / `DEFAULT_ADMIN_ROLE` since it was issued (Quantstamp GUARD-1,
+    ///      review G26). The epoch needs no check here: it is part of the id the hooks compute.
+    function _approvalUsable(bytes32 id_) internal view returns (bool) {
+        Approval storage _a = _approvals[id_];
+        uint64 _expiry = _a.expiry;
+        return _expiry != 0 && block.timestamp <= _expiry && _revocations[_a.issuer] == _a.issuerGen;
     }
 
     function _bumpEpoch(address safe_) internal {

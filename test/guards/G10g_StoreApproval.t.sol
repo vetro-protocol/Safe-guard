@@ -5,7 +5,7 @@ import {CuratorGuardTestBase, MockProtocol} from "test/guards/CuratorGuardTestBa
 import {Operation} from "contracts/interfaces/safe/ISafeGuard.sol";
 
 /// @dev g10g evidence test: how many storage writes `approveTransaction` executes (the `_storeApproval`
-///      NatSpec claims one `sstore` for the packed record with the member-wise form), with a control
+///      NatSpec claims one `sstore` per slot of the two-slot record with the member-wise form), with a control
 ///      showing that `vm.accesses` reports repeated writes to one slot separately.
 contract CuratorGuardG10gStoreApproval is CuratorGuardTestBase {
     function test_g10g_count_storage_writes_of_approveTransaction() public {
