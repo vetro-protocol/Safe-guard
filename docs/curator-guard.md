@@ -321,10 +321,15 @@ Evaluation order in `checkTransaction` / `checkModuleTransaction` (the tests pin
    window applies its limits to the inner transaction too). The owner-signed and module paths are
    independent, so an approved owner batch may trigger policy-compliant module transactions.
 3. The Safe's guard slot of this path (the transaction-guard slot on the owner path, the module-guard
-   slot on the module path) must name this guard → `GuardNotInstalled` otherwise (an account that
-   cannot answer `getStorageAt` is `SafeConfigUnreadable`). A replacement guard is therefore inert
-   until the Safe adopts it and a retired one from the swap on: neither can spend approvals or use
-   windows when the installed guard lets the Safe call it. Not checked in the post-hook (an approved
+   slot on the module path) must name this guard in its low 160 bits, as the Safe reads it →
+   `GuardNotInstalled` otherwise (an account that cannot answer `getStorageAt` is
+   `SafeConfigUnreadable`). A replacement guard is therefore inert until the Safe adopts it and a
+   retired one from the swap on: neither can spend approvals or use windows when the installed guard
+   lets the Safe call it. A word with dirty high bits still makes the Safe call this guard and passes
+   this check, so the window and approval exits and the `setGuard` / `setModuleGuard` repair stay
+   open (Quantstamp GUARD-4); step 9 still compares the module-guard word in full, so a dirty one
+   keeps the policy lane closed while a module is linked (`ModuleNotHooked`).
+   Not checked in the post-hook (an approved
    `setGuard` moves the slot inside the transaction and the Safe calls the cached guard) nor in the
    dry runs (the pre-swap checklist simulates against the replacement); so a post-hook reached on
    its own by a Safe that holds a live window on a guard it does not have installed still emits a
@@ -961,7 +966,7 @@ Residual (document, monitor, mitigate outside the guard):
   `gasUsed.sub(gasleft())`, which reverts with no data when that call nets such a refill; nothing the guard does
   before that window allocates storage, so only a bundled transaction (an outer frame allocates, the Safe
   transaction clears) can hit it. EIP-7954 raises the EIP-170 limit to 64 KiB (the 96 % gate stays as a margin on
-  the old limit) and a replacement guard's deployment then costs about 36 M state gas (23,509 bytes at 1,530
+  the old limit) and a replacement guard's deployment then costs about 36 M state gas (23,522 bytes at 1,530
   each). Before the mainnet activation: re-run the unit suites under `amsterdam` on a forge that models it (31 of
   the tests pin Osaka numbers or subtract gas across clears and fail there by design) and re-measure §7.2.
 - **Safe builds.** The supported set is fixed at deployment: the proxies the v1.3.0 / v1.4.1 /
@@ -1276,7 +1281,7 @@ of step 0 does not stop it; review G11a-1), or after install.
   and compare the chain with `helpers/address.ts` on that machine: a tampered address book or operator
   audits itself as "expected". The install signers therefore read, from their own node, before signing
   the batch of §7.4: `keccak256(eth_getCode(guard))` and `keccak256(eth_getCode(guard.defaultAdmin()))`
-  with their CBOR tails stripped equal the reviewed build (`test/guards/G12a_BuildPin.t.sol`, 23,509 and
+  with their CBOR tails stripped equal the reviewed build (`test/guards/G12a_BuildPin.t.sol`, 23,522 and
   8,204 bytes); `guard.defaultAdmin()` is the timelock named in this runbook and in the policy file's
   `$comment`, `guard.defaultAdminDelay()` is 3 days and `guard.pendingDefaultAdmin()` empty;
   `timelock.getMinDelay()` is 48 h; `timelock.hasRole(PROPOSER_ROLE, p)` for exactly the proposer Safes
@@ -2560,8 +2565,8 @@ is kept as an alias; CI pins a pristine fork block through `.github/actions/fork
 `forge test` in `.github/workflows/ci.yml`):
 
 - `G12a_BuildPin.t.sol`: the runtime bytecode of `CuratorGuard`, `CuratorGuardTimelock` and the
-  `SettlementDeadline` helper, metadata stripped, is pinned to the reviewed build (23,509, 8,204 and 177 bytes;
-  keccak `305bfa47…`, `8a69e72c…`, `15af8250…`; the deploy script carries the same two guard and timelock
+  `SettlementDeadline` helper, metadata stripped, is pinned to the reviewed build (23,522, 8,204 and 177 bytes;
+  keccak `3052dbae…`, `8a69e72c…`, `15af8250…`; the deploy script carries the same two guard and timelock
   pins and refuses to send an artifact that does not hash to them, review G18g-2; the helper's pin is the build the sync compares a
   deadline entry's target against, §5, review G16c-1). CI's toolchain-parity step compares
   hardhat with foundry, never with the reviewed build, and the deploy script deploys whatever the local

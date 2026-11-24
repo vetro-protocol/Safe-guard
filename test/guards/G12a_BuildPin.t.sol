@@ -12,7 +12,7 @@ import {Test} from "forge-std/Test.sol";
 /// audited bytecode silently. Re-pin the two constants only together with the review of the change that moved
 /// them (the sizes are the ones docs section 10 and the README quote).
 contract G12a_BuildPin is Test {
-    uint256 internal constant GUARD_RUNTIME_BYTES = 23_509;
+    uint256 internal constant GUARD_RUNTIME_BYTES = 23_522;
     uint256 internal constant TIMELOCK_RUNTIME_BYTES = 8_204;
     // keccak256 of the runtime code without its CBOR tail: CuratorGuard (sha256 e0366b24...; 7b7cc641... before the
     // zero-target approval rail of G17a-3, +18 B, applied at the owner's decision after round 21) and
@@ -22,9 +22,10 @@ contract G12a_BuildPin is Test {
     // pins: d878077 (the round-13 follow-up build, rounds 14-18): 23,240 / 8,195 bytes, keccak c8e0a908... /
     // b7790f42...; 830824e: 23,224 / 8,191 bytes, keccak b3ac8167... / 745ff0ea... The guard's two constants were
     // re-pinned with the issuer binding of one-shot approvals (Quantstamp GUARD-1, +242 B): the audited build
-    // 9f53eb8 described above was 23,267 bytes, keccak 3bfe33c8...; the pinned guard build is sha256 ebf8f19f...;
-    // the timelock did not move.
-    bytes32 internal constant GUARD_STRIPPED_KECCAK = 0x305bfa47b4f7d3d954d5ff0030e3f30ebd05fe7af0e54e2987e3666568835a3d;
+    // 9f53eb8 described above was 23,267 bytes, keccak 3bfe33c8...; the GUARD-1 build was 23,509 bytes, keccak
+    // 305bfa47..., sha256 ebf8f19f... They moved again with the installed-slot check reading the guard word's low
+    // 160 bits (Quantstamp GUARD-4, +13 B): the pinned guard build is sha256 3c473a40...; the timelock did not move.
+    bytes32 internal constant GUARD_STRIPPED_KECCAK = 0x3052dbaefb69daf6f3471805b1a2c562a980d70f6467fce617db878fb1a4839d;
     bytes32 internal constant TIMELOCK_STRIPPED_KECCAK = 0x8a69e72c4ff2fbc0189b1ff3f6a7e74c239bcc3c3394a3fe158e952a02da786c;
 
     function test_guard_runtime_is_the_reviewed_build() public view {

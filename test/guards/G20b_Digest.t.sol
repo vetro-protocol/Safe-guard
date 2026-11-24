@@ -3,12 +3,17 @@ pragma solidity 0.8.25;
 
 import {Vm} from "forge-std/Vm.sol";
 import {ISafe} from "contracts/interfaces/safe/ISafe.sol";
+import {Operation} from "contracts/interfaces/safe/ISafeGuard.sol";
 import {G20bDigestBase} from "test/guards/G20b_DigestBase.sol";
 
 /// @dev The concrete twin of `G20b_SymDigest.t.sol` under `forge test` (2,048 runs in the driver), with the one thing
-///      the symbolic suite does not watch: the served post-hook emits exactly one `TransactionChecked`.
+///      the symbolic suite does not watch: the served post-hook emits exactly one `TransactionChecked`. X5 to X7 are
+///      not that suite's: they pin the installed-slot check, which reads the guard word's low 160 bits since
+///      Quantstamp GUARD-4 (the symbolic X5 pinned the full-word compare).
 abstract contract G20bDigestFoundryBase is G20bDigestBase {
     bytes32 internal constant REPORT_SIG = keccak256("TransactionChecked(address,bytes32,uint8,uint8)");
+    bytes32 internal constant MODULE_GUARD_SLOT = 0xb104e0b93118902c651344349b610029d694cfdec91c589c91ebafbcd0289947;
+    address internal constant MODULE = address(0x30D);
 
     function _reports(Vm.Log[] memory logs_) internal view returns (uint256 _n) {
         for (uint256 i; i < logs_.length; ++i) if (logs_[i].emitter == address(guard) && logs_[i].topics[0] == REPORT_SIG) ++_n;
@@ -79,10 +84,62 @@ abstract contract G20bDigestFoundryBase is G20bDigestBase {
         assertTrue(_isSafeConfigChanged(_ok2, _ret), "cleaned");
     }
 
-    function testFuzz_X5_a_dirty_guard_word_is_GuardNotInstalled(uint96 h) public {
+    /// @dev The installed-slot check reads the low 160 bits, as the Safe reads its guard (Quantstamp GUARD-4):
+    ///      a guard word whose low bits name this guard is admitted whatever its high bits (X5b and X6 hold the
+    ///      control: a word whose low bits name another account is `GuardNotInstalled`).
+    function testFuzz_X5_a_dirty_guard_word_is_admitted_by_its_low_160_bits(uint96 h) public {
         vm.store(address(s), GUARD_SLOT, _w(address(guard), h));
+        (bool _ok, ) = _pre();
+        assertTrue(_ok, "a dirty guard word naming this guard is admitted (masked read)");
+    }
+
+    /// @dev X5 at the edges of the mask: the lowest and the highest bit above the address, every high bit, and the
+    ///      low 96 bits of this guard's own address repeated above it are admitted (and served by the post-hook); a
+    ///      word one bit off inside the low 160 bits (the highest and the lowest), a word that carries this guard in
+    ///      its HIGH 160 bits only, an empty address under dirty high bits and the Safe's own address are
+    ///      `GuardNotInstalled`.
+    function test_X5b_the_mask_is_exactly_160_bits_wide() public {
+        uint256 _g = uint256(uint160(address(guard)));
+        uint96[4] memory _hs = [uint96(1), uint96(1) << 95, type(uint96).max, uint96(_g)];
+        for (uint256 i; i < _hs.length; ++i) {
+            vm.store(address(s), GUARD_SLOT, _w(address(guard), _hs[i]));
+            (bool _ok, ) = _pre();
+            assertTrue(_ok, "admitted by the low 160 bits");
+            (_ok, ) = _post();
+            assertTrue(_ok, "same bytes: served");
+        }
+        bytes32[5] memory _others = [bytes32(_g ^ (1 << 159)), bytes32(_g ^ 1), bytes32(_g << 96), _w(address(0), type(uint96).max), _clean(address(s))];
+        for (uint256 i; i < _others.length; ++i) {
+            vm.store(address(s), GUARD_SLOT, _others[i]);
+            (bool _ok, bytes memory _ret) = _pre();
+            assertTrue(_isGuardNotInstalled(_ok, _ret), "GuardNotInstalled");
+        }
+    }
+
+    /// @dev The control of X5 as a property: the pre-hook answers a guard word EXACTLY by its low 160 bits. Any
+    ///      word whose low bits name another account (or none) is `GuardNotInstalled`, whatever its high bits.
+    function testFuzz_X6_a_guard_word_naming_another_account_is_GuardNotInstalled(uint96 h, address low) public {
+        vm.assume(low != address(guard));
+        vm.store(address(s), GUARD_SLOT, _w(low, h));
         (bool _ok, bytes memory _ret) = _pre();
-        if (h == 0) assertTrue(_ok);
+        assertTrue(_isGuardNotInstalled(_ok, _ret), "GuardNotInstalled");
+    }
+
+    /// @dev X5 and X6 on the module path, whose installed-slot check reads the MODULE-guard slot (the hook is driven
+    ///      directly, as the Safe; no module is linked, so the policy lane's `ModuleNotHooked` rail has nothing to
+    ///      refuse). The transaction-guard slot is emptied first: the installed-slot check of this path does not
+    ///      read it.
+    function testFuzz_X7_the_module_hook_reads_the_module_guard_word_by_its_low_160_bits(uint96 h, address low, bool named) public {
+        if (named) low = address(guard);
+        else vm.assume(low != address(guard));
+        vm.prank(VETRO);
+        guard.setModuleAllowed(address(s), MODULE, true);
+        vm.store(address(s), GUARD_SLOT, bytes32(0));
+        vm.store(address(s), MODULE_GUARD_SLOT, _w(low, h));
+        bytes memory _c = abi.encodeCall(guard.checkModuleTransaction, (address(venue), 0, settle, Operation.Call, MODULE));
+        vm.prank(address(s));
+        (bool _ok, bytes memory _ret) = address(guard).call(_c);
+        if (named) assertTrue(_ok, "a dirty module-guard word naming this guard is admitted (masked read)");
         else assertTrue(_isGuardNotInstalled(_ok, _ret), "GuardNotInstalled");
     }
 }

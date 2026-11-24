@@ -552,15 +552,14 @@ contract CuratorGuard is CuratorGuardPolicy, ISafeTransactionGuard, ISafeModuleG
     ///      admin-window `setGuard` moves the slot inside the transaction and the cached guard still gets
     ///      the post-hook; so a post-hook a Safe calls directly, while it holds a live window on this
     ///      guard, still emits a `Bypass` report, see rule 2 of the contract NatSpec) and not in the
-    ///      dry runs (the pre-swap checklist simulates against the replacement).
+    ///      dry runs (the pre-swap checklist simulates against the replacement). The slot's low 160 bits are
+    ///      compared, as the Safe reads its guard: a word with dirty high bits (planted by an approved
+    ///      delegatecall, or used by a later Safe build) still makes the Safe call this guard, and a full-word
+    ///      compare would refuse every transaction before the window and approval exits, the repair included
+    ///      (Quantstamp GUARD-4).
     function _requireInstalled(address safe_, uint8 path_) private view {
-        if (_slotWord(safe_, path_ == PATH_OWNER ? GUARD_STORAGE_SLOT : MODULE_GUARD_STORAGE_SLOT) != _self()) {
-            revert GuardNotInstalled(safe_);
-        }
-    }
-
-    function _self() private view returns (bytes32) {
-        return bytes32(uint256(uint160(address(this))));
+        bytes32 _word = _slotWord(safe_, path_ == PATH_OWNER ? GUARD_STORAGE_SLOT : MODULE_GUARD_STORAGE_SLOT);
+        if (address(uint160(uint256(_word))) != address(this)) revert GuardNotInstalled(safe_);
     }
 
     /// @dev One storage word of the Safe, through its own `getStorageAt`.
